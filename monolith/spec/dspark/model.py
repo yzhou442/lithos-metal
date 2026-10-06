@@ -145,8 +145,8 @@ class DSparkDrafter(Drafter):
         super().__init__(prefix="draft.")
         if block_size is not None:
             from dataclasses import replace
-            if isinstance(block_size, bool) or not isinstance(block_size, int) or not 1 <= block_size <= cfg.block_size:
-                raise ValueError(f"DSpark: block_size must be in 1..{cfg.block_size}")
+            if isinstance(block_size, bool) or not isinstance(block_size, int) or not 1 <= block_size <= cfg.max_block_size:
+                raise ValueError(f"DSpark: block_size must be in 1..{cfg.max_block_size}")
             cfg = replace(cfg, block_size=block_size)
         self.cfg, self.gamma, self.max_context = cfg, cfg.block_size, max_context
         self.kernel_config = kernel_config

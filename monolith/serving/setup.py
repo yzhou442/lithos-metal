@@ -50,8 +50,8 @@ class ServingAssets:
             options.update(drafter_options=dict(block_size=self.gamma, attention=recipe.get('draft_attention', 'mma'),
                                                kernel_config=copy.deepcopy(recipe.get('draft'))),
                            decoder_kernel_config=copy.deepcopy(recipe.get('target')),
-                           prefill_attention=('auto' if profile.backend == 'm5_max_40c'
-                                              and recipe.get('target') else 'v3'), accelerator='on')
+                           prefill_attention=recipe.get('prefill_attention', 'auto' if profile.backend == 'm5_max_40c'
+                                                        and recipe.get('target') else 'v3'), accelerator='on')
         return key, options
 
 
@@ -80,8 +80,8 @@ def prepare(args, *, device_info=None):
     draft = DRAFTERS.get('dspark').from_checkpoint(str(draft_dir), target_lm_head=None,
                 max_context=args.max_context) if draft_dir else None
     gamma = (min(7, draft.gamma) if args.draft_block_size is None else args.draft_block_size) if draft else 0
-    if draft and not 1 <= gamma <= draft.gamma:
-        raise ValueError(f'--draft-block-size must be between 1 and {draft.gamma}')
+    if draft and not 1 <= gamma <= draft.cfg.max_block_size:
+        raise ValueError(f'--draft-block-size must be between 1 and {draft.cfg.max_block_size}')
     capacity = args.max_context + max(0, gamma - 1)
     model = cls.from_checkpoint(str(model_dir), max_context=capacity)
     if draft:

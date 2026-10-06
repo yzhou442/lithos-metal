@@ -21,7 +21,7 @@ def recipes(model, drafter, quantization):
         return {}
     if tuple(getattr(draft, k, None) for k in fields) != (5120, 17408, 5, 32, 8, 128, 248320):
         return {}
-    if (draft.block_size != 7 or draft.target_layer_ids != [5, 19, 33, 47, 61]
+    if (not 1 <= draft.block_size <= 15 or draft.target_layer_ids != [5, 19, 33, 47, 61]
             or draft.markov_rank != 256 or draft.target_hidden != 5120):
         return {}
     shape = tuple(getattr(target, k, None) for k in ('linear_num_key_heads', 'linear_num_value_heads',
@@ -44,4 +44,12 @@ def recipes(model, drafter, quantization):
     for key in ('4096', '8192', '16384'):
         selected[key] = copy.deepcopy(selected['32768'])
         selected[key]['target'] = contexts[key]['target']
+    if draft.block_size != 7:
+        # The measured target recipes are eight-row programs (decoder_fusion) and the draft recipes' native tiles
+        # are eight rows (static_fusion TM=8): other blocks keep the formats, thresholds and draft attention but run
+        # the generic dynamic-T kernels. The prefill attention stays the one the eight-row serve path selects.
+        for recipe in selected.values():
+            recipe.pop('target', None)
+            recipe.pop('draft', None)
+            recipe['prefill_attention'] = 'auto'
     return selected
