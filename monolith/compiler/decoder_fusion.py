@@ -43,4 +43,12 @@ def optimize(program, config):
             regions.append((i, i + 2, f'decoder.mlp.{layer}', config['mlp']))
         start = i + 2
         layer += 1
+    if config.get('lm_head'):
+        # The target vocabulary projection keeps its own native geometry and a
+        # lossless operand layout; the drafter's shared head is a separate op.
+        heads = [i for i in range(end) if p.ops[i].meta.get('kind') == 'lm_head'
+                 and p.kernels[p.ops[i].kernel].function == 'gemm_tile']
+        if len(heads) != 1:
+            raise ValueError('decoder lm_head recipe requires one tensor vocabulary projection')
+        regions.append((heads[0], heads[0] + 1, 'decoder.lm_head', dict(config['lm_head'], fuse=False)))
     return fuse_regions(p, regions)
