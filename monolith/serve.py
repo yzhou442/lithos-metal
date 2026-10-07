@@ -28,7 +28,7 @@ from .serving.tool_stream import tool_prefixes
 class Backend:
     """One cached session; sampling changes rebuild its compiled programs, never duplicate model residency."""
 
-    def __init__(self, model_dir, pack_dir, max_context=4096, prefill_chunk_size=128, *, assets=None):
+    def __init__(self, model_dir, pack_dir, max_context=4096, prefill_chunk_size=128, *, assets=None, prefill_exact=False):
         from transformers import AutoTokenizer
 
         self.tokenizer = AutoTokenizer.from_pretrained(model_dir, local_files_only=True, trust_remote_code=False)
@@ -36,6 +36,7 @@ class Backend:
             raise ValueError("The checkpoint must provide a chat template")
         self.model_dir, self.pack_dir, self.max_context = model_dir, pack_dir, max_context
         self.prefill_chunk_size = prefill_chunk_size
+        self.prefill_exact = prefill_exact
         self.session, self.sampling = None, None
         self._sessions = {}
         self.assets = assets
@@ -85,7 +86,8 @@ class Backend:
             self.session = load_session(self.model_dir, self.pack_dir, **options,
                 temperature=request.temperature, top_p=request.top_p, seed=request.seed,
                 autotune=False, prefill_chunk_size=self.prefill_chunk_size, prefix_cache=True,
-                prefix_cache_min_tokens=min(self.prefill_chunk_size, 128))
+                prefix_cache_min_tokens=min(self.prefill_chunk_size, 128),
+                **({'prefill_exact': True} if getattr(self, 'prefill_exact', False) else {}))
         if prefix_cache is not None:
             self.session.prefix_cache = prefix_cache
         while len(sessions) > 8:
@@ -370,7 +372,11 @@ def create_app(backend, model_name, api_key=None):
 
 
 def _chunk_size(value):
-    return value if value == 'auto' else int(value)
+    if value in ('auto', 'auto-exact'):
+        return value
+    if value.endswith('-exact'):
+        return (int(value[:-len('-exact')]), 'exact')
+    return int(value)
 
 
 def parse_args(argv=None):
@@ -401,7 +407,8 @@ def parse_args(argv=None):
     parser.add_argument("--prefill-chunk-size", type=_chunk_size, default=128,
                         help="Prompt tokens per prefill pass (default 128). 'auto' selects the chip's measured size for the "
                              "model (512 on the 40-core M5 Max recipe: ~2-2.6x faster long-prompt prefill; different "
-                             "reduction order, so very long prompts can change greedy tokens)")
+                             "reduction order, so very long prompts can change greedy tokens). 'N-exact' / 'auto-exact' "
+                             "use N-row (or the measured) chunks with the 128-row graph's reduction orders: identical results")
     parser.add_argument("--no-warmup", action='store_true', help="Skip startup compilation/warmup; the first request pays this cost")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
@@ -411,7 +418,8 @@ def parse_args(argv=None):
         args.draft = default_draft(args.model)
     if args.max_context < 1:
         parser.error("--max-context must be positive")
-    if args.prefill_chunk_size != 'auto' and args.prefill_chunk_size < 1:
+    size = args.prefill_chunk_size[0] if isinstance(args.prefill_chunk_size, tuple) else args.prefill_chunk_size
+    if size not in ('auto', 'auto-exact') and size < 1:
         parser.error("--prefill-chunk-size must be positive")
     if args.draft_block_size is not None and args.draft_block_size < 1:
         parser.error('--draft-block-size must be positive')
@@ -429,10 +437,14 @@ def main(argv=None):
     logging.basicConfig(level=logging.INFO)
     assets = prepare(args)
     api_key = os.environ.get("LITHOS_METAL_API_KEY") or os.environ.get("LMK_API_KEY") or os.environ.get("MONOLITH_API_KEY")
-    chunk = args.prefill_chunk_size
-    if chunk == 'auto':
+    chunk, exact = args.prefill_chunk_size, False
+    if isinstance(chunk, tuple):
+        chunk, exact = chunk[0], True
+    if chunk in ('auto', 'auto-exact'):
+        exact = chunk == 'auto-exact'
         chunk = getattr(assets, 'prefill_chunk_size', None) or 128
-    backend = Backend(str(assets.model_dir), str(assets.pack_dir), args.max_context, chunk, assets=assets)
+    backend = Backend(str(assets.model_dir), str(assets.pack_dir), args.max_context, chunk, assets=assets,
+                      prefill_exact=exact)
     model_name = args.served_model_name or (assets.model_dir.name if Path(args.model).expanduser().exists() else args.model)
     if not args.no_warmup:
         backend.warmup(model_name)

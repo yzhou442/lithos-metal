@@ -5,13 +5,23 @@ tiles, key partitions, cached-prefix loads, projection tiles and K splits.
 Keep choices here rather than duplicating the decode context recipes.
 """
 import copy
+import os
 import struct
 
 from ....compiler.attention_fusion import specialize_attention, compact_partials
 from ....compiler.region_fusion import subprogram
 from ....compiler.prefill import (projection_geometry, device_attention_tiles, packed_nvfp4_projection,
                                  packed_fp8_projection, direct_bf16_projection, shared_nvfp4_layout,
-                                 shared_fp8_layout, input_tile_order)
+                                 shared_fp8_layout, input_tile_order, transposed_nvfp4_projection)
+
+# Numerics of the 512-row prompt graph. EXACT_ATTENTION keeps the 16-query /
+# 32-key attention core of smaller chunks (per-row softmax blocks identical to
+# the 128-row graph) instead of the faster 32/128 device tiles; SHARED_READS
+# 'transposed' reads the decoder's packed files in the private 128-column
+# reduction order (same sums as the private layouts), 'retarget' writes x' in
+# the files' order (faster for none measured, changes the in-tile sum order).
+EXACT_ATTENTION = os.environ.get('LITHOS_PREFILL_EXACT_ATTENTION', '0') == '1'
+SHARED_READS = os.environ.get('LITHOS_PREFILL_SHARED_READS', 'retarget')
 
 # 512-row FP8 projections reading the verification graph's packed operands
 # (32-row file tiles of 32 reduction columns) through 32x16x128 matrix tiles:
@@ -51,7 +61,13 @@ def shared_fp8_plan(program, fp8_rows):
     return plan
 
 
-def optimize(program):
+def optimize(program, exact=False):
+    """``exact``: keep every reduction order of the smaller-chunk prompt graph (the 128-row path): the attention
+    core's 16-query / 32-key blocks, and the decoder's packed files read in each projection's own 128-column K order
+    (transposed reads). Rows are independent in every kernel, so the 512-row graph then reproduces the 128-row
+    graph's activations bit for bit while keeping the larger chunk's GEMM efficiency and the shared weights."""
+    exact_attention = exact or EXACT_ATTENTION
+    reads = 'transposed' if exact else SHARED_READS
     # Work on individual core/merge pairs. Draft attention and shapes not
     # measured by the prefill sweep retain their existing implementation.
     for core in list(program.ops):
@@ -75,7 +91,8 @@ def optimize(program):
             part.kernels[private] = copy.deepcopy(part.kernels[op.kernel])
             op.kernel = private
         tuned = part.kernels[part.ops[0].kernel]
-        sgs, groups = (8, 80) if rows == 512 else ((4, 160) if rows >= 256 else (8, 320))
+        sgs, groups = ((8, 80) if rows == 512 and not exact_attention else
+                       ((8, 320) if exact_attention or rows < 256 else (4, 160)))
         tuned.macros.update(MMA_SG=str(sgs), STATIC_GQA_P_N_SG=f'{groups}u')
         record = bytearray(part.buffers[params].init)
         struct.pack_into('<I', record, offset+16, groups)
@@ -83,7 +100,7 @@ def optimize(program):
         part.ops[0].grid = (groups, 1, 1)
         part.ops[0].threadgroup = (sgs*32, 1, 1)
         part = specialize_attention(part, sgs, True, 64)
-        if rows == 512:
+        if rows == 512 and not exact_attention:
             device_attention_tiles(part)
         compact_partials(part)
         # Preparation has explicit writes so lifetime analysis can reuse Q.
@@ -130,7 +147,7 @@ def optimize(program):
                 or int(k.macros.get('TK', '0').rstrip('u')) != 128):
             continue
         shape = (op.meta.get('format'), op.meta.get('n'), op.meta.get('k'))
-        if id(op) in fp8_plan:
+        if id(op) in fp8_plan and not (exact and fp8_plan[id(op)]['tk'] != 32):
             # The decoder's FP8 operands (6.7 GiB otherwise duplicated): 128-column
             # matrix tiles assembled from its 32-column file tiles, half a file tile
             # of rows per matrix tile. Changes the reduction order (not the values)
@@ -138,28 +155,39 @@ def optimize(program):
             shared = fp8_plan[id(op)]
             tn, sgs, groups = SHARED_FP8_GEOMETRY[shape]
             tn = min(tn, shared['tn'])
-            projection_geometry(program, op, tm=32, tn=tn, sgs=sgs, groups=groups, q_outer=0)
+            transposed = reads == 'transposed' and shared['tk'] == 32
+            projection_geometry(program, op, tm=32, tn=tn, sgs=sgs, groups=groups, q_outer=None if transposed else 0)
             program.kernels[op.kernel].macros['FP8_DECODE'] = '1'
             binding = next((name, offset) for slot, name, offset in op.bindings if slot == 0)
             packed_fp8_projection(program, op, fp8_rows[binding], tile_block=shared['tile_block'], file_tk=shared['tk'],
-                                  file_tn=shared['tn'])
-            retile.append((op, shared['tk']))
+                                  file_tn=shared['tn'], transposed=transposed)
+            if not transposed:
+                retile.append((op, shared['tk']))
             continue
-        if shape == ('bf16', 96, 5120) and op.meta['t_variant'] == 512:
+        if shape == ('bf16', 96, 5120) and op.meta['t_variant'] == 512 and not exact:
             # Reorder native BF16 only; FP8 projections stay eight-bit.
             projection_geometry(program, op, tm=32, tn=16, sgs=4, groups=40)
             direct_bf16_projection(program, op)
         elif shape in (('nvfp4', 34816, 5120), ('nvfp4', 5120, 17408)) and op.meta['t_variant'] == 512 and (
-                shared := shared_nvfp4_layout(program, op)) is not None:
+                shared := shared_nvfp4_layout(program, op)) is not None and not (exact and shared['tk'] != 64):
             # Read the verification graph's packed MLP operands (32x64 tiles in
             # blocks of 32) instead of a private copy: within 1.5 % of the
             # 16x128 prompt layout, bit-identical outputs, and no 9-GiB layout
             # to evict and re-read whenever a request switches programs.
-            projection_geometry(program, op, tm=32, tn=shared['tn'], sgs=8,
-                                groups=160 if shape[0] == 34816 else 80, tk=shared['tk'], q_outer=shared['outer'])
-            packed_nvfp4_projection(program, op, shared['tile_block'], shared['rows'])
-            if shared['tk'] != 128:
-                retile.append((op, shared['tk']))
+            # The down projection (K = 17408) multiplies each decoded weight tile with
+            # two 32-token blocks: 1.68 -> 1.56 ms per op, identical outputs.
+            if reads == 'transposed' and shared['tk'] == 64:
+                gate_up = shape[0] == 34816
+                projection_geometry(program, op, tm=32, tn=16 if gate_up else 32, sgs=16 if gate_up else 8,
+                                    groups=160 if gate_up else 80, token_blocks=1 if gate_up else 2)
+                transposed_nvfp4_projection(program, op, shared)
+            else:
+                projection_geometry(program, op, tm=32, tn=shared['tn'], sgs=8,
+                                    groups=160 if shape[0] == 34816 else 80, tk=shared['tk'], q_outer=shared['outer'],
+                                    token_blocks=1 if shape[0] == 34816 else 2)
+                packed_nvfp4_projection(program, op, shared['tile_block'], shared['rows'])
+                if shared['tk'] != 128:
+                    retile.append((op, shared['tk']))
         elif shape == ('nvfp4', 34816, 5120):
             projection_geometry(program, op, tm=32, tn=16, sgs=16, groups=160)
             if op.meta['t_variant'] == 512:
