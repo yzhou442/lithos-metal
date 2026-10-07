@@ -19,7 +19,7 @@ from pathlib import Path
 
 ap = argparse.ArgumentParser()
 ap.add_argument('--repo', required=True, help='lithos-metal checkout to import (worktree)')
-ap.add_argument('--suite', default='quick', choices=['quick', 'full', 'long', 'prefill'])
+ap.add_argument('--suite', default='quick', choices=['quick', 'full', 'long', 'prefill', 'agent'])
 ap.add_argument('--out', required=True)
 ap.add_argument('--baseline')
 ap.add_argument('--model', default='nvidia/Qwen3.8-27B-NVFP4')
@@ -37,6 +37,8 @@ ap.add_argument('--drafter-kw', default='{}', help='drafter_options entries as J
 ap.add_argument('--no-target-recipe', action='store_true')
 ap.add_argument('--no-draft-recipe', action='store_true')
 ap.add_argument('--recipe-key', default=None)
+ap.add_argument('--verify-rule', default='fixed', choices=['fixed', 'cost'], help='serve option: per-round verify length rule')
+ap.add_argument('--draft-lookup', action='store_true', help='serve option: context-lookup extension into rows 9-16')
 a = ap.parse_args()
 sys.path.insert(0, str(Path(a.repo).expanduser().resolve()))
 os.environ.setdefault('HF_HUB_OFFLINE', '1')
@@ -71,7 +73,17 @@ PROMPTS = {
 def doc_prompt(n_chars, ask, max_new):
     text = (DOC.read_text() + '\n\n' + DOC2.read_text()) * 4
     return ([{'role': 'user', 'content': text[:n_chars] + '\n\n' + ask}], max_new)
+# agentic, copy-heavy prompts (spec campaign): rewrite a file the prompt contains
+_BASE = Path('~/lmopt/base').expanduser()      # fixed source text (the base commit), whatever repo is measured
+_SETUP = (_BASE / 'monolith' / 'serving' / 'setup.py').read_text()
+_RECIPE = json.dumps(json.loads((_BASE / 'monolith' / 'backends' / 'metal' / 'm5_max_40c' / 'recipes' / 'dspark'
+                                / 'selected-nvfp4-endpoints.json').read_text())['128']['target'], indent=1)
+PROMPTS['edit'] = ([{'role': 'user', 'content': 'Here is a Python module:\n```python\n' + _SETUP + '```\nAdd a one-line docstring to '
+                     'every function and method that lacks one, change nothing else, and output the complete updated file.'}], 640)
+PROMPTS['json'] = ([{'role': 'user', 'content': 'Here is a JSON config:\n```json\n' + _RECIPE + '\n```\nChange every "workers" value '
+                     'of 160 to 192 and every "sgs" value of 4 to 8. Output the complete updated JSON only.'}], 512)
 SUITES = {
+    'agent': ['edit', 'json'],
     'quick': ['code', 'chat', 'web'],
     'full': ['code', 'chat', 'math', 'web', 'tool', 'doc4k'],
     'long': ['doc4k', 'doc16k'],
@@ -89,6 +101,7 @@ ns.draft = None if a.no_draft else a.draft
 ns.no_draft, ns.draft_revision, ns.draft_block_size = a.no_draft, None, a.draft_block_size
 ns.max_context, ns.draft_quantization, ns.draft_pack, ns.pack = a.max_context, 'auto', None, None
 ns.kernel_config, ns.kernel_config_key = None, a.recipe_key
+ns.verify_rule, ns.draft_lookup = a.verify_rule, a.draft_lookup
 t = time.time()
 assets = prepare(ns)
 setup_s = time.time() - t

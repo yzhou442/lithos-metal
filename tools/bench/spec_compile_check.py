@@ -26,6 +26,7 @@ ap.add_argument('--draft-recipe-key', default=None, help='force this context key
 ap.add_argument('--no-target-recipe', action='store_true')
 ap.add_argument('--no-draft-recipe', action='store_true')
 ap.add_argument('--session-kw', default='{}')
+ap.add_argument('--drafter-kw', default='{}')
 ap.add_argument('--dump', default=None, help='write one line per dispatch')
 a = ap.parse_args()
 repo = Path(a.repo).expanduser().resolve()
@@ -80,6 +81,7 @@ if a.no_target_recipe:
 if a.no_draft_recipe:
     options['drafter_options'].pop('kernel_config', None)
 options.update(json.loads(a.session_kw))
+options['drafter_options'] = dict(options['drafter_options'], **json.loads(a.drafter_kw))
 s = load_session(str(assets.model_dir), str(assets.pack_dir), **options, eos=-1, temperature=0.0, autotune=False,
                  prefill_chunk_size=128)
 t0 = time.time()

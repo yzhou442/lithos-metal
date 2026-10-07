@@ -35,6 +35,7 @@ ap.add_argument('--no-draft-recipe', action='store_true')
 ap.add_argument('--recipe-key', default=None, help='force a recipe context key (128/4096/...)')
 ap.add_argument('--profile-ops', action='store_true', help='per-kernel-function attribution of the verification span')
 ap.add_argument('--session-kw', default='{}')
+ap.add_argument('--drafter-kw', default='{}', help='drafter_options entries (e.g. {"lookup": {}})')
 ap.add_argument('--out', required=True)
 a = ap.parse_args()
 repo = Path(a.repo).expanduser().resolve()
@@ -69,6 +70,7 @@ if a.no_target_recipe:
 if a.no_draft_recipe and 'drafter_options' in options:
     options['drafter_options'].pop('kernel_config', None)
 options.update(json.loads(a.session_kw))
+options['drafter_options'] = dict(options['drafter_options'], **json.loads(a.drafter_kw))
 t0 = time.time()
 s = load_session(str(assets.model_dir), str(assets.pack_dir), **options, eos=-1, temperature=0.0, autotune=False,
                  prefill_chunk_size=128)
@@ -130,7 +132,7 @@ def restore(L=None):
         e.buffers[n].write(data, 0)
     if L is not None:
         st = e.state()
-        pend = [st['anchor']] + drafts0[:L]
+        pend = [st['anchor']] + (drafts0 * 3)[:L]          # rows past the block (lookup extension): repeated drafts
         st.update(t_this_step=1 + L, verify_len=L, pending_tokens=pend + [0] * (p.layout.t_max - len(pend)))
         e.buffers[p.step_state].write(p.layout.pack(st), 0)
 
@@ -163,7 +165,7 @@ def run_full(L):
 
 
 Ls = [int(x) for x in a.ls.split(',')] if a.ls else list(range(1, gamma + 1))
-assert all(1 <= L <= gamma for L in Ls), (Ls, gamma)
+assert all(1 <= L <= s.decode_t_max - 1 for L in Ls) and (s.decode_t_max > gamma + 1 or all(L <= gamma for L in Ls)), (Ls, gamma)
 for _ in range(a.warmup):
     for L in Ls:
         run_full(L)
