@@ -132,6 +132,7 @@ class Session:
         self.coresident = coresident
         # Large prompt chunks with the smaller chunks' reduction orders (backend permitting): identical activations.
         self.prefill_exact = bool(prefill_exact)
+        self.last_prefill_reference = False        # whether the last request ran on the reference prompt graph
         self._coresident: Dict[str, bool] = {}
         self.commute_norm = commute_norm
         self.gdn_mixer_fusion = gdn_mixer_fusion
@@ -219,15 +220,27 @@ class Session:
             raise ValueError("Session: a speculative session decodes with engine(0)")
         return self._engine(t, self.decode_t_max if t == 0 else t, dynamic=(t == 0))
 
-    def prefill_engine(self, prompt_tokens: Optional[int] = None):
-        """A separate graph/ICB for prompt chunks; short prompts use a smaller bucket."""
-        bound = self.prefill_chunk_size
+    # prefill_exact reproduces the results of prompt chunks of this many rows.
+    EXACT_REFERENCE_ROWS = 128
+
+    def _reference_prefill(self) -> bool:
+        """Whether exact mode keeps the reference-size prompt graph next to the large one (see generate)."""
+        return bool(getattr(self, 'prefill_exact', False)) and self.prefill_chunk_size > self.EXACT_REFERENCE_ROWS
+
+    def prefill_engine(self, prompt_tokens: Optional[int] = None, *, reference: bool = False):
+        """A separate graph/ICB for prompt chunks; short prompts use a smaller bucket.
+
+        ``reference``: the prompt graph of EXACT_REFERENCE_ROWS-row chunks, compiled as a session with that chunk
+        size compiles it. Exact mode runs a request on it when the reference chunking has a one-token chunk."""
+        bound = self.EXACT_REFERENCE_ROWS if reference else self.prefill_chunk_size
         if prompt_tokens is not None and self.decoder_kernel_config is None:
             # With a decoder recipe, keep the one full-size prompt graph: it reads
             # the decoder's packed layouts, a smaller bucket would map others.
             bound = min(bound, 1 << (max(1, prompt_tokens) - 1).bit_length())
         # The last prefill pass bootstraps drafting as well as ingesting the prompt.
         bound = max(bound, self.drafter.gamma + 1 if self.drafter is not None else 1)
+        if reference:
+            return self._engine(f"prefill.{bound}.reference", bound, dynamic=True, prefill=True, exact=False)
         return self._engine(f"prefill.{bound}", bound, dynamic=True, prefill=True)
 
     def prepare(self):
@@ -235,11 +248,15 @@ class Session:
         from .runtime.engine import compile_pipelines
         bound = max(self.prefill_chunk_size, self.drafter.gamma + 1 if self.drafter is not None else 1)
         # The decoder first: the prompt graph reuses the packed layouts it derives.
-        plans = [(0, self.decode_t_max, True, False) if self.drafter is not None else (1, 1, False, False),
-                 (f'prefill.{bound}', bound, True, True)]
-        for key, rows, dynamic, prefill in plans:
+        plans = [(0, self.decode_t_max, True, False, None) if self.drafter is not None else (1, 1, False, False, None),
+                 (f'prefill.{bound}', bound, True, True, None)]
+        if self._reference_prefill():
+            # one-token-chunk requests run on the reference graph (generate): no compilation at request time
+            rows = max(self.EXACT_REFERENCE_ROWS, self.drafter.gamma + 1 if self.drafter is not None else 1)
+            plans.append((f'prefill.{rows}.reference', rows, True, True, False))
+        for key, rows, dynamic, prefill, exact in plans:
             if key not in self._programs:
-                self._programs[key] = self._compile(rows, dynamic=dynamic, prefill=prefill)
+                self._programs[key] = self._compile(rows, dynamic=dynamic, prefill=prefill, exact=exact)
             compile_pipelines(self._programs[key], self.dev, fast_math=self.fast_math, cache=self._pipelines)
 
     def _keep_both(self) -> bool:
@@ -282,7 +299,8 @@ class Session:
         self.engine(0)                                       # the main program first: its (larger) states are the shared ones
         return self._engine("alt", self.decode_t_max, dynamic=True, alt=True)
 
-    def _engine(self, key, bound: int, *, dynamic: bool, prefill: bool = False, alt: bool = False):
+    def _engine(self, key, bound: int, *, dynamic: bool, prefill: bool = False, alt: bool = False,
+                exact: Optional[bool] = None):
         from .runtime import Engine
 
         if key not in self.engines:
@@ -292,8 +310,9 @@ class Session:
                 # Derive the decoder's packed layouts before the prompt graph looks for them.
                 self._programs[0] = self._compile(self.decode_t_max, dynamic=True, prefill=False)
             if prog is None:
-                # (alt only when set: callers and tests may replace _compile with the pre-adaptive signature)
-                prog = self._compile(bound, dynamic=dynamic, prefill=prefill, **({'alt': True} if alt else {}))
+                # (alt / exact only when set: callers and tests may replace _compile with an older signature)
+                extra = dict(**({'alt': True} if alt else {}), **({'exact': exact} if exact is not None else {}))
+                prog = self._compile(bound, dynamic=dynamic, prefill=prefill, **extra)
                 self._programs[key] = prog
             # a second decode program never shares a megakernel's synchronization words with the first (crews may differ)
             private = ("mega.flags", "mega.tasks")
@@ -339,7 +358,7 @@ class Session:
                 op.bindings = [(slot, renames.get(n, n), off) for slot, n, off in op.bindings]
         return prog
 
-    def _compile(self, bound, *, dynamic, prefill, alt=False):
+    def _compile(self, bound, *, dynamic, prefill, alt=False, exact: Optional[bool] = None):
         drafter = self.alt_drafter if alt else self.drafter
         # the short-block program verifies its whole block (T <= 8 costs the same for every length)
         verify, verify_length, verify_cost = (("fixed", drafter.gamma, None) if alt else (self.verify, self.verify_length, self.verify_cost))
@@ -359,7 +378,7 @@ class Session:
             from .compiler.prefill import specialize_prompt
             prog = specialize_prompt(prog)
             with using_backend(self.profile.backend) as backend:
-                prog = backend.optimize_prefill(prog, exact=self.prefill_exact)
+                prog = backend.optimize_prefill(prog, exact=self.prefill_exact if exact is None else exact)
             reuse_arenas(prog, barriers=self.barriers)
         if prefill and self.decoder_kernel_config is not None:
             prog = self._alias_weights(prog)
@@ -387,6 +406,22 @@ class Session:
                 if spec.role in ("state", "step_state", "ring"):
                     eng.buffers[name].fill(0)
 
+    @staticmethod
+    def _prompt_chunks(prompt_ids, offset: int, boundaries, rows: int) -> List[List[int]]:
+        """The prompt from ``offset`` on, cut at every boundary and into passes of at most ``rows`` tokens."""
+        chunks, begin = [], offset
+        for end in sorted(boundaries):
+            if end <= begin:
+                continue
+            chunks.extend(list(prompt_ids[i:min(i + rows, end)]) for i in range(begin, end, rows))
+            begin = end
+        return chunks
+
+    @staticmethod
+    def _one_token_chunk(chunks, can_ingest: bool) -> bool:
+        """Whether the prompt graph gets a chunk of one token (the verification graph ingests the last chunk)."""
+        return any(len(chunk) == 1 for chunk in (chunks[:-1] if can_ingest else chunks))
+
     def generate(self, prompt_ids: List[int], max_new_tokens: int, *, steps_per_cb: int = 8, in_flight: int = 3,
                  on_tokens=None, cancelled=None, cache_prefix_tokens: Union[int, Sequence[int]] = 0) -> Generation:
         p = len(prompt_ids)
@@ -403,20 +438,6 @@ class Session:
         can_ingest = (self.decoder_kernel_config is not None and self.drafter is not None
                       and ((self.verify == 'fixed' and (self.verify_length or 0) >= 1) or self.verify == 'cost'))
         resident_prefill = can_ingest and p - offset <= self.resident_prefill_tokens
-        keep = self._keep_both() if self.decoder_kernel_config is not None else False
-        if self.decoder_kernel_config is not None and not resident_prefill and not keep:
-            # Derived matrix layouts and the original prefill pack can each
-            # fit while their union cannot. Retain CPU programs across requests,
-            # but release decoder allocations before loading the prefill pack.
-            self.release_engines()
-        elif resident_prefill and self.engines and 0 not in self.engines and not keep:
-            # A one-token response can finish in prefill without ever loading
-            # decode. Those original weight windows must not be reused by name
-            # for the decoder's differently packed matrices.
-            self.release_engines()
-        reset_started = time.perf_counter()
-        self.reset(preserve_kv=True)
-        state_reset_ms = (time.perf_counter() - reset_started) * 1000
         t_max = self.decode_t_max if resident_prefill else self.prefill_chunk_size
         # Split at the stable message prefix and just before the prompt tail.
         # Intermediate passes do not sample or draft; their state can be reused
@@ -437,14 +458,41 @@ class Session:
             candidates = [n for n in candidates if 0 < n < p] or [p - 1]
             checkpoints.update(n for n in candidates if offset < n < p and n >= cache.min_tokens)
             boundaries.update(checkpoints)
-        chunks = []
-        begin = offset
-        for end in sorted(boundaries):
-            if end <= begin:
-                continue
-            chunks.extend(list(prompt_ids[i:min(i + t_max, end)]) for i in range(begin, end, t_max))
-            begin = end
-        pre = self.engine(0) if resident_prefill else self.prefill_engine(None if cache is not None else p)
+        chunks = self._prompt_chunks(prompt_ids, offset, boundaries, t_max)
+        reference = False
+        if self._reference_prefill() and not resident_prefill:
+            # Exact mode promises the reference chunking's results. Rows are independent in every kernel, with
+            # one exception: a chunk of ONE token. The reference graph computes it with one-row projection
+            # kernels over the original weight layout; the large graph has matrix tiles only (last-bit
+            # different) and cannot keep a second copy of the weights resident. A request whose reference
+            # chunking gives the prompt graph such a chunk therefore runs the reference path itself: the same
+            # chunks on the same graph, with its engine hand-over (no co-resident engines for this request).
+            expected = self._prompt_chunks(prompt_ids, offset, boundaries, self.EXACT_REFERENCE_ROWS)
+            if self._one_token_chunk(expected, can_ingest):
+                reference, chunks, t_max = True, expected, self.EXACT_REFERENCE_ROWS
+        self.last_prefill_reference = reference
+        keep = self._keep_both() if self.decoder_kernel_config is not None and not reference else False
+        if reference:
+            self.release_engines()
+        elif self.decoder_kernel_config is not None and not resident_prefill and not keep:
+            # Derived matrix layouts and the original prefill pack can each
+            # fit while their union cannot. Retain CPU programs across requests,
+            # but release decoder allocations before loading the prefill pack.
+            self.release_engines()
+        elif resident_prefill and self.engines and 0 not in self.engines and not keep:
+            # A one-token response can finish in prefill without ever loading
+            # decode. Those original weight windows must not be reused by name
+            # for the decoder's differently packed matrices.
+            self.release_engines()
+        reset_started = time.perf_counter()
+        self.reset(preserve_kv=True)
+        state_reset_ms = (time.perf_counter() - reset_started) * 1000
+        if resident_prefill:
+            pre = self.engine(0)
+        elif reference:
+            pre = self.prefill_engine(None if cache is not None else p, reference=True)
+        else:
+            pre = self.prefill_engine(None if cache is not None else p)
         self._last_engine = pre
         cap = pre.program.context_capacity                    # the last new token is sampled at position p + max_new_tokens - 2
         if cap and p + max_new_tokens - 1 > cap:
@@ -464,7 +512,7 @@ class Session:
             if cancelled and cancelled():
                 return Generation([], prefill_ms, 0, 0, 0, 0)
             if can_ingest and not resident_prefill and k == len(chunks) - 1:
-                if not keep:
+                if not keep:                                   # (always on the reference path)
                     self.release_engines(keep_state_from=pre)
                 del pre
                 pre = self.engine(0)
@@ -495,7 +543,7 @@ class Session:
         steps = alt_steps = 0
         n_pre = len(tokens)
         if max_new_tokens > 1 and not r1.done and not (cancelled and cancelled()):
-            if self.decoder_kernel_config is not None and not resident_prefill and not keep:
+            if (self.decoder_kernel_config is not None or reference) and not resident_prefill and not keep:
                 self.release_engines(keep_state_from=pre)
                 del pre
             if getattr(self, 'alt_drafter', None) is not None:
