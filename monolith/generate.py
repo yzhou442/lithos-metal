@@ -84,7 +84,8 @@ class Session:
                  prefill_attention: Optional[str] = None, decoder_kernel_config: Optional[Dict[str, Any]] = None,
                  prefix_cache: bool = False, prefix_cache_min_tokens: int = 0, device=None, pipeline_cache=None,
                  prefill_optimizations: bool = True, prefix_cache_max_bytes: Optional[int] = None,
-                 resident_prefill_tokens: Optional[int] = None, coresident: Optional[bool] = None) -> None:
+                 resident_prefill_tokens: Optional[int] = None, coresident: Optional[bool] = None,
+                 prefill_exact: bool = False) -> None:
         """``drafter`` (a ``Drafter`` built with the model's head) and its pack turn the session speculative: one
         small dynamic-T decode program holds the round; ``verify`` / ``verify_threshold`` as in ``compile_program``."""
         from .runtime import _native as nt
@@ -127,6 +128,8 @@ class Session:
         # None: keep the prompt and verification graphs allocated together when their
         # union fits Metal's working set (see _keep_both); False/True force it.
         self.coresident = coresident
+        # Large prompt chunks with the smaller chunks' reduction orders (backend permitting): identical activations.
+        self.prefill_exact = bool(prefill_exact)
         self._coresident: Dict[str, bool] = {}
         self.commute_norm = commute_norm
         self.gdn_mixer_fusion = gdn_mixer_fusion
@@ -324,7 +327,7 @@ class Session:
             from .compiler.prefill import specialize_prompt
             prog = specialize_prompt(prog)
             with using_backend(self.profile.backend) as backend:
-                prog = backend.optimize_prefill(prog)
+                prog = backend.optimize_prefill(prog, exact=self.prefill_exact)
             reuse_arenas(prog, barriers=self.barriers)
         if prefill and self.decoder_kernel_config is not None:
             prog = self._alias_weights(prog)

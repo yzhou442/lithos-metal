@@ -64,7 +64,7 @@ class MetalBackend:
     def optimize_draft(self, program, drafter, *, prefill=False):
         return drafter.optimize_program(program, prefill=prefill)
 
-    def optimize_prefill(self, program):
+    def optimize_prefill(self, program, exact=False):
         """Chip-owned tuning for large prompt chunks, before scratch reuse."""
         return program
 
