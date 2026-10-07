@@ -82,7 +82,8 @@ class Session:
                  prefill_chunk_size: int = 128, commute_norm: bool = True, gdn_mixer_fusion: bool = True,
                  prefill_attention: Optional[str] = None, decoder_kernel_config: Optional[Dict[str, Any]] = None,
                  prefix_cache: bool = False, prefix_cache_min_tokens: int = 0, device=None, pipeline_cache=None,
-                 prefill_optimizations: bool = True, prefix_cache_max_bytes: Optional[int] = None) -> None:
+                 prefill_optimizations: bool = True, prefix_cache_max_bytes: Optional[int] = None,
+                 resident_prefill_tokens: Optional[int] = None) -> None:
         """``drafter`` (a ``Drafter`` built with the model's head) and its pack turn the session speculative: one
         small dynamic-T decode program holds the round; ``verify`` / ``verify_threshold`` as in ``compile_program``."""
         from .runtime import _native as nt
@@ -110,6 +111,16 @@ class Session:
         if not isinstance(prefill_chunk_size, int) or isinstance(prefill_chunk_size, bool) or prefill_chunk_size < 1:
             raise ValueError("prefill_chunk_size must be a positive integer")
         self.prefill_chunk_size = prefill_chunk_size
+        # With an explicit decoder recipe, prompts (uncached suffixes) of at most
+        # this many tokens are ingested by the resident verification graph instead
+        # of the prefill program. It used to equal the chunk size; keep that
+        # behaviour for chunks up to 128 rows, but do not route a 129..512-token
+        # prompt through 8-row passes merely because prefill chunks are larger.
+        if resident_prefill_tokens is None:
+            resident_prefill_tokens = min(prefill_chunk_size, 128)
+        if not isinstance(resident_prefill_tokens, int) or isinstance(resident_prefill_tokens, bool) or resident_prefill_tokens < 0:
+            raise ValueError("resident_prefill_tokens must be a non-negative integer")
+        self.resident_prefill_tokens = resident_prefill_tokens
         self.commute_norm = commute_norm
         self.gdn_mixer_fusion = gdn_mixer_fusion
         self.decode_t_max = decode_layout.t_max
@@ -266,7 +277,7 @@ class Session:
         # ICB resident for short prompts/tails instead of remapping both packs.
         can_ingest = (self.decoder_kernel_config is not None and self.drafter is not None
                       and self.verify == 'fixed' and (self.verify_length or 0) >= 1)
-        resident_prefill = can_ingest and p - offset <= self.prefill_chunk_size
+        resident_prefill = can_ingest and p - offset <= self.resident_prefill_tokens
         if self.decoder_kernel_config is not None and not resident_prefill:
             # Derived matrix layouts and the original prefill pack can each
             # fit while their union cannot. Retain CPU programs across requests,

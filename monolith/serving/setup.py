@@ -30,6 +30,7 @@ class ServingAssets:
     gamma: int = 0
     recipes: dict | None = None
     recipe_key: str | None = None
+    prefill_chunk_size: int | None = None   # the backend's measured prefill pass size for this model, if any
 
     def options(self, prompt_tokens):
         profile = copy.deepcopy(self.profile)
@@ -129,5 +130,6 @@ def prepare(args, *, device_info=None):
                                   backend=profile.backend, role='draft', quantization=quantization)
     LOG.info('Serving backend=%s, target=%s, draft=%s, verify=%s, recipe contexts=%s',
              profile.backend, model_dir, draft_dir, gamma + 1 if gamma else 1, sorted(recipes))
+    chunk = backend.serving_prefill_chunk(model, draft, recipes)
     return ServingAssets(model_dir, pack, args.max_context, capacity, profile,
-                         draft_dir, draft_pack, gamma, recipes, args.kernel_config_key)
+                         draft_dir, draft_pack, gamma, recipes, args.kernel_config_key, chunk)

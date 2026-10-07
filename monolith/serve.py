@@ -85,7 +85,7 @@ class Backend:
             self.session = load_session(self.model_dir, self.pack_dir, **options,
                 temperature=request.temperature, top_p=request.top_p, seed=request.seed,
                 autotune=False, prefill_chunk_size=self.prefill_chunk_size, prefix_cache=True,
-                prefix_cache_min_tokens=self.prefill_chunk_size)
+                prefix_cache_min_tokens=min(self.prefill_chunk_size, 128))
         if prefix_cache is not None:
             self.session.prefix_cache = prefix_cache
         while len(sessions) > 8:
@@ -389,7 +389,8 @@ def parse_args(argv=None):
     parser.add_argument("--kernel-config-key", help="Pin a context key in the selected recipe map")
     parser.add_argument("--served-model-name", default=None)
     parser.add_argument("--max-context", type=int, default=32768)
-    parser.add_argument("--prefill-chunk-size", type=int, default=128, help="Prompt tokens per prefill pass (default: 128)")
+    parser.add_argument("--prefill-chunk-size", type=int, default=None,
+                        help="Prompt tokens per prefill pass (default: the chip's measured size for the model, else 128)")
     parser.add_argument("--no-warmup", action='store_true', help="Skip startup compilation/warmup; the first request pays this cost")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
@@ -399,7 +400,7 @@ def parse_args(argv=None):
         args.draft = default_draft(args.model)
     if args.max_context < 1:
         parser.error("--max-context must be positive")
-    if args.prefill_chunk_size < 1:
+    if args.prefill_chunk_size is not None and args.prefill_chunk_size < 1:
         parser.error("--prefill-chunk-size must be positive")
     if args.draft_block_size is not None and args.draft_block_size < 1:
         parser.error('--draft-block-size must be positive')
@@ -417,7 +418,8 @@ def main(argv=None):
     logging.basicConfig(level=logging.INFO)
     assets = prepare(args)
     api_key = os.environ.get("LITHOS_METAL_API_KEY") or os.environ.get("LMK_API_KEY") or os.environ.get("MONOLITH_API_KEY")
-    backend = Backend(str(assets.model_dir), str(assets.pack_dir), args.max_context, args.prefill_chunk_size, assets=assets)
+    chunk = args.prefill_chunk_size or getattr(assets, 'prefill_chunk_size', None) or 128
+    backend = Backend(str(assets.model_dir), str(assets.pack_dir), args.max_context, chunk, assets=assets)
     model_name = args.served_model_name or (assets.model_dir.name if Path(args.model).expanduser().exists() else args.model)
     if not args.no_warmup:
         backend.warmup(model_name)
