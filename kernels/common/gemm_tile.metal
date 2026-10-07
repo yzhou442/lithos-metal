@@ -272,6 +272,9 @@ kernel void gemm_tile(device const uint4* w [[buffer(0)]], device const float* r
   const uint mq = (lane & 1u) | (((lane >> 3) & 1u) << 1);            // its member id in the quad sharing those rows
 #if POST_NORM
   float norm_r = 0.f;
+#if TM > 8
+  float norm_r8 = 0.f;                                                // tokens 8..15 of a 16-row tile (destination s2 = 1)
+#endif
 #endif
   for (uint tile = p.tile0 + sg_tile; tile < p.tile0 + p.n_tiles; tile += n_tg) {
     auto bT = op.get_right_input_cooperative_tensor<bfloat, bfloat, float>();
@@ -445,8 +448,8 @@ kernel void gemm_tile(device const uint4* w [[buffer(0)]], device const float* r
     if (slice != 0u) continue;
 #endif
 #if POST_NORM
-#if TM > 8
-#error POST_NORM requires a short tile
+#if TM > 16
+#error POST_NORM covers at most sixteen token rows
 #endif
 #if POST_NORM_ONCE
     // A persistent crew reuses the same input across its output tiles.
@@ -467,6 +470,22 @@ kernel void gemm_tile(device const uint4* w [[buffer(0)]], device const float* r
     ssq += simd_shuffle_xor(ssq, ushort(1));
     ssq += simd_shuffle_xor(ssq, ushort(2));
     norm_r = simd_shuffle(rsqrt(ssq / float(K) + POST_NORM_EPS), ushort(4u * c1b));
+#if TM > 8
+    // The second half of a 16-row tile: the same per-token reduction (same lanes, same order) for token lane/4 + 8.
+    {
+      const uint norm_row8 = token0 + min(lane / 4u + 8u, T_act - 1u);
+      float u0 = 0, u1 = 0, u2 = 0, u3 = 0;
+      for (uint b = q; b < POST_NORM_PARTS; b += 64u) {
+        float v[16];
+        for (uint u = 0; u < 16; u++) v[u] = b + 4u * u < POST_NORM_PARTS ? norm_stat[norm_row8 * POST_NORM_PARTS + b + 4u * u] : 0.f;
+        for (uint u = 0; u < 16; u += 4) { u0 += v[u]; u1 += v[u+1]; u2 += v[u+2]; u3 += v[u+3]; }
+      }
+      float ssq8 = (u0 + u1) + (u2 + u3);
+      ssq8 += simd_shuffle_xor(ssq8, ushort(1));
+      ssq8 += simd_shuffle_xor(ssq8, ushort(2));
+      norm_r8 = simd_shuffle(rsqrt(ssq8 / float(K) + POST_NORM_EPS), ushort(4u * c1b));
+    }
+#endif
 #if POST_NORM_ONCE
     }
 #endif
@@ -492,7 +511,12 @@ kernel void gemm_tile(device const uint4* w [[buffer(0)]], device const float* r
 #pragma clang loop unroll(full)
           for (uint qq = 0; qq < 4u; qq++) v[qq] = cT[uint16_t((((blk * (TN / 16u) + jump) * 2u + s2) << 2) | qq)] * rs[qq];
 #if POST_NORM
+#if TM > 8
+          const float nr = (s2 == 0u) ? norm_r : norm_r8;
+          for (uint qq = 0; qq < 4u; qq++) v[qq] *= nr;
+#else
           for (uint qq = 0; qq < 4u; qq++) v[qq] *= norm_r;
+#endif
 #endif
 #if EPILOGUE == 2
           float pv[4];                                                   // the partner rows: up for a gate lane, gate for an up lane

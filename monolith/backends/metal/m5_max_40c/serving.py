@@ -44,12 +44,6 @@ def recipes(model, drafter, quantization):
     for key in ('4096', '8192', '16384'):
         selected[key] = copy.deepcopy(selected['32768'])
         selected[key]['target'] = contexts[key]['target']
-    if draft.block_size != 7:
-        # The measured target recipes are eight-row programs (decoder_fusion) and the draft recipes' native tiles
-        # are eight rows (static_fusion TM=8): other blocks keep the formats, thresholds and draft attention but run
-        # the generic dynamic-T kernels. The prefill attention stays the one the eight-row serve path selects.
-        for recipe in selected.values():
-            recipe.pop('target', None)
-            recipe.pop('draft', None)
-            recipe['prefill_attention'] = 'auto'
+    # The recipes were measured at block 7 (verify 8 rows); blocks 8-15 compile the same recipes at the sixteen-row
+    # bound (TM16 tiles, T_HI 16, single-pass GDN at T <= 16: static_fusion / emit), with every per-row result equal.
     return selected

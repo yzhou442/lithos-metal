@@ -105,7 +105,8 @@ class Session:
             drafter.bind_target(model)
             bind_pack_formats(drafter, self.drafter_pack)
         if layout is None and drafter is not None:
-            layout = StepStateLayout(t_max=max(8, drafter.gamma + 1), gamma_max=max(7, drafter.gamma))
+            # verify bounds come in the two row counts the recipes compile for: 8, else 16 (blocks 8-15)
+            layout = StepStateLayout(t_max=8 if drafter.gamma + 1 <= 8 else 16, gamma_max=max(7, drafter.gamma))
         decode_layout = layout or StepStateLayout()
         if not isinstance(prefill_chunk_size, int) or isinstance(prefill_chunk_size, bool) or prefill_chunk_size < 1:
             raise ValueError("prefill_chunk_size must be a positive integer")
@@ -230,8 +231,8 @@ class Session:
         if self.tuner is not None:
             self.tuner.save(self.dev.info().name)
         if self.decoder_kernel_config is not None and not prefill:
-            if not dynamic or bound != 8:
-                raise ValueError('explicit decoder recipes require a dynamic eight-row verification program')
+            if not dynamic or bound not in (8, 16):
+                raise ValueError('explicit decoder recipes require a dynamic eight- or sixteen-row verification program')
             from .compiler.barriers import place_barriers
             if self.decoder_kernel_config:
                 with using_backend(self.profile.backend) as backend:

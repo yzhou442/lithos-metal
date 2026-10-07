@@ -532,7 +532,7 @@ def _norm_output(ctx: _Ctx, v: Value) -> Optional[Tuple[str, Dict[str, str], Tup
             continue
         tm, wpw, tk, t_src, lo, hi = plan
         info = ctx.slab_info(c.inputs[1].name)
-        if not 2 <= hi <= 8 or (info.format == "bf16" and info.k == 1024 and hi == 4):
+        if not 2 <= hi <= 16 or (info.format == "bf16" and info.k == 1024 and hi == 4):
             continue  # the small BF16 path uses a separate SIMD kernel
         if ctx.rows_of(v.producer) != (hi, t_src):
             continue
@@ -1070,16 +1070,16 @@ def _gdn(ctx: _Ctx, op: Op) -> None:
     prepared_blocks = hv * (dv // 4)
     if prepared:
         macros.update(PREPARED="1", SPB="1u", SL="4u", TP="8u")
-    local_prepare = (prepared and ctx.t in (1, 4, 6, 8) and dk == dv == 128 and hv >= 16
+    local_prepare = (prepared and ctx.t in (1, 4, 6, 8, 16) and dk == dv == 128 and hv >= 16
                      and len(o_part.consumers) == 1 and o_part.consumers[0].kind == "gdn_norm")
     fuse_norm = local_prepare and ctx.t == 1
     local_groups = 16 if ctx.t == 4 else 32
     if local_prepare:
         # Multi-token recurrence can overlap the gate projection. Smaller slices
         # at T=6/8 provide more independent work without duplicating device state.
-        sl = 2 if ctx.t in (6, 8) else 4
+        sl = 2 if ctx.t in (6, 8, 16) else 4
         prepared_blocks = hv * (dv // sl)
-        macros.update(LOCAL_PREPARE="1", SINGLE_PASS="1", LOCAL_GROUPS=f"{local_groups}u", SL=f"{sl}u", TP=f"{min(8, ctx.t)}u")
+        macros.update(LOCAL_PREPARE="1", SINGLE_PASS="1", LOCAL_GROUPS=f"{local_groups}u", SL=f"{sl}u", TP=f"{min(16, ctx.t)}u")
     main, abv = projs[ps["in_proj_qkv"][0]], projs[ps["in_proj_a"][0]]
     preconvolved = not commit and main.name in ctx.preconvolved
     if preconvolved:

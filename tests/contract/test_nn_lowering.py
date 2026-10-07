@@ -424,6 +424,6 @@ def test_commuted_norm_option_and_large_tile_fallback(tmp_path):
         p = compile_program(model, pack, profile, t=tokens, **options,
                             layout=StepStateLayout(t_max=16, gamma_max=15))
         fused = [op for op in p.ops if p.kernels[op.kernel].macros.get('POST_NORM') == '1']
-        assert bool(fused) == (enabled is not False and tokens == 8)
+        assert bool(fused) == (enabled is not False and tokens in (8, 16))   # POST_NORM covers 16-row tiles (spec)
         for op in fused:
             assert any(index == 5 for index, _, _ in op.bindings)
