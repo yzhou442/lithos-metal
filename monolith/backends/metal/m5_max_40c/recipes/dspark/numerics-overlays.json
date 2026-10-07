@@ -1,5 +1,5 @@
 {
- "_doc": "Opt-in, numerics-changing recipe overlays. Off unless named in LITHOS_NUMERICS_OVERLAYS (comma separated); each entry deep-merges a per-context patch into the selected recipe (null deletes a key). Every overlay records its numerics-gate result (BRIEF numerics-change gate) under _gate.",
+ "_doc": "Opt-in, numerics-changing recipe overlays. Off unless named in LITHOS_NUMERICS_OVERLAYS (comma separated); each entry deep-merges a per-context patch into the selected recipe (null deletes a key). Every overlay records its numerics-gate result (teacher-forced agreement / KL against the default recipes, greedy divergence, task sanity, speed) under _gate.",
  "attention_big_tile": {
   "_doc": "Verify attention core with one 48-row x 64-key score MMA and one value MMA per key tile for all of a KV head's query rows (instead of 16-row groups x 32-key tiles); K/V read straight from the cache. Changes the online-softmax partition: last-bit differences.",
   "_gate": {
@@ -7,7 +7,7 @@
    "logits": "FAIL: agreement 99.15 %, mean KL 1.88e-3, max KL 1.08, max |dlogit| teacher 7.9; all in document prompt-tail rows (doc4k 98.58 % / 4.2e-3, doc16k 98.88 % / 1.4e-3); generated rows 100 % / <= 3.2e-4",
    "first_divergence": "none (lmbench full + long identical to baseline tokens)",
    "tasks": "pending",
-   "speed": "round 0.958 at 16K, 0.984 at 4K (kround paired); end-to-end pending"
+   "speed": "round 0.958 at 16K, 0.984 at 4K (paired whole-round A/B)"
   },
   "4096": {
    "target": {
