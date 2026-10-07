@@ -292,7 +292,8 @@ class Session:
                 # Derive the decoder's packed layouts before the prompt graph looks for them.
                 self._programs[0] = self._compile(self.decode_t_max, dynamic=True, prefill=False)
             if prog is None:
-                prog = self._compile(bound, dynamic=dynamic, prefill=prefill, alt=alt)
+                # (alt only when set: callers and tests may replace _compile with the pre-adaptive signature)
+                prog = self._compile(bound, dynamic=dynamic, prefill=prefill, **({'alt': True} if alt else {}))
                 self._programs[key] = prog
             # a second decode program never shares a megakernel's synchronization words with the first (crews may differ)
             private = ("mega.flags", "mega.tasks")
@@ -497,7 +498,7 @@ class Session:
             if self.decoder_kernel_config is not None and not resident_prefill and not keep:
                 self.release_engines(keep_state_from=pre)
                 del pre
-            if self.alt_drafter is not None:
+            if getattr(self, 'alt_drafter', None) is not None:
                 dec_ms, dec_wall, host, steps, alt_steps = self._decode_adaptive(tokens, max_new_tokens, on_tokens, cancelled)
             elif on_tokens:
                 # Bound each host pump for incremental output/cancellation, while
