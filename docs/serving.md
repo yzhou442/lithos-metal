@@ -122,6 +122,20 @@ The 35B-A3B uses one configuration across contexts. Selection happens once per r
 `--kernel-config` can override the recipe JSON and
 `--kernel-config-key` can pin an entry. Recipes live in the selected chip backend.
 
+Heads whose config records `training_block_size` (a DSpark head trained at 16 positions) can serve up to
+`min(training_block_size - 1, 15)` proposals; `--draft-block-size 8` to `15` compiles the same recipes at a
+sixteen-row verification bound. Two opt-in rules decide how many rows a round verifies; neither changes greedy
+output, only how many tokens a round commits:
+
+* `--verify-rule cost` picks each round's verification length from the drafter's confidence chain and the chip's
+  measured whole-round cost per length (`recipes/dspark/verify-cost.json` in the backend, measured with
+  `tools/bench/spec_cost_table.py`). It applies to blocks above seven and to `--draft-lookup`; backends without
+  a table keep fixed verification.
+* `--draft-lookup` extends a fully drafted block with a context-lookup continuation (the tokens that followed the
+  latest earlier occurrence of the current suffix in the prompt or output) in verification rows 9-16. It helps
+  copy-heavy requests such as file rewrites and structured edits; combine it with `--verify-rule cost`, which
+  weighs the continuation by the request's measured lookup acceptance.
+
 The checkpoint must include its tokenizer and chat template.
 Experimental support for NVIDIA's Qwen3.6-35B-A3B hybrid MoE, including its
 Koopah DSpark pairing and outstanding numerical qualification, is described in
@@ -241,8 +255,12 @@ accepted prompt rows, and the forward GDN pass retains state in registers throug
 the chunk. Temporary allocations are reused after their last consumer. Decode
 still uses the existing seven-proposal DSpark recipe.
 
-The measured throughput choice for this model/device is `--prefill-chunk-size 512`.
-The portable default remains 128. In isolated whole-program GPU measurements
+The measured throughput choice for this model/device is `--prefill-chunk-size 512`
+(`--prefill-chunk-size auto` selects it wherever a backend reports a measured size). The portable default remains
+128: 512-row chunks reduce in a different order, which can change greedy tokens on very long prompts. With 512-row
+chunks the prompt graph reads the decoder's packed weight files where the layouts allow, so the prompt and decoder
+engines (which stay allocated together whenever both fit in 0.9x Metal's recommended working set) share most of
+their weights and long requests no longer re-map them between prefill and decode. In isolated whole-program GPU measurements
 (three samples after warmup, synthetic cached KV), 128-row chunks improved as
 follows; these numbers exclude HTTP, tokenizer, checkpoint and layout-transition
 costs and are not time to first token:
