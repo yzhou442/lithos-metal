@@ -225,7 +225,8 @@
         "nvfp4_layout": "tile",
         "nvfp4_tile_block": 16,
         "q_outer": 1
-      }
+      },
+      "gdn_dead_state": true
     }
   },
   "4096": {
@@ -449,7 +450,8 @@
         "nvfp4_layout": "tile",
         "nvfp4_tile_block": 16,
         "q_outer": 1
-      }
+      },
+      "gdn_dead_state": true
     }
   },
   "8192": {
@@ -672,7 +674,8 @@
         "nvfp4_layout": "tile",
         "nvfp4_tile_block": 16,
         "q_outer": 1
-      }
+      },
+      "gdn_dead_state": true
     }
   },
   "16384": {
@@ -861,7 +864,9 @@
         "task_grain": "tile",
         "task_seed": true,
         "tn": 32,
-        "workers": 120
+        "workers": 120,
+        "fuse": false,
+        "attention_kv_pipeline": true
       },
       "mlp": {
         "cache_external_inputs": false,
@@ -895,7 +900,8 @@
         "nvfp4_layout": "tile",
         "nvfp4_tile_block": 16,
         "q_outer": 1
-      }
+      },
+      "gdn_dead_state": true
     }
   },
   "32768": {
@@ -1127,7 +1133,8 @@
         "nvfp4_layout": "tile",
         "nvfp4_tile_block": 16,
         "q_outer": 1
-      }
+      },
+      "gdn_dead_state": true
     }
   }
 }

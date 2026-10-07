@@ -51,4 +51,26 @@ def optimize(program, config):
         if len(heads) != 1:
             raise ValueError('decoder lm_head recipe requires one tensor vocabulary projection')
         regions.append((heads[0], heads[0] + 1, 'decoder.lm_head', dict(config['lm_head'], fuse=False)))
-    return fuse_regions(p, regions)
+    result = fuse_regions(p, regions)
+    if config.get('gdn_dead_state'):
+        for program in result:
+            elide_dead_gdn_state(program)
+    return result
+
+
+def elide_dead_gdn_state(program):
+    """Skip the verify recurrence's state store where the commit pass rewrites it.
+
+    In a speculative program the GDN commit pass recomputes the committed rows from the slot the verify pass read
+    and overwrites the slot it wrote, so outside prefill chunks (where the commit pass returns early) the verify's
+    final-pass store is dead (a multi-pass block still stores between its passes). Numerics are untouched.
+    """
+    if not any(o.name == 'gdn_commit' for o in program.ops):
+        return 0
+    n = 0
+    for op in program.ops:
+        k = program.kernels[op.kernel]
+        if (k.function == 'gdn_mixer' and k.macros.get('COMMIT', '0') != '1' and k.macros.get('STEP_STATE') == '1'):
+            k.macros['DEAD_STATE'] = '1'
+            n += 1
+    return n

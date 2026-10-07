@@ -238,7 +238,8 @@
         "nvfp4_layout": "tile",
         "nvfp4_tile_block": 16,
         "q_outer": 1
-      }
+      },
+      "gdn_dead_state": true
     },
     "accelerator_min_t": {
       "nvfp4": 2
@@ -486,7 +487,8 @@
         "nvfp4_layout": "tile",
         "nvfp4_tile_block": 16,
         "q_outer": 1
-      }
+      },
+      "gdn_dead_state": true
     },
     "accelerator_min_t": {
       "nvfp4": 2

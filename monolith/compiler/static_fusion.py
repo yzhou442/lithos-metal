@@ -58,7 +58,7 @@ def normalize(p,sgs,mode="coop",groups=None, *, tn=16, split=False,
               gdn_tp=None, perm_sgs=None, staged_tk=None, fp8_decode='standard', gdn_global=None,
               q_outer=None, fp8_layout='blm', weight_prefetch=0, fp8_tile_block=1, fp8_storage='fp8', tm=16, attention_prepare=False, attention_chunk_tiles=1,
               attention_style='staged', attention_key_tile=32, attention_cached_prefix=False, attention_alias_scratch=False, attention_task_order='head',
-              attention_compact_partials=False, nvfp4_layout="blm", nvfp4_tile_block=1, nvfp4_scale_mode="shared", nvfp4_operand="standard", nvfp4_prefetch=0, nvfp4_vector_loads=False,
+              attention_compact_partials=False, attention_kv_pipeline=False, nvfp4_layout="blm", nvfp4_tile_block=1, nvfp4_scale_mode="shared", nvfp4_operand="standard", nvfp4_prefetch=0, nvfp4_vector_loads=False,
               post_norm_once=None, post_norm_loads=16, post_norm_prefold=False):
     if type(post_norm_prefold) is not bool or (post_norm_once is not None and type(post_norm_once) is not bool) or type(post_norm_loads) is not int or post_norm_loads not in (4,8,16,32):
         raise ValueError('unsupported post-product normalization fold')
@@ -161,7 +161,7 @@ def normalize(p,sgs,mode="coop",groups=None, *, tn=16, split=False,
                     attention_prepare=attention_prepare,attention_chunk_tiles=attention_chunk_tiles,
                     attention_style=attention_style,attention_key_tile=attention_key_tile,attention_cached_prefix=attention_cached_prefix,
                     attention_alias_scratch=attention_alias_scratch,attention_compact_partials=attention_compact_partials,
-                    attention_task_order=attention_task_order,
+                    attention_task_order=attention_task_order,attention_kv_pipeline=attention_kv_pipeline,
                     nvfp4_layout=nvfp4_layout,nvfp4_tile_block=nvfp4_tile_block,nvfp4_scale_mode=nvfp4_scale_mode,nvfp4_operand=nvfp4_operand,nvfp4_prefetch=nvfp4_prefetch,nvfp4_vector_loads=nvfp4_vector_loads,
                     post_norm_once=post_norm_once,post_norm_loads=post_norm_loads)
         out=normalize(p,sgs,mode,groups,**common)
@@ -559,9 +559,11 @@ def normalize(p,sgs,mode="coop",groups=None, *, tn=16, split=False,
         o.threadgroup=(32*sgs,1,1)
     if gdn_global is not None and any(p.kernels[o.kernel].function=='gdn_mixer' for o in p.ops):
         p=_gdn_recurrence_options(p,sgs,gdn_global,0,1)
-    if attention_prepare or attention_chunk_tiles != 1 or attention_cached_prefix or attention_alias_scratch or attention_key_tile!=32 or attention_compact_partials or attention_task_order!='head':
+    if type(attention_kv_pipeline) is not bool:
+        raise ValueError('attention_kv_pipeline must be a boolean')
+    if attention_prepare or attention_chunk_tiles != 1 or attention_cached_prefix or attention_alias_scratch or attention_key_tile!=32 or attention_compact_partials or attention_task_order!='head' or attention_kv_pipeline:
         from .attention_fusion import specialize_attention
-        p=specialize_attention(p,sgs,attention_prepare,attention_chunk_tiles,attention_style,attention_key_tile,attention_cached_prefix,attention_alias_scratch,attention_task_order)
+        p=specialize_attention(p,sgs,attention_prepare,attention_chunk_tiles,attention_style,attention_key_tile,attention_cached_prefix,attention_alias_scratch,attention_task_order,attention_kv_pipeline)
         if attention_compact_partials:
             from .attention_fusion import compact_partials
             compact_partials(p)
