@@ -34,15 +34,20 @@ def specialize_prompt(program):
     return program
 
 
-def projection_geometry(program, op, *, tm, tn, sgs, groups):
-    """Retile an emitted matrix projection without changing its K layout."""
+def projection_geometry(program, op, *, tm, tn, sgs, groups, tk=128, q_outer=None):
+    """Retile an emitted matrix projection; ``tk`` < 128 also needs input_tile_order for its x'."""
     old = program.kernels[op.kernel]
     if old.function != 'gemm_tile' or int(old.macros['TK'].rstrip('u')) != 128:
         raise ValueError('prefill projection tuning requires a 128-column matrix tile')
-    key = op.kernel + f'.prefill.{tm}.{tn}.{sgs}.{groups}'
+    if tk not in (32, 64, 128) or (tk != 128 and int(old.macros['K'].rstrip('u')) % tk):
+        raise ValueError('unsupported prefill reduction tile')
+    key = op.kernel + f'.prefill.{tm}.{tn}.{sgs}.{groups}' + (f'.tk{tk}' if tk != 128 else '') + (
+        f'.q{q_outer}' if q_outer is not None else '')
     kernel = copy.deepcopy(old)
     oldtn = int(kernel.macros['TN'].rstrip('u'))
-    kernel.macros.update(TM=str(tm), TN=f'{tn}u', KSPLIT='1u', SCALE_CACHE='0')
+    kernel.macros.update(TM=str(tm), TN=f'{tn}u', TK=f'{tk}u', KSPLIT='1u', SCALE_CACHE='0')
+    if q_outer is not None:
+        kernel.macros['Q_OUTER'] = str(q_outer)
     pn, off = next((n, o) for slot, n, o in op.bindings if slot == 4)
     data = bytearray(program.buffers[pn].init)
     n, _, _, rows, _, tile0, _, _ = struct.unpack_from('<IIIIfIII', data, off)
@@ -59,29 +64,166 @@ def projection_geometry(program, op, *, tm, tn, sgs, groups):
     op.meta.update(tm=tm, tile=[tn, 128], geometry=f'prefill_{groups}x{sgs}')
 
 
-def packed_nvfp4_projection(program, op):
+def packed_nvfp4_projection(program, op, tile_block=1, rows=None):
     """Losslessly arrange codes/scales in the cooperative matrix load order."""
     from . import nvfp4_tiles
 
     kernel = program.kernels[op.kernel]
     binding = next((name, offset) for slot, name, offset in op.bindings if slot == 0)
-    rows = nvfp4_tiles.projection_rows(program)[binding]
+    rows = rows or nvfp4_tiles.projection_rows(program)[binding]
     tn, tk = (int(kernel.macros[field].rstrip('u')) for field in ('TN', 'TK'))
-    name, spec, scale_base = nvfp4_tiles.repack(program, binding, kernel.macros, rows, tn, tk)
+    name, spec, scale_base = nvfp4_tiles.repack(program, binding, kernel.macros, rows, tn, tk, tile_block)
     program.buffers[name] = spec
     op.bindings = [(slot, name, 0) if slot == 0 else (slot, n, offset) for slot, n, offset in op.bindings]
-    nvfp4_tiles.specialize_source(kernel, 1, 'shared', scale_base, vector_loads=True)
+    nvfp4_tiles.specialize_source(kernel, tile_block, 'shared', scale_base, vector_loads=True)
     op.meta['prefill_packed_nvfp4'] = True
 
 
-def packed_fp8_projection(program, op, rows, *, tile_block=1):
-    """Keep FP8 codes unchanged while making each operand load contiguous."""
+def shared_nvfp4_layout(program, op, *, tn=None, tk=None):
+    """A packed NVFP4 layout another program (the verification graph) derived from this op's slab, or None.
+
+    Returns the repack arguments; reusing them maps the same content-addressed file, so a prompt graph and
+    a decoder can keep one copy of the weights in memory instead of evicting each other's layouts."""
+    from . import nvfp4_tiles
+
+    binding = next(((name, offset) for slot, name, offset in op.bindings if slot == 0), None)
+    if binding is None or binding[0] not in program.buffers:
+        return None
+    key = nvfp4_tiles.source_key(program, binding)
+    if key not in nvfp4_tiles.LAYOUTS:
+        return None
+    rows = nvfp4_tiles.projection_rows(program).get(binding)
+    kernel = program.kernels[op.kernel]
+    lane_order = int(kernel.macros.get('LANE_ORDER', '0'))
+    for record in nvfp4_tiles.LAYOUTS.get(key, {}).values():
+        if (record['rows'] == rows and record['scale_mode'] == 'shared' and record['lane_order'] == lane_order
+                and (tn is None or record['tn'] == tn) and (tk is None or record['tk'] == tk)
+                and record['tk'] in (32, 64, 128) and record['tn'] in (16, 32)):
+            return record
+    return None
+
+
+def input_tile_order(program, consumer, tk):
+    """Make every producer of a projection's x' write the ``tk``-column tile order its reader now expects.
+
+    Writers are x_permute (TK), fused producers (PERM_TK) and residual norms (NORM_TK). All readers of that x'
+    must already use ``tk``. Writer kernels are privatized, so other projections keep their order."""
+    xp = next((name, offset) for slot, name, offset in consumer.bindings if slot == 2)
+    readers = [op for op in program.ops if program.kernels[op.kernel].function == 'gemm_tile'
+               and any(slot == 2 and (name, offset) == xp for slot, name, offset in op.bindings)]
+    if any(op.meta.get('xp_tk', int(program.kernels[op.kernel].macros['TK'].rstrip('u'))) != tk for op in readers):
+        raise ValueError('all readers of a permuted input must share its tile order')
+    writers = []
+    for op in program.ops:
+        if op is consumer:
+            continue
+        for slot, name, offset in op.bindings:
+            if (name, offset) == xp and slot in op.meta.get('writes', ()):
+                writers.append((op, slot))
+    if not writers:
+        raise ValueError('permuted input has no producer')
+    for op, slot in writers:
+        kernel = program.kernels[op.kernel]
+        if kernel.function == 'x_permute' and slot == 3:
+            macro = 'TK'
+        elif slot == 14 and kernel.macros.get('NORM_OUT') == '1':
+            macro = 'NORM_TK'
+        elif kernel.macros.get('PERM_OUT') == '1':
+            macro = 'PERM_TK'
+        else:
+            raise ValueError(f'unsupported producer of a permuted input: {kernel.function}')
+        if int(kernel.macros[macro].rstrip('u')) == tk:
+            continue
+        key = op.kernel + f'.{macro.lower()}{tk}'
+        if key not in program.kernels:
+            private = copy.deepcopy(kernel)
+            private.macros[macro] = f'{tk}u'
+            if macro == 'TK':
+                # The permute's source also holds the (unused) GEMM entry, which must
+                # stay valid at a short tile: fewer than 16 columns per quad member.
+                private.source = private.source.replace('#define NCH (CT / 16u)', '#define NCH ((CT + 15u) / 16u)')
+            program.kernels[key] = private
+        op.kernel = key
+
+
+FP8_SUBTILE_FILL = """
+      {
+        const ulong packed_tile = min(tile, p.tile0 + p.n_tiles - 1u);
+        // A FILE_TN-row file tile holds FILE_TN / TN of this kernel's output tiles: row slots [slot0, slot0 + NS_B).
+        const ulong ftile = packed_tile * TN / FILE_TN;
+        const uint slot0 = uint(packed_tile * TN % FILE_TN) / 8u;
+#pragma clang loop unroll(full)
+        for (uint sub = 0; sub < TK / FILE_TK; sub++) {
+          // File tile kf = kt * (TK / FILE_TK) + sub holds FILE_TK/4 consecutive codes per (row slot, lane); its
+          // columns are this matrix tile's jumps [sub * FILE_TK / 16, +FILE_TK / 16), the x' order of FILE_TK.
+          const ulong pg = (ftile / FILE_BLOCK * (K / FILE_TK) + kt * (TK / FILE_TK) + sub) * FILE_BLOCK
+                           + ftile % FILE_BLOCK;
+#pragma clang loop unroll(full)
+          for (uint s = 0; s < NS_B; s++) {
+#if FILE_TK == 32
+            const uint2 c2 = reinterpret_cast<device const uint2*>(w)[(pg * (FILE_TN / 8u) + slot0 + s) * 32u + lane];
+            const uint cw[2] = {c2.x, c2.y};
+#else
+            const uint4 c4 = w[(pg * (FILE_TN / 8u) + slot0 + s) * 32u + lane];
+            const uint cw[4] = {c4.x, c4.y, c4.z, c4.w};
+#endif
+#pragma clang loop unroll(full)
+            for (uint e = 0; e < FILE_TK / 4u; e++) {
+              const uint code = (cw[e / 4u] >> ((e % 4u) * 8u)) & 255u;
+              bT[uint16_t((((sub * (FILE_TK / 16u) + e / 4u) * NS_B + s) << 2) | (e % 4u))] = bfloat(fp8_e4m3(code));
+            }
+          }
+        }
+      }
+"""
+
+
+def shared_fp8_layout(program, op, rows):
+    """A packed FP8 layout the verification graph derived from this op's slab (see shared_nvfp4_layout).
+
+    Only reduction-order-preserving files (no lane-group-outer order) with 32- or 64-column tiles qualify:
+    the prompt kernel multiplies 128-column tiles assembled from consecutive file tiles."""
+    import os
+    from . import fp8_tiles
+
+    binding = next(((name, offset) for slot, name, offset in op.bindings if slot == 0), None)
+    if binding is None or binding[0] not in program.buffers or program.buffers[binding[0]].file is None:
+        return None
+    spec = program.buffers[binding[0]]
+    key = (os.path.realpath(spec.file), spec.file_offset + binding[1])
+    lane_order = int(program.kernels[op.kernel].macros.get('LANE_ORDER', '0'))
+    found = [r for r in fp8_tiles.LAYOUTS.get(key, {}).values()
+             if r['rows'] == rows and r['storage'] == 'fp8' and r['outer'] == 0 and r['tk'] in (32, 64)
+             and r['tn'] in (16, 32) and r['lane_order'] == lane_order]
+    found.sort(key=lambda r: (-r['tn'], r['tk']))
+    return found[0] if found else None
+
+
+def packed_fp8_projection(program, op, rows, *, tile_block=1, file_tk=None, file_tn=None):
+    """Keep FP8 codes unchanged while making each operand load contiguous.
+
+    ``file_tk`` < TK reads a file packed in narrower reduction tiles (the verification graph's), consuming
+    TK / file_tk consecutive file tiles per matrix tile; the op's x' must then use file_tk's order."""
     from . import fp8_tiles
 
     kernel = program.kernels[op.kernel]
     tn, tk = (int(kernel.macros[field].rstrip('u')) for field in ('TN', 'TK'))
     if tk != 128:
         raise ValueError('packed prefill FP8 operands require a 128-column tile')
+    if file_tk is not None and file_tk != tk:
+        file_tn = file_tn or tn
+        if file_tk not in (32, 64) or kernel.macros.get('Q_OUTER', '0') != '0' or file_tn % tn:
+            raise ValueError('narrow FP8 file tiles need 32/64 columns in reduction order')
+        binding = next((name, offset) for slot, name, offset in op.bindings if slot == 0)
+        name, spec = fp8_tiles.repack(program, binding, kernel.macros, rows, file_tn, file_tk, tile_block)
+        program.buffers[name] = spec
+        op.bindings = [(slot, name, 0) if slot == 0 else (slot, n, offset) for slot, n, offset in op.bindings]
+        begin = kernel.source.index('#pragma clang loop unroll(full)\n      for (uint s = 0; s < NS_B; s++)')
+        end = kernel.source.index('#if EXP_MODE == 2\n      }', begin)
+        kernel.source = kernel.source[:begin] + FP8_SUBTILE_FILL + kernel.source[end:]
+        kernel.macros.update(FILE_TK=f'{file_tk}u', FILE_BLOCK=f'{tile_block}u', FILE_TN=f'{file_tn}u')
+        op.meta.update(prefill_packed_fp8=True, xp_tk=file_tk)
+        return
     binding = next((name, offset) for slot, name, offset in op.bindings if slot == 0)
     name, spec = fp8_tiles.repack(program, binding, kernel.macros, rows, tn, tk, tile_block)
     program.buffers[name] = spec

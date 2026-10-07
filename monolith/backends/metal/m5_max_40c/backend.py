@@ -20,3 +20,10 @@ class Backend(MetalBackend):
     def serving_recipes(self, model, drafter, quantization):
         from .serving import recipes
         return recipes(model, drafter, quantization)
+
+    def serving_prefill_chunk(self, model, drafter, recipes):
+        # prefill.py tunes 512-row Qwen3.8-27B projection/attention tiles; the
+        # serving recipes match exactly that model (and its DSpark head).
+        if recipes and any(r.get('target') for r in recipes.values() if isinstance(r, dict)):
+            return 512
+        return None

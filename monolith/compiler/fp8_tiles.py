@@ -17,6 +17,10 @@ import numpy as np
 from monolith.runtime.program import BufferSpec
 
 
+# Derived operand layouts produced in this process (see nvfp4_tiles.LAYOUTS).
+LAYOUTS = {}
+
+
 def projection_rows(program):
     """Find the complete row extent of each shared FP8 slab before editing it."""
     rows = {}
@@ -109,4 +113,8 @@ def repack(program, binding, macros, rows, tn, tk=32, tile_block=1, storage='fp8
                 os.replace(temporary, path)
             finally:
                 temporary.unlink(missing_ok=True)
+    if spec.file is not None:
+        LAYOUTS.setdefault((os.path.realpath(spec.file), spec.file_offset + off), {})[identity] = dict(
+            rows=rows, tn=tn, tk=tk, tile_block=tile_block, storage=storage, outer=outer, lane_order=lane_order,
+            width=width, path=str(path))
     return name + '.fp8tile.' + identity, BufferSpec(aligned, role='weights', file=str(path))

@@ -82,7 +82,8 @@ class Session:
                  prefill_chunk_size: int = 128, commute_norm: bool = True, gdn_mixer_fusion: bool = True,
                  prefill_attention: Optional[str] = None, decoder_kernel_config: Optional[Dict[str, Any]] = None,
                  prefix_cache: bool = False, prefix_cache_min_tokens: int = 0, device=None, pipeline_cache=None,
-                 prefill_optimizations: bool = True, prefix_cache_max_bytes: Optional[int] = None) -> None:
+                 prefill_optimizations: bool = True, prefix_cache_max_bytes: Optional[int] = None,
+                 resident_prefill_tokens: Optional[int] = None, coresident: Optional[bool] = None) -> None:
         """``drafter`` (a ``Drafter`` built with the model's head) and its pack turn the session speculative: one
         small dynamic-T decode program holds the round; ``verify`` / ``verify_threshold`` as in ``compile_program``."""
         from .runtime import _native as nt
@@ -110,6 +111,20 @@ class Session:
         if not isinstance(prefill_chunk_size, int) or isinstance(prefill_chunk_size, bool) or prefill_chunk_size < 1:
             raise ValueError("prefill_chunk_size must be a positive integer")
         self.prefill_chunk_size = prefill_chunk_size
+        # With an explicit decoder recipe, prompts (uncached suffixes) of at most
+        # this many tokens are ingested by the resident verification graph instead
+        # of the prefill program. It used to equal the chunk size; keep that
+        # behaviour for chunks up to 128 rows, but do not route a 129..512-token
+        # prompt through 8-row passes merely because prefill chunks are larger.
+        if resident_prefill_tokens is None:
+            resident_prefill_tokens = min(prefill_chunk_size, 128)
+        if not isinstance(resident_prefill_tokens, int) or isinstance(resident_prefill_tokens, bool) or resident_prefill_tokens < 0:
+            raise ValueError("resident_prefill_tokens must be a non-negative integer")
+        self.resident_prefill_tokens = resident_prefill_tokens
+        # None: keep the prompt and verification graphs allocated together when their
+        # union fits Metal's working set (see _keep_both); False/True force it.
+        self.coresident = coresident
+        self._coresident: Dict[str, bool] = {}
         self.commute_norm = commute_norm
         self.gdn_mixer_fusion = gdn_mixer_fusion
         self.decode_t_max = decode_layout.t_max
@@ -168,7 +183,9 @@ class Session:
     def prefill_engine(self, prompt_tokens: Optional[int] = None):
         """A separate graph/ICB for prompt chunks; short prompts use a smaller bucket."""
         bound = self.prefill_chunk_size
-        if prompt_tokens is not None:
+        if prompt_tokens is not None and self.decoder_kernel_config is None:
+            # With a decoder recipe, keep the one full-size prompt graph: it reads
+            # the decoder's packed layouts, a smaller bucket would map others.
             bound = min(bound, 1 << (max(1, prompt_tokens) - 1).bit_length())
         # The last prefill pass bootstraps drafting as well as ingesting the prompt.
         bound = max(bound, self.drafter.gamma + 1 if self.drafter is not None else 1)
@@ -178,12 +195,40 @@ class Session:
         """Compile prefill/decode programs without making their weight layouts resident."""
         from .runtime.engine import compile_pipelines
         bound = max(self.prefill_chunk_size, self.drafter.gamma + 1 if self.drafter is not None else 1)
-        plans = [(f'prefill.{bound}', bound, True, True),
-                 (0, self.decode_t_max, True, False) if self.drafter is not None else (1, 1, False, False)]
+        # The decoder first: the prompt graph reuses the packed layouts it derives.
+        plans = [(0, self.decode_t_max, True, False) if self.drafter is not None else (1, 1, False, False),
+                 (f'prefill.{bound}', bound, True, True)]
         for key, rows, dynamic, prefill in plans:
             if key not in self._programs:
                 self._programs[key] = self._compile(rows, dynamic=dynamic, prefill=prefill)
             compile_pipelines(self._programs[key], self.dev, fast_math=self.fast_math, cache=self._pipelines)
+
+    def _keep_both(self) -> bool:
+        """Whether the prompt graph and the verification graph can stay allocated together.
+
+        With a decoder recipe the prompt policy reads the decoder's packed weights, so the union of both
+        programs is little more than the decoder. Keeping both avoids releasing and re-residing tens of GB
+        of mappings (seconds per request) at every switch. Requires the union to fit Metal's working set."""
+        if self.decoder_kernel_config is None or self.coresident is False:
+            return False
+        bound = max(self.prefill_chunk_size, self.drafter.gamma + 1 if self.drafter is not None else 1)
+        key = f'prefill.{bound}'
+        if key not in self._coresident:
+            if 0 not in self._programs:
+                self._programs[0] = self._compile(self.decode_t_max, dynamic=True, prefill=False)
+            if key not in self._programs:
+                self._programs[key] = self._compile(bound, dynamic=True, prefill=True)
+            named = {}
+            for prog in (self._programs[0], self._programs[key]):
+                for name, spec in prog.buffers.items():
+                    if spec.role in ('weights', 'state', 'step_state', 'ring'):
+                        named[name] = max(named.get(name, 0), spec.nbytes)      # shared by name across engines
+                    else:
+                        named[(id(prog), name)] = spec.nbytes                  # scratch and parameters: per engine
+            total = sum(named.values())
+            budget = 0.9 * self.dev.info().recommended_working_set
+            self._coresident[key] = bool(self.coresident) or total <= budget
+        return self._coresident[key]
 
     def release_engines(self, keep_state_from=None):
         """Release GPU allocations, retaining CPU programs and executable pipelines."""
@@ -199,6 +244,9 @@ class Session:
         if key not in self.engines:
             started = time.perf_counter()
             prog = self._programs.get(key)
+            if prog is None and prefill and self.decoder_kernel_config is not None and 0 not in self._programs:
+                # Derive the decoder's packed layouts before the prompt graph looks for them.
+                self._programs[0] = self._compile(self.decode_t_max, dynamic=True, prefill=False)
             if prog is None:
                 prog = self._compile(bound, dynamic=dynamic, prefill=prefill)
                 self._programs[key] = prog
@@ -211,6 +259,34 @@ class Session:
             self.engines[key] = eng
             self._setup_ms += (time.perf_counter() - started) * 1000
         return self.engines[key]
+
+    def _alias_weights(self, prog):
+        """Name the prompt graph's weight windows like the decoder's identical ones (shared allocations), and
+        rename any same-named window that differs, so engines that share buffers by name stay correct."""
+        import os
+        decoder = self._programs.get(0)
+        if decoder is None:
+            return prog
+        def ident(spec):
+            return (os.path.realpath(spec.file), spec.file_offset, spec.nbytes) if spec.file else None
+        by_window = {ident(spec): name for name, spec in decoder.buffers.items() if spec.role == 'weights' and spec.file}
+        renames = {}
+        for name, spec in prog.buffers.items():
+            if spec.role != 'weights':
+                continue
+            other = decoder.buffers.get(name)
+            if other is not None and ident(other) == ident(spec) and other.init == spec.init:
+                continue
+            target = by_window.get(ident(spec)) if spec.file else None
+            if target is not None and target not in prog.buffers:
+                renames[name] = target
+            elif other is not None:
+                renames[name] = name + '@prompt'
+        if renames:
+            prog.buffers = {renames.get(n, n): b for n, b in prog.buffers.items()}
+            for op in prog.ops:
+                op.bindings = [(slot, renames.get(n, n), off) for slot, n, off in op.bindings]
+        return prog
 
     def _compile(self, bound, *, dynamic, prefill):
         prog = compile_program(self.model, self.pack, self.profile, t=bound, dynamic_t=dynamic, eos=self.eos,
@@ -227,6 +303,8 @@ class Session:
             with using_backend(self.profile.backend) as backend:
                 prog = backend.optimize_prefill(prog)
             reuse_arenas(prog, barriers=self.barriers)
+        if prefill and self.decoder_kernel_config is not None:
+            prog = self._alias_weights(prog)
         if self.tuner is not None:
             self.tuner.save(self.dev.info().name)
         if self.decoder_kernel_config is not None and not prefill:
@@ -266,13 +344,14 @@ class Session:
         # ICB resident for short prompts/tails instead of remapping both packs.
         can_ingest = (self.decoder_kernel_config is not None and self.drafter is not None
                       and self.verify == 'fixed' and (self.verify_length or 0) >= 1)
-        resident_prefill = can_ingest and p - offset <= self.prefill_chunk_size
-        if self.decoder_kernel_config is not None and not resident_prefill:
+        resident_prefill = can_ingest and p - offset <= self.resident_prefill_tokens
+        keep = self._keep_both() if self.decoder_kernel_config is not None else False
+        if self.decoder_kernel_config is not None and not resident_prefill and not keep:
             # Derived matrix layouts and the original prefill pack can each
             # fit while their union cannot. Retain CPU programs across requests,
             # but release decoder allocations before loading the prefill pack.
             self.release_engines()
-        elif resident_prefill and self.engines and 0 not in self.engines:
+        elif resident_prefill and self.engines and 0 not in self.engines and not keep:
             # A one-token response can finish in prefill without ever loading
             # decode. Those original weight windows must not be reused by name
             # for the decoder's differently packed matrices.
@@ -325,7 +404,8 @@ class Session:
             if cancelled and cancelled():
                 return Generation([], prefill_ms, 0, 0, 0, 0)
             if can_ingest and not resident_prefill and k == len(chunks) - 1:
-                self.release_engines(keep_state_from=pre)
+                if not keep:
+                    self.release_engines(keep_state_from=pre)
                 del pre
                 pre = self.engine(0)
                 self._last_engine = pre
@@ -355,7 +435,7 @@ class Session:
         steps = 0
         n_pre = len(tokens)
         if max_new_tokens > 1 and not r1.done and not (cancelled and cancelled()):
-            if self.decoder_kernel_config is not None and not resident_prefill:
+            if self.decoder_kernel_config is not None and not resident_prefill and not keep:
                 self.release_engines(keep_state_from=pre)
                 del pre
             if on_tokens:

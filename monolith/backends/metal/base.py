@@ -71,3 +71,7 @@ class MetalBackend:
     def serving_recipes(self, model, drafter, quantization):
         """Only opt matching workloads into recipes validated on this chip."""
         return {}
+
+    def serving_prefill_chunk(self, model, drafter, recipes):
+        """The measured prefill pass size for a served workload, or None for the portable default."""
+        return None
