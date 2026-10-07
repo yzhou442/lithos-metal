@@ -87,7 +87,8 @@ def test_packed_prefill_projection_tails(fmt, tm, tn, block, shared_slice):
 @pytest.mark.parametrize('fmt,tn,file_tn,file_tk,block', [('fp8_e4m3', 16, 32, 32, 8), ('fp8_e4m3', 32, 32, 32, 8),
                                                        ('fp8_e4m3', 16, 16, 32, 1), ('fp8_e4m3', 16, 32, 64, 8),
                                                        ('nvfp4', 32, 32, 64, 32)])
-def test_prompt_projection_reads_narrow_decoder_tiles(fmt, tn, file_tn, file_tk, block):
+@pytest.mark.parametrize('token_blocks', [1, 2])
+def test_prompt_projection_reads_narrow_decoder_tiles(fmt, tn, file_tn, file_tk, block, token_blocks):
     """A 512-row prompt tile reading a verification graph's packed file (narrower reduction tiles, other output
     tile blocks) through 128-column matrix tiles (FP8) or its own tile width (NVFP4) matches the original pack."""
     from monolith.compiler.prefill import input_tile_order, projection_geometry
@@ -124,11 +125,12 @@ def test_prompt_projection_reads_narrow_decoder_tiles(fmt, tn, file_tn, file_tk,
                                     kernels.MSL_TENSOR_OPS)}, buffers, [perm, matrix], layout=layout, ring_capacity=1)
     reference = copy.deepcopy(p)
     if fmt == 'fp8_e4m3':
-        projection_geometry(p, matrix, tm=32, tn=tn, sgs=sgs, groups=groups, q_outer=0)
+        projection_geometry(p, matrix, tm=32, tn=tn, sgs=sgs, groups=groups, q_outer=0, token_blocks=token_blocks)
         p.kernels[matrix.kernel].macros['FP8_DECODE'] = '1'
         packed_fp8_projection(p, matrix, rows, tile_block=block, file_tk=file_tk, file_tn=file_tn)
     else:
-        projection_geometry(p, matrix, tm=32, tn=tn, sgs=sgs, groups=groups, tk=file_tk, q_outer=1)
+        projection_geometry(p, matrix, tm=32, tn=tn, sgs=sgs, groups=groups, tk=file_tk, q_outer=1,
+                            token_blocks=token_blocks)
         packed_nvfp4_projection(p, matrix, block, rows)
     input_tile_order(p, matrix, file_tk)
     dev = nt.Device()

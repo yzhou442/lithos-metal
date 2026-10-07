@@ -76,8 +76,8 @@ if a.no_draft_recipe and 'drafter_options' in options:
 options.update(json.loads(a.session_kw))
 options['drafter_options'] = dict(options['drafter_options'], **json.loads(a.drafter_kw))
 t0 = time.time()
-s = load_session(str(assets.model_dir), str(assets.pack_dir), **options, eos=-1, temperature=0.0, autotune=False,
-                 prefill_chunk_size=128)
+options.setdefault('temperature', 0.0)
+s = load_session(str(assets.model_dir), str(assets.pack_dir), **options, eos=-1, autotune=False, prefill_chunk_size=128)
 load_s = time.time() - t0
 
 
@@ -197,6 +197,8 @@ if a.profile_ops:
             for i, (t_s, t_e) in enumerate(prof):
                 fn = p.kernels[p.ops[i].kernel].function
                 phase = 'V' if i < accept_i else ('C' if i < draft_i else 'D')
+                if fn == 'argmax_final' and p.ops[i].name != 'argmax_final':
+                    fn = p.ops[i].name
                 nm = p.ops[i].name
                 if phase == 'D':
                     fn = ('markov.' if '.markov' in nm or (fn.startswith('argmax') and i > draft_i) else '') + fn

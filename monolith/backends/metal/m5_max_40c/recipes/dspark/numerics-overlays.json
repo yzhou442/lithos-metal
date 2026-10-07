@@ -1,0 +1,77 @@
+{
+ "_doc": "Opt-in, numerics-changing recipe overlays. Off unless named in LITHOS_NUMERICS_OVERLAYS (comma separated); each entry deep-merges a per-context patch into the selected recipe (null deletes a key). Every overlay records its numerics-gate result (BRIEF numerics-change gate) under _gate.",
+ "attention_big_tile": {
+  "_doc": "Verify attention core with one 48-row x 64-key score MMA and one value MMA per key tile for all of a KV head's query rows (instead of 16-row groups x 32-key tiles); K/V read straight from the cache. Changes the online-softmax partition: last-bit differences.",
+  "_gate": {
+   "tool": "numerics_gate.py, base = opt/kernels e326092 served recipes, tail 2048 (6,099 scored rows)",
+   "logits": "FAIL: agreement 99.15 %, mean KL 1.88e-3, max KL 1.08, max |dlogit| teacher 7.9; all in document prompt-tail rows (doc4k 98.58 % / 4.2e-3, doc16k 98.88 % / 1.4e-3); generated rows 100 % / <= 3.2e-4",
+   "first_divergence": "none (lmbench full + long identical to baseline tokens)",
+   "tasks": "pending",
+   "speed": "round 0.958 at 16K, 0.984 at 4K (kround paired); end-to-end pending"
+  },
+  "4096": {
+   "target": {
+    "attention": {
+     "fuse": false,
+     "attention_prepare": true,
+     "attention_cached_prefix": false,
+     "attention_alias_scratch": false,
+     "attention_kv_pipeline": false,
+     "attention_big_tile": 64,
+     "attention_chunk_tiles": 16
+    }
+   }
+  },
+  "16384": {
+   "target": {
+    "attention": {
+     "fuse": false,
+     "attention_prepare": true,
+     "attention_cached_prefix": false,
+     "attention_alias_scratch": false,
+     "attention_kv_pipeline": false,
+     "attention_big_tile": 64,
+     "attention_chunk_tiles": 12
+    }
+   }
+  }
+ },
+ "attention_big_tile_exact": {
+  "_doc": "Big-tile verify attention that keeps the grouped core's 32-key softmax partition, probability rounding and carry order (64-key score MMAs over all 48 rows, two 32-key value MMAs) and the served chunk partition: byte-identical to the served attention core (a bit-exact change; an overlay only because it is new).",
+  "_gate": {
+   "tool": "numerics_gate.py vs opt/kernels e326092 served recipes, tail 2048 (6,099 scored rows)",
+   "logits": "byte-identical logits.npy on all 6,099 rows (agreement 100 %, KL 0)",
+   "kernel_tests": "tests/kernels/test_attention_static.py -k big_tile: 13/13 pass, incl. byte identity vs the grouped core (8 rows, 16 rows with the 48/96-row paths, capacity 33024 and the served 32774)",
+   "first_divergence": "none (lmbench quick/full/long identical to the 0.1.2 baseline with the eight-row default below)",
+   "speed": "paired rounds vs the served core (15 pairs each, variant/served): eight-row program 0.986 at 4K, 0.959 at 16K; sixteen-row program at 16 rows (block 15) 1.029 at 4K, 1.117 at 16K. Hence the default of the eight-row program only (selected-contexts.json target_rows8); this overlay still forces it for every program"
+  },
+  "4096": {
+   "target": {
+    "attention": {
+     "fuse": false,
+     "attention_prepare": true,
+     "attention_cached_prefix": false,
+     "attention_alias_scratch": false,
+     "attention_kv_pipeline": false,
+     "attention_big_tile": 64,
+     "attention_big_tile_exact": true,
+     "attention_chunk_tiles": 16
+    }
+   }
+  },
+  "16384": {
+   "target": {
+    "attention": {
+     "fuse": false,
+     "attention_prepare": true,
+     "attention_cached_prefix": false,
+     "attention_alias_scratch": false,
+     "attention_kv_pipeline": false,
+     "attention_big_tile": 64,
+     "attention_big_tile_exact": true,
+     "attention_chunk_tiles": 12
+    }
+   }
+  }
+ }
+}

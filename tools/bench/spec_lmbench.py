@@ -44,6 +44,11 @@ ap.add_argument('--no-draft-recipe', action='store_true')
 ap.add_argument('--recipe-key', default=None)
 ap.add_argument('--verify-rule', default='fixed', choices=['fixed', 'cost'], help='serve option: per-round verify length rule')
 ap.add_argument('--draft-lookup', action='store_true', help='serve option: context-lookup extension into rows 9-16')
+ap.add_argument('--spec-sampling', default='match', choices=['match', 'q'], help='serve option: T > 0 accept rule')
+ap.add_argument('--adaptive-block', action='store_true', help='serve option: adaptive block (block 7 rounds when L>7 is rare)')
+ap.add_argument('--top-k', type=int, default=0)
+ap.add_argument('--top-p', type=float, default=0.0)
+ap.add_argument('--seed', type=int, default=0)
 a = ap.parse_args()
 sys.path.insert(0, str(Path(a.repo).expanduser().resolve()))
 os.environ.setdefault('HF_HUB_OFFLINE', '1')
@@ -68,6 +73,8 @@ ns.no_draft, ns.draft_revision, ns.draft_block_size = a.no_draft, None, a.draft_
 ns.max_context, ns.draft_quantization, ns.draft_pack, ns.pack = a.max_context, 'auto', None, None
 ns.kernel_config, ns.kernel_config_key = None, a.recipe_key
 ns.verify_rule, ns.draft_lookup = a.verify_rule, a.draft_lookup
+ns.spec_sampling = a.spec_sampling
+ns.draft_adaptive_block = a.adaptive_block
 t = time.time()
 assets = prepare(ns)
 setup_s = time.time() - t
@@ -103,8 +110,11 @@ for key, items in by_key.items():
         if a.no_draft_recipe:
             options['drafter_options'].pop('kernel_config', None)
     options.update(extra)
-    session = load_session(str(assets.model_dir), str(assets.pack_dir), **options, eos=-1,
-                           temperature=a.temperature, autotune=False, prefill_chunk_size=a.prefill_chunk_size)
+    options.setdefault('temperature', a.temperature)
+    if a.temperature > 0:
+        options.setdefault('top_k', a.top_k); options.setdefault('top_p', a.top_p); options.setdefault('seed', a.seed)
+    session = load_session(str(assets.model_dir), str(assets.pack_dir), **options, eos=-1, autotune=False,
+                           prefill_chunk_size=a.prefill_chunk_size)
     load_s = time.time() - t; sessions_built += 1
     t = time.time(); session.generate(items[0][1][:64], 16); warm_s = time.time() - t   # compile + warm
     for name, ids, mx, _ in items:
@@ -117,7 +127,7 @@ for key, items in by_key.items():
                              tokens=g.tokens[:mx], committed=(sum(g.committed) if g.committed else None),
                              mean_accepted=g.mean_accepted, tokens_per_step=g.tokens_per_step,
                              accepted=g.accepted, committed_log=g.committed, verify_len=g.verify_len,
-                             confidences=g.confidences))
+                             confidences=g.confidences, alt_steps=int(getattr(g, 'alt_steps', 0))))
         reps.sort(key=lambda x: x['decode_wall_ms'])
         m = reps[len(reps) // 2]
         P = len(ids); gen = len(m['tokens'])
@@ -127,7 +137,7 @@ for key, items in by_key.items():
                    gpu_ms_per_token=m['decode_gpu_ms'] / max(1, (m['committed'] or gen - 1)),
                    tokens_per_step=m['tokens_per_step'], mean_accepted=m['mean_accepted'],
                    ttft_ms=m['prefill_wall_ms'], **{k: m[k] for k in ('prefill_wall_ms', 'decode_wall_ms',
-                   'decode_gpu_ms', 'steps', 'tokens', 'accepted', 'committed_log', 'verify_len', 'confidences')},
+                   'decode_gpu_ms', 'steps', 'tokens', 'accepted', 'committed_log', 'verify_len', 'confidences', 'alt_steps')},
                    load_s=load_s, warm_s=warm_s, round_ms=m['decode_gpu_ms'] / max(1, m['steps']),
                    decode_wall_all=[x['decode_wall_ms'] for x in reps])
         if base and name in base['prompts']:
@@ -142,6 +152,7 @@ for key, items in by_key.items():
         results[name] = rec
         print(f"{name:8s} P={P:6d} prefill {rec['prefill_tok_s'] or 0:8.1f} tok/s  decode {rec['decode_tok_s']:7.1f} "
               f"tok/s  tok/step {rec['tokens_per_step']:.2f}  acc {rec['mean_accepted']:.2f}"
+              + (f"  short-block steps {rec['alt_steps']}/{rec['steps']}" if rec['alt_steps'] else '')
               + (f"  ident={rec['identical']} dspd={rec['decode_speedup']:.3f}" if 'identical' in rec else ''),
               flush=True)
 gm = lambda xs: math.exp(sum(math.log(x) for x in xs) / len(xs)) if xs else None

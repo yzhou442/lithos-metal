@@ -83,8 +83,8 @@ if a.no_draft_recipe:
     options['drafter_options'].pop('kernel_config', None)
 options.update(json.loads(a.session_kw))
 options['drafter_options'] = dict(options['drafter_options'], **json.loads(a.drafter_kw))
-s = load_session(str(assets.model_dir), str(assets.pack_dir), **options, eos=-1, temperature=0.0, autotune=False,
-                 prefill_chunk_size=128)
+options.setdefault('temperature', 0.0)
+s = load_session(str(assets.model_dir), str(assets.pack_dir), **options, eos=-1, autotune=False, prefill_chunk_size=128)
 t0 = time.time()
 try:
     prog = s._compile(s.decode_t_max, dynamic=True, prefill=False)

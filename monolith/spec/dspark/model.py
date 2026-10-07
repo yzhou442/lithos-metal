@@ -162,6 +162,9 @@ class DSparkDrafter(Drafter):
         # context lookup: extend a whole-block verify with the continuation of the latest earlier
         # occurrence of the context's suffix (prompt lookup) into the verify rows past the block; {} = defaults
         self.lookup = None if lookup is None else dict(lookup)
+        # exact speculative sampling (spec campaign): {"temperature": T} makes the Markov chain draw d_k ~ softmax(corrected
+        # / T) and keep q for the verify (set by the Session for temperature > 0 with spec_sampling="q"); None = greedy drafts
+        self.sampling: Optional[Dict[str, Any]] = None
         if attention not in (None, 'v1', 'mma', 'auto'):
             raise ValueError('draft attention must be v1, mma or auto')
         self.confidence_threshold = float(confidence_threshold)
@@ -281,6 +284,16 @@ class DSparkDrafter(Drafter):
             out += blk.mixer.state_entries()
         if self.lookup is not None:
             out.append(StateEntry("draft.token_hist", (self.max_context,), DType.I32))
+        if self.sampling:
+            out.append(StateEntry("draft.q_logits", (self.gamma, self.cfg.vocab_size), DType.BF16))
+            out.append(StateEntry("draft.q_lse", (self.gamma,), DType.F32))
+        return out
+
+    def q_state_values(self, g: Graph) -> List[Value]:
+        """The sampled drafts' q (corrected logits rows and their log-sum-exp of logits / T), persistent across steps."""
+        out = []
+        for name, shape, dt in (("draft.q_logits", (self.gamma, self.cfg.vocab_size), DType.BF16), ("draft.q_lse", (self.gamma,), DType.F32)):
+            out.append(g.values[name] if name in g.values else g.state(name, shape, dt))
         return out
 
     def history_value(self, g: Graph) -> Optional[Value]:
@@ -422,7 +435,12 @@ class DSparkDrafter(Drafter):
             g.op("embed", [prev, w1], [e_k], domain=BlockDomain("rows", 1), klass=OpClass.MAP, packed=True)
             lg = self.markov_w2.lower(g, e_k, residual=g.view(f"draft.base_logits.{k}", base, k, 1), name=f"draft.markov.{k}.logits").value
             d_k = g.view(f"draft.tokens.{k}", drafts, k, 1)
-            g.op("argmax", [lg], [d_k], domain=BlockDomain("span", cfg.vocab_size), klass=OpClass.REDUCE)
+            if self.sampling:
+                ql, qs = self.q_state_values(g)
+                g.op("argmax", [lg, ql, qs], [d_k], domain=BlockDomain("span", cfg.vocab_size), klass=OpClass.REDUCE,
+                     draft_q=dict(k=k, temperature=float(self.sampling["temperature"])), updates=[ql.name, qs.name])
+            else:
+                g.op("argmax", [lg], [d_k], domain=BlockDomain("span", cfg.vocab_size), klass=OpClass.REDUCE)
             prev = d_k
         # 4. the confidence head over [h_k ; W₁[prev_k]]
         conf = None
@@ -454,7 +472,7 @@ class DSparkDrafter(Drafter):
             # tail rows to the lookup when the confidence chain fades)
             base = min(block.gamma, int(self.lookup.get('base', block.gamma)))
             g.op("ngram_lookup", [hist, block.tokens], [found], domain=BlockDomain("span", 1), klass=OpClass.SERIAL,
-                 gamma=base)
+                 gamma=base, nmin=int(self.lookup.get('nmin', 2)), nmax=int(self.lookup.get('nmax', 4)))
             ins.append(found)
             lookup_attrs = dict(self.lookup)
         thr = self.confidence_threshold if threshold is None else float(threshold)

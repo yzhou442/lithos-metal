@@ -23,6 +23,17 @@ def cost_table_kind(gamma, lookup):
     return 'b7lk' if lookup and gamma <= 7 else 'b15' if gamma > 7 else None
 
 
+def _merge_recipe(dst, src):
+    """Deep-merge a recipe patch (None deletes a key)."""
+    for key, value in src.items():
+        if value is None:
+            dst.pop(key, None)
+        elif isinstance(value, dict) and isinstance(dst.get(key), dict):
+            _merge_recipe(dst[key], value)
+        else:
+            dst[key] = copy.deepcopy(value)
+
+
 @dataclass
 class ServingAssets:
     model_dir: Path
@@ -38,6 +49,8 @@ class ServingAssets:
     prefill_chunk_size: int | None = None   # the backend's measured prefill pass size for this model, if any
     verify_rule: str = 'fixed'
     lookup: bool = False
+    spec_sampling: str = 'match'
+    adaptive_block: bool = False
     verify_costs: dict | None = None
 
     def options(self, prompt_tokens):
@@ -56,11 +69,20 @@ class ServingAssets:
                 for k, v in recipe.get('accelerator_min_t', {}).items()})
             if 'bf16_min_t' in recipe:
                 profile.accelerator_min_t['bf16'] = recipe['bf16_min_t']
+            target = copy.deepcopy(recipe.get('target'))
+            if target and recipe.get('target_rows8') and self.gamma <= 7 and not self.lookup:
+                # Recipe entries measured on the eight-row verify program only (blocks above 7 and the lookup
+                # extension compile a sixteen-row program, where they were measured slower).
+                _merge_recipe(target, recipe['target_rows8'])
             options.update(drafter_options=dict(block_size=self.gamma, attention=recipe.get('draft_attention', 'mma'),
                                                kernel_config=copy.deepcopy(recipe.get('draft'))),
-                           decoder_kernel_config=copy.deepcopy(recipe.get('target')),
+                           decoder_kernel_config=target,
                            prefill_attention=recipe.get('prefill_attention', 'auto' if profile.backend == 'm5_max_40c'
                                                         and recipe.get('target') else 'v3'), accelerator='on')
+        if self.draft_dir and self.spec_sampling != 'match':
+            options['spec_sampling'] = self.spec_sampling          # temperature > 0 only; greedy requests are unaffected
+        if self.draft_dir and self.adaptive_block and self.gamma > 7:
+            options['adaptive_block'] = dict(block=7)              # block-7 rounds while the cost rule rarely verifies past 7
         if self.draft_dir and self.lookup:
             options['drafter_options'] = dict(options['drafter_options'], lookup={})
         if self.draft_dir and self.verify_rule == 'cost':
@@ -155,4 +177,6 @@ def prepare(args, *, device_info=None):
     chunk = backend.serving_prefill_chunk(model, draft, recipes)
     return ServingAssets(model_dir, pack, args.max_context, capacity, profile,
                          draft_dir, draft_pack, gamma, recipes, args.kernel_config_key, prefill_chunk_size=chunk,
-                         verify_rule=verify_rule, lookup=lookup, verify_costs=verify_costs)
+                         verify_rule=verify_rule, lookup=lookup, verify_costs=verify_costs,
+                         spec_sampling=getattr(args, 'spec_sampling', 'match') or 'match',
+                         adaptive_block=bool(getattr(args, 'draft_adaptive_block', False)))

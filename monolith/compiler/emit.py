@@ -1151,7 +1151,31 @@ def _gdn_norm(ctx: _Ctx, op: Op) -> None:
             (ctx.t * hv, 1, 1), (32, 1, 1), op.kind, writes=[3], perm_out=bool(fused))
 
 
+def _draft_q_sample(ctx: _Ctx, op: Op) -> None:
+    """A Markov step of a drafter that samples (exact speculative sampling, spec campaign): d_k ~ softmax(corrected / T)
+    over the whole vocabulary by Gumbel-max (noise stream 2000 + k), its log-sum-exp into ``q_lse[k]`` and the corrected
+    row into ``q_logits[k]`` (persistent: the next verify recomputes q from them)."""
+    logits, q_logits, q_lse = op.inputs
+    token = op.outputs[0]
+    a = op.attrs["draft_q"]
+    vocab = ctx.shape(logits)[1]
+    src = kernels.sample_source()
+    macros = {"DRAFT_K": f"{int(a['k'])}u"}
+    kp, kf = ctx.kernel("sample", src, "draft_q_partial", macros), ctx.kernel("sample", src, "draft_q_final", macros)
+    n = ctx.n_sg
+    pv, pi = ctx.scratch("draft_q.val", n * 4, shared=True), ctx.scratch("draft_q.idx", n * 4, shared=True)
+    pm, ps = ctx.scratch("draft_q.m", n * 4, shared=True), ctx.scratch("draft_q.s", n * 4, shared=True)
+    prm = ctx.params("draft_q", kernels.sample_params(vocab=vocab, t_active=1, n_sg=n, temperature=float(a["temperature"])))
+    grid, tg = ctx.crew_grid()
+    ctx.add(kp, [(0, *ctx.buf(logits)), (1, pv, 0), (2, pi, 0), (3, prm, 0), (4, pm, 0), (5, ps, 0), (6, *ctx.buf(q_logits))], grid, tg,
+            "draft_q_partial", writes=[1, 2, 4, 5, 6])
+    ctx.add(kf, [(0, pv, 0), (1, pi, 0), (2, *ctx.buf(token)), (3, prm, 0), (4, pm, 0), (5, ps, 0), (6, *ctx.buf(q_lse))], (1, 1, 1), (32, 1, 1),
+            "draft_q_final", writes=[2, 6])
+
+
 def _argmax(ctx: _Ctx, op: Op) -> None:
+    if op.attrs.get("draft_q"):
+        return _draft_q_sample(ctx, op)
     logits, = op.inputs
     token = op.outputs[0]
     t_c, t_src = ctx.rows_of(op)
@@ -1172,25 +1196,47 @@ def _argmax(ctx: _Ctx, op: Op) -> None:
 
 
 def _sample(ctx: _Ctx, op: Op) -> None:
-    logits, = op.inputs
+    logits = op.inputs[0]
+    spec_q = bool(op.attrs.get("spec_q"))                              # exact speculative sampling against sampled drafts
     token = op.outputs[0]
     vocab = ctx.shape(logits)[1]
     a = op.attrs
     src = kernels.sample_source()
     macros = {"STEP_STATE": "1"}                                       # seed and step always come from StepState
-    kh, ks, kg, kf = (ctx.kernel("sample", src, f, macros) for f in ("sample_hist", "sample_select", "sample_gumbel", "argmax_final"))
+    kg, kf = (ctx.kernel("sample", src, f, macros) for f in ("sample_gumbel", "argmax_final"))
+    # with the q rule the select scans only each row's occupied key range (KEY_BOUNDS: ~100 keys per lane instead of 2048;
+    # the mass sums partition differently, so it stays with the flag) and reports the kept distribution's normalizer
+    kh = ctx.kernel("sample", src, "sample_hist", dict(macros, **({"KEY_BOUNDS": "1"} if spec_q else {})))
+    ks = ctx.kernel("sample", src, "sample_select", dict(macros, **({"SPEC_STATS": "1", "KEY_BOUNDS": "1"} if spec_q else {})))
     hb, tb, pb = kernels.sample_workspace(ctx.t, ctx.n_sg)
     hist, tau = ctx.scratch("sample.hist", hb), ctx.scratch("sample.tau", tb)
     pv, pi = ctx.scratch("sample.val", pb), ctx.scratch("sample.idx", pb)
     prm = ctx.params("sample", kernels.sample_params(vocab=vocab, t_active=ctx.t, n_sg=ctx.n_sg, top_k=int(a.get("top_k", 0)),
                                                      temperature=float(a.get("temperature", 1.0)), top_p=float(a.get("top_p", 0.0)),
-                                                     min_p=float(a.get("min_p", 0.0)), seed=int(a.get("seed", 0)), step=0))
+                                                     min_p=float(a.get("min_p", 0.0)), seed=int(a.get("seed", 0)), step=0,
+                                                     topp_in_topk=bool(a.get("topp_in_topk"))))
     st = ctx.program.step_state
     grid, tg = ctx.crew_grid()
-    ctx.add(kh, [(0, *ctx.buf(logits)), (1, hist, 0), (3, prm, 0), (15, st, 0)], grid, tg, op.kind, writes=[1])
-    ctx.add(ks, [(1, hist, 0), (2, tau, 0), (3, prm, 0), (15, st, 0)], (ctx.t, 1, 1), (32, 1, 1), "sample_select", writes=[2])
+    bounds = ctx.scratch("sample.bounds", ctx.t * 8) if spec_q else None
+    ctx.add(kh, [(0, *ctx.buf(logits)), (1, hist, 0), (3, prm, 0), (15, st, 0)] + ([(2, bounds, 0)] if spec_q else []), grid, tg, op.kind,
+            writes=[1] + ([2] if spec_q else []))
+    stats = ctx.scratch("sample.stats", ctx.t * 8) if spec_q else None
+    ctx.add(ks, [(1, hist, 0), (2, tau, 0), (3, prm, 0), (15, st, 0)] + ([(4, stats, 0), (5, bounds, 0)] if spec_q else []), (ctx.t, 1, 1), (32, 1, 1),
+            "sample_select", writes=[2] + ([4, 5] if spec_q else []))
     ctx.add(kg, [(0, *ctx.buf(logits)), (2, tau, 0), (3, prm, 0), (4, pv, 0), (5, pi, 0), (15, st, 0)], grid, tg, "sample_gumbel", writes=[4, 5])
     ctx.add(kf, [(0, pv, 0), (1, pi, 0), (2, *ctx.buf(token)), (3, prm, 0), (15, st, 0)], (ctx.t, 1, 1), (32, 1, 1), "argmax_final", writes=[2])
+    if spec_q:
+        # accept each drafted row with min(1, p/q), rewrite token[] for the accept scan, draw the correction of a rejected
+        # drafter row from norm(max(p - q, 0)) (kernels/common/sample.metal)
+        q_logits, q_lse = op.inputs[1], op.inputs[2]
+        ka, kr, krf = (ctx.kernel("sample", src, f, macros) for f in ("spec_q_accept", "spec_residual_partial", "spec_residual_final"))
+        flag = ctx.scratch("spec_q.flag", 16)
+        rv, ri = ctx.scratch("spec_q.val", ctx.n_sg * 4), ctx.scratch("spec_q.idx", ctx.n_sg * 4)
+        common = [(0, *ctx.buf(logits)), (1, tau, 0), (2, stats, 0), (3, prm, 0), (4, *ctx.buf(q_logits)), (5, *ctx.buf(q_lse)), (15, st, 0)]
+        ctx.add(ka, common + [(6, *ctx.buf(token)), (7, flag, 0)], (1, 1, 1), (32, 1, 1), "spec_q_accept", writes=[6, 7])
+        ctx.add(kr, common + [(7, flag, 0), (8, rv, 0), (9, ri, 0)], grid, tg, "spec_residual_partial", writes=[8, 9])
+        ctx.add(krf, [(0, rv, 0), (1, ri, 0), (2, *ctx.buf(token)), (3, prm, 0), (7, flag, 0), (15, st, 0)], (1, 1, 1), (32, 1, 1),
+                "spec_residual_final", writes=[2])
 
 
 # ---- the DSpark round (design §5.8; issue #24) ------------------------------------------------------------------
@@ -1287,7 +1333,8 @@ def _ngram_lookup(ctx: _Ctx, op: Op) -> None:
     out = op.outputs[0]
     gamma = int(op.attrs["gamma"])
     cap = ctx.shape(hist)[0]
-    k = ctx.kernel("spec_ops", _spec_ops(ctx), "ngram_lookup", {})
+    k = ctx.kernel("spec_ops", _spec_ops(ctx), "ngram_lookup", {"LOOKUP_NMIN": f"{int(op.attrs.get('nmin', 2))}u",
+                                                                "LOOKUP_NMAX": f"{int(op.attrs.get('nmax', 4))}u"})
     prm = ctx.params("ngram_lookup", struct.pack("<IIII", gamma, cap, 0, 0))
     ctx.add(k, [(0, *ctx.buf(hist)), (1, *ctx.buf(drafts)), (2, *ctx.buf(out)), (3, prm, 0)], (1, 1, 1), (1024, 1, 1), op.kind,
             writes=[2])
@@ -1520,6 +1567,14 @@ def lower_round(g: Graph, model: Model, drafter: Any, token: Value, profile: Pro
 
     acc = g.value("accepted", (1,), DType.U32)
     lm = bool(getattr(drafter, "lm_drafter", False))          # an LM drafter: the scan's bookkeeping differs (design §5.8)
+    if getattr(drafter, "sampling", None):
+        # exact speculative sampling: the target's sampler also runs the accept test against the drafter's q, which the
+        # previous round's draft pass left in the drafter's state (spec campaign)
+        sop = next((op for op in g.ops if op.kind == "sample" and op.outputs and op.outputs[0] is token), None)
+        if sop is None:
+            raise ValueError("lower_round: sampled drafts need the target's stochastic sampler")
+        sop.inputs.extend(drafter.q_state_values(g))
+        sop.attrs["spec_q"] = True
     hist = drafter.history_value(g) if hasattr(drafter, "history_value") else None
     g.op("accept_scan", [token] + ([hist] if hist is not None else []), [acc], domain=BlockDomain("span", 1), klass=OpClass.SERIAL,
          **({"lm": True} if lm else {}))

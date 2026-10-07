@@ -308,3 +308,102 @@ def test_seeded_queue_exact_bound(attention,batch):
         dict(schedule='queue',task_grain='tile',task_batch=batch,task_seed=True,
              task_seed_bound=True,task_stats=True),
         dict(attention_prepare=True,attention_chunk_tiles=16,attention_compact_partials=True))
+
+
+@pytest.mark.parametrize('key_tile,chunk_tiles', [(64, 2), (64, 12), (32, 1), (32, 3)])
+def test_big_tile_attention(attention, key_tile, chunk_tiles):
+    """attention_big_tile (a recipe opt-in numerics change): close to the 32-key reference at every position up to
+    the cache's end, cache appends byte-identical, and each row independent of how many rows the step verifies."""
+    from monolith.compiler.static_fusion import normalize
+    dev, original, (capacity, kd, t, stride) = attention
+    common = dict(attention_groups=80, attention_qm=16, merge_sgs=4, attention_prepare=True, attention_chunk_tiles=chunk_tiles)
+    grouped = normalize(original, 8, groups=8, **common)
+    big = normalize(original, 8, groups=8, attention_big_tile=key_tile, **common)
+    assert any('BT_K' in big.kernels[o.kernel].source for o in big.ops)
+    engines = [Engine(p, dev) for p in (original, grouped, big)]
+    rng = np.random.default_rng(7)
+    caches = [f32_to_bf16(rng.normal(0, .2, (capacity, kd)).astype(np.float32)).tobytes() for _ in range(2)]
+    actives = (t, 3, 1) if t <= 8 else (t, 9, 8, 3, 1)           # 16 rows: both the 96-row and the 48-row path
+    for pos in (0, 5, 63, 64, 1000, 8191, 16383, capacity - 2 * t, capacity - t):
+        projection = f32_to_bf16(rng.normal(0, .2, (t, stride)).astype(np.float32)).tobytes()
+        outs = {}
+        for active in actives:
+            for i, e in enumerate(engines):
+                for name, value in zip(('k', 'v'), caches):
+                    e.buffers[name].write(value, 0)
+                e.buffers['qkv'].write(projection, 0)
+                e.buffers['step_state'].write(original.layout.pack({'position': pos, 't_this_step': active}), 0)
+                e.run(1, steps_per_cb=1, in_flight=1)
+                outs[i, active] = np.frombuffer(e.read('out'), np.uint16).reshape(t, -1)[:active]
+                if active == t:
+                    assert e.read('k') == engines[0].read('k') and e.read('v') == engines[0].read('v')
+        for active in actives:
+            a, b = [bf16_to_f32(outs[i, active]).astype(np.float64).ravel() for i in (0, 2)]
+            assert np.isfinite(b).all()
+            assert a @ b / (np.linalg.norm(a) * np.linalg.norm(b)) > .99999
+            assert np.linalg.norm(a - b) / np.linalg.norm(a) < .005
+            # a row's result does not depend on the step's row count (speculative == plain decoding)
+            assert np.array_equal(outs[2, active], outs[2, t][:active])
+            assert np.array_equal(outs[1, active], outs[1, t][:active])
+
+
+@pytest.fixture(scope="module")
+def attention16():
+    return attention_program(t=16)
+
+
+def test_big_tile_attention_sixteen_rows(attention16):
+    """96 rows: 64 keys do not fit, so 32-key tiles; steps of at most 8 rows take the 48-row path, with the same per-row
+    results as the 96-row path."""
+    test_big_tile_attention(attention16, 64, 2)
+
+
+@pytest.fixture(scope="module")
+def attention_odd():
+    return attention_program(capacity=32774)                    # the served capacity: 32768 + a 7-token block - 1
+
+
+def test_big_tile_attention_unaligned_capacity(attention_odd):
+    """The last key tile is shifted back to end at the capacity (no read past the cache) and its re-read keys masked."""
+    test_big_tile_attention(attention_odd, 64, 2)
+
+
+@pytest.mark.parametrize('chunk_tiles,big,exact', [(1, 32, False), (3, 32, False), (12, 32, False), (2, 64, True), (12, 64, True)])
+def test_big_tile_32_keys_matches_grouped_core_bytes(attention, chunk_tiles, big, exact):
+    _big_tile_bytes_vs_grouped(attention, chunk_tiles, big, exact)
+
+
+def _big_tile_bytes_vs_grouped(attention, chunk_tiles, big, exact):
+    """With 32-key tiles the big-tile core keeps the grouped core's online-softmax partition, probability rounding and
+    carry arithmetic; only the matrix operations batch 48 rows instead of 16 and read K/V from the cache directly.
+    Records whether the matrix unit's per-element results make that byte-identical."""
+    from monolith.compiler.static_fusion import normalize
+    dev, original, (capacity, kd, t, stride) = attention
+    common = dict(attention_groups=80, attention_qm=16, merge_sgs=4, attention_prepare=True, attention_chunk_tiles=chunk_tiles)
+    engines = [Engine(normalize(original, 8, groups=8, **common), dev),
+               Engine(normalize(original, 8, groups=8, attention_big_tile=big, attention_big_tile_exact=exact, **common), dev)]
+    rng = np.random.default_rng(11)
+    caches = [f32_to_bf16(rng.normal(0, .2, (capacity, kd)).astype(np.float32)).tobytes() for _ in range(2)]
+    for pos in (0, 37, 1000, 4095, 16383, capacity - 40, capacity - 2 * t, capacity - t):
+        projection = f32_to_bf16(rng.normal(0, .2, (t, stride)).astype(np.float32)).tobytes()
+        for active in (t, 5):
+            outs = []
+            for e in engines:
+                for name, value in zip(('k', 'v'), caches):
+                    e.buffers[name].write(value, 0)
+                e.buffers['qkv'].write(projection, 0)
+                e.buffers['step_state'].write(original.layout.pack({'position': pos, 't_this_step': active}), 0)
+                e.run(1, steps_per_cb=1, in_flight=1)
+                outs.append(np.frombuffer(e.read('out'), np.uint16).reshape(t, -1)[:active].copy())
+            assert np.array_equal(outs[0], outs[1]), (pos, active, int((outs[0] != outs[1]).sum()))
+
+
+def test_big_tile_32_keys_matches_grouped_core_bytes_unaligned(attention_odd):
+    """At the served capacity (32774) the last key tile is shifted back inside the cache."""
+    _big_tile_bytes_vs_grouped(attention_odd, 12, 32, False)
+    _big_tile_bytes_vs_grouped(attention_odd, 12, 64, True)
+
+
+def test_big_tile_32_keys_matches_grouped_core_bytes_sixteen_rows(attention16):
+    """The sixteen-row program: 96-row and 48-row paths against the grouped core (6 / 3 query groups)."""
+    _big_tile_bytes_vs_grouped(attention16, 12, 32, False)

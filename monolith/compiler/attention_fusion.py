@@ -327,8 +327,227 @@ def _kv_pipeline(source):
     return source[:open_ + 1] + _kv_pipeline_body(True) + source[end:]
 
 
+_BT_PROLOGUE = """
+  threadgroup float bscore[BT_R * BT_K];
+  threadgroup GqaProbability bprob[BT_R * BT_K];
+  threadgroup float row_md[BT_R * 2];
+  threadgroup float carry[BT_R * 2];
+  if (st->done) return;
+  const uint T = st->t_this_step, position = st->position;
+  if (T == 0u) return;
+  const uint rep = p.heads / p.kv_heads, rows = T * rep;
+  const uint ctx = position + T, chunks = (ctx + CH - 1u) / CH;
+  GqaDevT qall((device bfloat*)qkvg, dextents<int, 2>(D, int(p.kv_heads * p.rows_max)));
+  GqaDevT kall((device bfloat*)k_cache, dextents<int, 2>(int(p.kv_heads * D), int(p.ctx_max)));
+  GqaDevT vall((device bfloat*)v_cache, dextents<int, 2>(int(p.kv_heads * D), int(p.ctx_max)));
+"""
+
+_BT_PART = """  matmul2d<bt_score_desc{S}, execution_simdgroups<MMA_SG>> score_op;
+  matmul2d<bt_value_desc{S}, execution_simdgroups<MMA_SG>> value_op;
+  GqaFloatTG score_tile(bscore, dextents<int, 2>(BT_K, {R}));
+  GqaProbTG pt(bprob, dextents<int, 2>(BT_K, {R}));
+  for (uint block = tgid; block < p.kv_heads * chunks; block += p.n_sg) {{
+    const uint j = block / chunks, c = block % chunks;
+    auto qt = qall.slice<D, {R}>(0, int(j * p.rows_max));
+    auto accum = value_op.get_destination_cooperative_tensor<GqaProbTG, decltype(vall.slice<D, BT_K>(0, 0)), float>();
+    for (uint16_t i = 0; i < accum.get_capacity(); i++) if (accum.is_valid_element(i)) accum[i] = 0.0f;
+    for (uint r = sgi; r < {R}; r += MMA_SG) if (lane == 0) {{ row_md[2 * r] = -INFINITY; row_md[2 * r + 1] = 0.0f; }}
+    for (uint sub = 0; sub < CH / BT_K && c * CH + sub * BT_K < ctx; sub++) {{
+      const uint key_base = c * CH + sub * BT_K;
+      // a tile never reads past the cache: the last one is shifted back to end at the capacity and its columns
+      // below key_base (keys an earlier tile already took) are masked
+      const uint key_org = min(key_base, uint(p.ctx_max) - uint(BT_K));
+      auto kt = kall.slice<D, BT_K>(int(j * D), int(key_org));
+      auto scores = score_op.get_destination_cooperative_tensor<decltype(qt), decltype(kt), float>();
+      for (uint16_t i = 0; i < scores.get_capacity(); i++) if (scores.is_valid_element(i)) scores[i] = 0.0f;
+      score_op.run(qt, kt, scores);
+      scores.store(score_tile);
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      for (uint r = sgi; r < {R}; r += MMA_SG) {{
+        const uint t = r / rep;
+        float sc[BT_K / 32];
+        for (uint u = 0; u < BT_K / 32; u++) {{
+          const uint key = key_org + lane + u * 32;
+          sc[u] = r < rows && key >= key_base && key < ctx && key <= position + t ? round_bf16(round_bf16(bscore[r * BT_K + lane + u * 32]) * p.scaling) : -INFINITY;
+        }}
+        float local_max = -INFINITY;
+        for (uint u = 0; u < BT_K / 32; u++) local_max = max(local_max, sc[u]);
+        const float m = simd_max(local_max);
+        float den = 0;
+        for (uint u = 0; u < BT_K / 32; u++) {{
+          const float pr = sc[u] == -INFINITY ? 0.0f : exp(sc[u] - m);
+          bprob[r * BT_K + lane + u * 32] = GqaProbability(pr);
+          den += pr;
+        }}
+        den = simd_sum(den);
+        if (lane == 0) {{
+          const float old_m = row_md[2 * r], new_m = max(old_m, m);
+          const float ca = old_m == -INFINITY ? 0.0f : exp(old_m - new_m);
+          const float cb = m == -INFINITY ? 0.0f : exp(m - new_m);
+          row_md[2 * r] = new_m;
+          row_md[2 * r + 1] = ca * row_md[2 * r + 1] + cb * den;
+          carry[2 * r] = ca; carry[2 * r + 1] = cb;
+        }}
+      }}
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      auto vt = vall.slice<D, BT_K>(int(j * D), int(key_org));
+      auto out = value_op.get_destination_cooperative_tensor<GqaProbTG, decltype(vt), float>();
+      for (uint16_t i = 0; i < out.get_capacity(); i++) if (out.is_valid_element(i)) out[i] = 0.0f;
+      value_op.run(pt, vt, out);
+      for (uint16_t i = 0; i < out.get_capacity(); i++) if (out.is_valid_element(i)) {{
+        const uint r = out.get_multidimensional_index(i)[1];
+        accum[i] = carry[2 * r] * accum[i] + carry[2 * r + 1] * out[i];
+      }}
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+    }}
+    for (uint16_t i = 0; i < accum.get_capacity(); i++) if (accum.is_valid_element(i)) {{
+      auto idx = accum.get_multidimensional_index(i);
+      const uint row = idx[1], dim = idx[0];
+      if (row < rows) part_o[((j * p.n_chunks_max + c) * p.rows_max + row) * D + dim] = accum[i];
+    }}
+    for (uint r = sgi; r < rows; r += MMA_SG) if (lane == 0) {{
+      const uint base = ((j * p.n_chunks_max + c) * p.rows_max + r) * 2;
+      part_md[base] = row_md[2 * r]; part_md[base + 1] = row_md[2 * r + 1];
+    }}
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }}
+"""
+
+
+_BT_PART_SPLIT = """  matmul2d<bt_score_desc{S}, execution_simdgroups<MMA_SG>> score_op;
+  matmul2d<bt_value_desc{S}, execution_simdgroups<MMA_SG>> value_op;
+  GqaFloatTG score_tile(bscore, dextents<int, 2>(BT_K, {R}));
+  GqaProbTG pt(bprob, dextents<int, 2>(BT_K, {R}));
+  for (uint block = tgid; block < p.kv_heads * chunks; block += p.n_sg) {{
+    const uint j = block / chunks, c = block % chunks;
+    auto qt = qall.slice<D, {R}>(0, int(j * p.rows_max));
+    auto accum = value_op.get_destination_cooperative_tensor<decltype(pt.slice<32, {R}>(0, 0)), decltype(vall.slice<D, 32>(0, 0)), float>();
+    for (uint16_t i = 0; i < accum.get_capacity(); i++) if (accum.is_valid_element(i)) accum[i] = 0.0f;
+    for (uint r = sgi; r < {R}; r += MMA_SG) if (lane == 0) {{ row_md[2 * r] = -INFINITY; row_md[2 * r + 1] = 0.0f; }}
+    for (uint sub = 0; sub < CH / BT_K && c * CH + sub * BT_K < ctx; sub++) {{
+      const uint key_base = c * CH + sub * BT_K;
+      const uint key_org = min(key_base, uint(p.ctx_max) - uint(BT_K));
+      auto kt = kall.slice<D, BT_K>(int(j * D), int(key_org));
+      auto scores = score_op.get_destination_cooperative_tensor<decltype(qt), decltype(kt), float>();
+      for (uint16_t i = 0; i < scores.get_capacity(); i++) if (scores.is_valid_element(i)) scores[i] = 0.0f;
+      score_op.run(qt, kt, scores);
+      scores.store(score_tile);
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      // softmax per 32-key partition, in key order: the grouped core's partition, rounding and carry sequence
+      for (uint r = sgi; r < {R}; r += MMA_SG) {{
+        const uint t = r / rep;
+        for (uint h = 0; h < BT_K / 32u; h++) {{
+          const uint hb = key_base + h * 32u;
+          if (hb >= ctx) break;
+          const uint key = hb + lane, col = key - key_org;
+          float sc[1];
+          sc[0] = r < rows && key < ctx && key <= position + t ? round_bf16(round_bf16(bscore[r * BT_K + col]) * p.scaling) : -INFINITY;
+          float local_max = -INFINITY;
+          local_max = max(local_max, sc[0]);
+          const float m = simd_max(local_max);
+          float den = 0;
+          const float pr = sc[0] == -INFINITY ? 0.0f : exp(sc[0] - m);
+          bprob[r * BT_K + col] = GqaProbability(pr);
+          den += pr;
+          den = simd_sum(den);
+          if (lane == 0) {{
+            const float old_m = row_md[2 * r], new_m = max(old_m, m);
+            const float ca = old_m == -INFINITY ? 0.0f : exp(old_m - new_m);
+            const float cb = m == -INFINITY ? 0.0f : exp(m - new_m);
+            row_md[2 * r] = new_m;
+            row_md[2 * r + 1] = ca * row_md[2 * r + 1] + cb * den;
+            carry[(r * (BT_K / 32u) + h) * 2] = ca; carry[(r * (BT_K / 32u) + h) * 2 + 1] = cb;
+          }}
+        }}
+      }}
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      for (uint h = 0; h < BT_K / 32u; h++) {{
+        const uint hb = key_base + h * 32u;
+        if (hb >= ctx) break;
+        uint vs = hb;
+        if (hb + 32u > uint(p.ctx_max)) {{
+          // the cache ends inside this partition: read the last 32 cached keys and zero the columns before hb
+          vs = uint(p.ctx_max) - 32u;
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+          for (uint i = sgi * 32 + lane; i < {R} * (hb - vs); i += MMA_SG * 32) bprob[(i / (hb - vs)) * BT_K + vs - key_org + i % (hb - vs)] = GqaProbability(0.0f);
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+        }}
+        auto ph = pt.slice<32, {R}>(int(vs - key_org), 0);
+        auto vh = vall.slice<D, 32>(int(j * D), int(vs));
+        auto out = value_op.get_destination_cooperative_tensor<decltype(ph), decltype(vh), float>();
+        for (uint16_t i = 0; i < out.get_capacity(); i++) if (out.is_valid_element(i)) out[i] = 0.0f;
+        value_op.run(ph, vh, out);
+        for (uint16_t i = 0; i < out.get_capacity(); i++) if (out.is_valid_element(i)) {{
+          const uint r = out.get_multidimensional_index(i)[1];
+          accum[i] = carry[(r * (BT_K / 32u) + h) * 2] * accum[i] + carry[(r * (BT_K / 32u) + h) * 2 + 1] * out[i];
+        }}
+      }}
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+    }}
+    for (uint16_t i = 0; i < accum.get_capacity(); i++) if (accum.is_valid_element(i)) {{
+      auto idx = accum.get_multidimensional_index(i);
+      const uint row = idx[1], dim = idx[0];
+      if (row < rows) part_o[((j * p.n_chunks_max + c) * p.rows_max + row) * D + dim] = accum[i];
+    }}
+    for (uint r = sgi; r < rows; r += MMA_SG) if (lane == 0) {{
+      const uint base = ((j * p.n_chunks_max + c) * p.rows_max + r) * 2;
+      part_md[base] = row_md[2 * r]; part_md[base + 1] = row_md[2 * r + 1];
+    }}
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }}
+"""
+
+
+def _big_tile(source, rows_max, key_tile, exact=False):
+    """Large-tile verify attention (``attention_big_tile``; a numerics change, recipe opt-in).
+
+    One task per (KV head, key chunk) multiplies ALL of the head's query rows (GQA rep x verify rows, rounded up to
+    16) against a key tile of ``key_tile`` keys in one score matrix operation and one value operation, reading the
+    prepared Q (compact per KV head) and the K/V cache rows directly as device tensors: no K/V staging through
+    threadgroup memory and one softmax/carry round per key tile instead of one per 16-row group per 32 keys. The
+    online-softmax partition (key tile) and the grouping of the value products differ from the 32-key staged core,
+    so results change in the last bits; the merge and partial records are unchanged. A program with more than 48
+    rows (16 verify rows) gets a half-height path for steps that verify at most half its rows; both paths use the
+    same key tile, so a row's result does not depend on the step's row count.
+    """
+    rmax = (rows_max + 15) // 16 * 16
+    split = exact and key_tile > 32                               # 64-key score tiles, 32-key softmax/value partitions
+    if rmax * key_tile * 6 + rmax * 8 * (1 + (key_tile // 32 if split else 1)) > 32768:  # scores, probabilities, row state
+        raise ValueError(f'big-tile attention: {rmax} rows x {key_tile} keys exceed 32 KB of threadgroup memory')
+    sizes = [rmax] if rmax <= 48 else [(rows_max // 2 + 15) // 16 * 16, rmax]
+    start = source.rindex('kernel void gqa_decode_mma(')
+    open_ = source.index('{', source.index('simdgroup_index_in_threadgroup]]', start))
+    end = source.find('\n#if DIRECT_KV\n// Prepare', start)
+    if end < 0:
+        raise ValueError('attention kernel end not found')
+    decls = f"""
+#define BT_R {rmax}
+#define BT_K {key_tile}
+using GqaDevT = tensor<device bfloat, dextents<int, 2>, tensor_inline>;
+"""
+    names = [('BT_R', '')] if len(sizes) == 1 else [(f'BT_R{i}', str(i)) for i in range(len(sizes))]
+    for (macro, suffix), rows in zip(names, sizes):
+        if macro != 'BT_R':
+            decls += f"#define {macro} {rows}\n"
+        decls += (f"constexpr constant auto bt_score_desc{suffix} = matmul2d_descriptor({macro}, BT_K, D, false, true, false, matmul2d_descriptor::mode::multiply_accumulate);\n"
+                  f"constexpr constant auto bt_value_desc{suffix} = matmul2d_descriptor({macro}, D, BT_K, false, false, false, matmul2d_descriptor::mode::multiply_accumulate);\n")
+    part, prologue = _BT_PART, _BT_PROLOGUE
+    if split:
+        part = _BT_PART_SPLIT
+        prologue = prologue.replace('threadgroup float carry[BT_R * 2];', 'threadgroup float carry[BT_R * 2 * (BT_K / 32)];')
+        decls = decls.replace('matmul2d_descriptor(BT_R, D, BT_K,', 'matmul2d_descriptor(BT_R, D, 32,')
+        for macro, _ in names:
+            decls = decls.replace(f'matmul2d_descriptor({macro}, D, BT_K,', f'matmul2d_descriptor({macro}, D, 32,')
+    if len(sizes) == 1:
+        body = prologue + part.format(R='BT_R', S='') + '}\n'
+    else:
+        body = (prologue + '  if (rows <= BT_R0) {\n' + part.format(R='BT_R0', S='0') + '  } else {\n'
+                + part.format(R='BT_R1', S='1') + '  }\n}\n')
+    return source[:start] + decls + source[start:open_ + 1] + body + source[end:]
+
+
 @program_scope
-def specialize_attention(program, sgs, prepare, chunk_tiles, style='staged', key_tile=32, cached_prefix=False, alias_scratch=False, task_order='head', kv_pipeline=False):
+def specialize_attention(program, sgs, prepare, chunk_tiles, style='staged', key_tile=32, cached_prefix=False, alias_scratch=False, task_order='head', kv_pipeline=False, big_tile=0, big_tile_exact=False):
     p = copy.deepcopy(program)
     cores = [o for o in p.ops if p.kernels[o.kernel].function == 'gqa_decode_mma']
     if not cores:
@@ -412,6 +631,18 @@ def specialize_attention(program, sgs, prepare, chunk_tiles, style='staged', key
         body = body[:a]+'''      if (key < ctx) load_dl(v_cache + (key*p.kv_heads+j)*D+lane*DL,v);
 '''+body[b:]
         k.source = k.source[:start]+body+k.source[end:]
+        if big_tile:
+            # a 16-row program (96 rows) takes 32-key tiles: 96 x 64 float scores do not fit threadgroup memory
+            rmax = (rows + 15) // 16 * 16
+            big_tile = big_tile if rmax * big_tile * 6 + rmax * 16 <= 32768 else 32
+            if alias_scratch or cached_prefix or style!='staged' or (32*chunk_tiles) % big_tile or task_order!='head':
+                raise ValueError('big-tile attention needs prepared staged Q/K, no aliasing or cached prefix, and chunks of whole key tiles')
+            cap = k.macros.get('STATIC_GQA_P_CTX_MAX')
+            if cap is not None and int(cap.rstrip('u')) < big_tile:
+                raise ValueError('big-tile attention needs a KV capacity of at least one key tile')
+            prep.source = _replace(prep.source, '    store_dl(prepared_q + t*p.in_stride+p.q_off+h*D+lane*DL, q);',
+                '    store_dl(prepared_q + ((h / (p.heads / p.kv_heads)) * p.rows_max + t * (p.heads / p.kv_heads) + h % (p.heads / p.kv_heads)) * D + lane*DL, q);')
+            k.source = _big_tile(k.source, rows, big_tile, exact=big_tile_exact)
         if alias_scratch:k.source=_alias_scratch(k.source)
         if cached_prefix:_cache_prefix(p,op,k,True)
         if style=='cooperative':
