@@ -37,8 +37,14 @@
   }
  },
  "attention_big_tile_exact": {
-  "_doc": "Big-tile verify attention that keeps the grouped core's 32-key softmax partition, probability rounding and carry sequence (64-key score MMAs over all 48 rows, two 32-key value MMAs, the served chunk partition); byte-identical to the served core if the matrix unit's per-element results do not depend on the tile shape.",
-  "_gate": "pending",
+  "_doc": "Big-tile verify attention that keeps the grouped core's 32-key softmax partition, probability rounding and carry order (64-key score MMAs over all 48 rows, two 32-key value MMAs) and the served chunk partition: byte-identical to the served attention core (a bit-exact change; an overlay only because it is new).",
+  "_gate": {
+   "tool": "numerics_gate.py vs opt/kernels e326092 served recipes, tail 2048 (6,099 scored rows)",
+   "logits": "byte-identical logits.npy on all 6,099 rows (agreement 100 %, KL 0)",
+   "kernel_tests": "tests/kernels/test_attention_static.py -k big_tile: 13/13 pass, incl. byte identity vs the grouped core (8 rows, 16 rows with the 48/96-row paths, capacity 33024 and the served 32774)",
+   "first_divergence": "pending",
+   "speed": "pending"
+  },
   "4096": {
    "target": {
     "attention": {
@@ -50,20 +56,6 @@
      "attention_big_tile": 64,
      "attention_big_tile_exact": true,
      "attention_chunk_tiles": 16
-    }
-   }
-  },
-  "8192": {
-   "target": {
-    "attention": {
-     "fuse": false,
-     "attention_prepare": true,
-     "attention_cached_prefix": false,
-     "attention_alias_scratch": false,
-     "attention_kv_pipeline": false,
-     "attention_big_tile": 64,
-     "attention_big_tile_exact": true,
-     "attention_chunk_tiles": 32
     }
    }
   },
