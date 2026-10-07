@@ -47,6 +47,7 @@ class Generation:
     state_reset_ms: float = 0.0
     checkpoint_ms: float = 0.0
     prefill_timings: List[Dict[str, Any]] = field(default_factory=list)
+    alt_steps: int = 0             # adaptive block: decode steps drafted by the short-block program
 
     @property
     def ms_per_token(self) -> float:
@@ -79,6 +80,7 @@ class Session:
                  min_p: float = 0.0, seed: int = 0, autotune: bool = True, drafter: Any = None, drafter_pack: Optional[str] = None,
                  verify: str = "cost", verify_threshold: Optional[float] = None, verify_length: Optional[int] = None,
                  verify_cost: Optional[Sequence[float]] = None, spec_sampling: str = "match", topp_in_topk: Optional[bool] = None,
+                 alt_drafter: Any = None, adaptive_block: Optional[Dict[str, Any]] = None,
                  barriers: str = "minimal", attention: Optional[str] = None, fast_math: bool = False, accelerator: Optional[str] = None,
                  prefill_chunk_size: int = 128, commute_norm: bool = True, gdn_mixer_fusion: bool = True,
                  prefill_attention: Optional[str] = None, decoder_kernel_config: Optional[Dict[str, Any]] = None,
@@ -160,6 +162,21 @@ class Session:
             drafter.sampling = dict(temperature=float(temperature)) if q_rule else None
         elif q_rule:
             raise ValueError("spec_sampling='q' needs a DSpark drafter")
+        # Adaptive block (spec campaign): a second decode program drafting a shorter block with the same head. The host
+        # switches per chunk of rounds: while the cost rule rarely verifies past the short block (EMA of the fraction of
+        # rounds with L > short block below `threshold`), rounds are drafted by the short-block program (cheaper draft,
+        # T <= 8 verify); every `hold` rounds the long block is probed again. Every round is still a valid chain
+        # verified by the unchanged rules, so greedy output and the sampling distribution are unaffected.
+        self.alt_drafter, self.adaptive = None, None
+        if alt_drafter is not None:
+            if drafter is None or alt_drafter.gamma >= drafter.gamma:
+                raise ValueError("adaptive block: the alternate drafter must draft a shorter block than the main one")
+            alt_drafter.bind_target(model)
+            bind_pack_formats(alt_drafter, self.drafter_pack)
+            if hasattr(alt_drafter, "sampling"):
+                alt_drafter.sampling = dict(temperature=float(temperature)) if q_rule else None
+            self.alt_drafter = alt_drafter
+            self.adaptive = dict(dict(threshold=0.5, chunk=8, hold=48, alpha=0.5), **(adaptive_block or {}))
         topp_in_topk = q_rule if topp_in_topk is None else bool(topp_in_topk)
         model.sampler = GreedySampler(prefix="sampler.") if temperature <= 0 else StochasticSampler(temperature, top_k, top_p, min_p, seed, prefix="sampler.",
                                                                                                      topp_in_topk=topp_in_topk)
@@ -257,7 +274,12 @@ class Session:
         self.engines.clear()
         self._last_engine = None
 
-    def _engine(self, key, bound: int, *, dynamic: bool, prefill: bool = False):
+    def alt_engine(self):
+        """The short-block decode program of the adaptive block (same bound, weights, states and StepState)."""
+        self.engine(0)                                       # the main program first: its (larger) states are the shared ones
+        return self._engine("alt", self.decode_t_max, dynamic=True, alt=True)
+
+    def _engine(self, key, bound: int, *, dynamic: bool, prefill: bool = False, alt: bool = False):
         from .runtime import Engine
 
         if key not in self.engines:
@@ -267,12 +289,18 @@ class Session:
                 # Derive the decoder's packed layouts before the prompt graph looks for them.
                 self._programs[0] = self._compile(self.decode_t_max, dynamic=True, prefill=False)
             if prog is None:
-                prog = self._compile(bound, dynamic=dynamic, prefill=prefill)
+                prog = self._compile(bound, dynamic=dynamic, prefill=prefill, alt=alt)
                 self._programs[key] = prog
-            eng = Engine(prog, self.dev, buffers=self.buffers, fast_math=self.fast_math,
+            # a second decode program never shares a megakernel's synchronization words with the first (crews may differ)
+            private = ("mega.flags", "mega.tasks")
+            shared = self.buffers if not alt or self.buffers is None else {
+                n: b for n, b in self.buffers.items() if not any(n == s or n.endswith("." + s) for s in private)}
+            eng = Engine(prog, self.dev, buffers=shared, fast_math=self.fast_math,
                          pipeline_cache=self._pipelines)
             if self.buffers is None:
                 self.buffers = dict(eng.buffers)
+            elif alt:
+                self.buffers.update({n: b for n, b in eng.buffers.items() if n not in self.buffers})
             else:
                 self.buffers.update(eng.buffers)
             self.engines[key] = eng
@@ -307,11 +335,14 @@ class Session:
                 op.bindings = [(slot, renames.get(n, n), off) for slot, n, off in op.bindings]
         return prog
 
-    def _compile(self, bound, *, dynamic, prefill):
+    def _compile(self, bound, *, dynamic, prefill, alt=False):
+        drafter = self.alt_drafter if alt else self.drafter
+        # the short-block program verifies its whole block (T <= 8 costs the same for every length)
+        verify, verify_length, verify_cost = (("fixed", drafter.gamma, None) if alt else (self.verify, self.verify_length, self.verify_cost))
         prog = compile_program(self.model, self.pack, self.profile, t=bound, dynamic_t=dynamic, eos=self.eos,
-                               ring_capacity=self.ring_capacity, layout=self.layout, tuner=None if prefill else self.tuner, drafter=self.drafter,
-                               drafter_pack=self.drafter_pack, verify=self.verify, verify_threshold=self.verify_threshold,
-                               verify_length=self.verify_length, verify_cost=self.verify_cost, barriers=self.barriers,
+                               ring_capacity=self.ring_capacity, layout=self.layout, tuner=None if prefill else self.tuner, drafter=drafter,
+                               drafter_pack=self.drafter_pack, verify=verify, verify_threshold=self.verify_threshold,
+                               verify_length=verify_length, verify_cost=verify_cost, barriers=self.barriers,
                                attention=self.prefill_attention if prefill and self.prefill_attention is not None else self.attention,
                                accelerator=self.accelerator, commute_norm=self.commute_norm,
                                prefill=prefill, gdn_mixer_fusion=self.gdn_mixer_fusion)
@@ -457,13 +488,15 @@ class Session:
         if on_tokens:
             on_tokens(tokens)
         dec_ms = dec_wall = host = 0.0
-        steps = 0
+        steps = alt_steps = 0
         n_pre = len(tokens)
         if max_new_tokens > 1 and not r1.done and not (cancelled and cancelled()):
             if self.decoder_kernel_config is not None and not resident_prefill and not keep:
                 self.release_engines(keep_state_from=pre)
                 del pre
-            if on_tokens:
+            if self.alt_drafter is not None:
+                dec_ms, dec_wall, host, steps, alt_steps = self._decode_adaptive(tokens, max_new_tokens, on_tokens, cancelled)
+            elif on_tokens:
                 # Bound each host pump for incremental output/cancellation, while
                 # retaining the complete speculative round and its kernel recipe.
                 dec = self.engine(0 if self.drafter is not None else 1)
@@ -512,9 +545,65 @@ class Session:
         gen.cached_prompt_tokens, gen.setup_ms = len(cached.tokens) if cached is not None else 0, self._setup_ms
         gen.prefill_wall_ms, gen.state_reset_ms, gen.checkpoint_ms = prefill_wall_ms, state_reset_ms, checkpoint_ms
         gen.prefill_timings = prefill_timings
+        gen.alt_steps = alt_steps
         if stats is not None:
             gen.accepted, gen.committed, gen.verify_len, gen.confidences = stats
         return gen
+
+    def _decode_adaptive(self, tokens, max_new_tokens, on_tokens, cancelled):
+        """The decode loop of the adaptive block: chunks of rounds on the long- or the short-block program (see
+        ``__init__``); appends to ``tokens``; returns (gpu ms, wall ms, host ms, steps, short-block steps)."""
+        import numpy as np
+
+        from .compiler.emit import ACCEPT_LOG
+        from .kernels import ACCEPT_LOG_CAP
+
+        cfg = self.adaptive
+        main, alt = self.engine(0), self.alt_engine()
+        short = self.alt_drafter.gamma
+        dec_ms = dec_wall = host = 0.0
+        steps = alt_steps = 0
+        use_alt, ema, seen, hold, skip_first = False, None, 0, 0, False
+        while len(tokens) < max_new_tokens and not (cancelled and cancelled()):
+            eng = alt if use_alt else main
+            self._last_engine = eng
+            need = max_new_tokens - len(tokens)
+            k = 1 if on_tokens else (min(max(hold, 1), 2 * int(cfg["chunk"])) if use_alt else int(cfg["chunk"]))
+            s0 = int(eng.state()["step"])
+            r = eng.run(min(k, need), steps_per_cb=self.spec_steps_per_cb, in_flight=self.spec_in_flight, max_tokens=need)
+            tokens += r.tokens
+            dec_ms += r.gpu_ms
+            dec_wall += r.wall_ms
+            host += r.host_busy_ms
+            steps += r.steps
+            if on_tokens:
+                on_tokens(tokens[:max_new_tokens])
+            s1 = int(eng.state()["step"])
+            ran = s1 - s0
+            if use_alt:
+                alt_steps += ran
+            if r.done:
+                break
+            if ran <= 0:
+                raise RuntimeError("adaptive decode made no progress")
+            if use_alt:
+                hold -= ran
+                if hold <= 0:                                   # probe the long block again
+                    use_alt, ema, seen, skip_first = False, None, 0, True
+                continue
+            # the rounds just verified: how often did the rule verify past what the short block can offer
+            raw = eng.buffers[ACCEPT_LOG].read((s0 % ACCEPT_LOG_CAP) * 4, min(ran, ACCEPT_LOG_CAP - s0 % ACCEPT_LOG_CAP) * 4)
+            ls = [(int(v) >> 8) & 0xFF for v in np.frombuffer(raw, dtype=np.uint32) if (int(v) & 0xFFFF) != 0xFFFF]
+            if skip_first and ls:                               # that round verified the short program's last block
+                ls, skip_first = ls[1:], False
+            if ls:
+                f = sum(1 for L in ls if L > short) / len(ls)
+                a = float(cfg["alpha"]) if not on_tokens else float(cfg["alpha"]) / int(cfg["chunk"])
+                ema = f if ema is None else (1.0 - a) * ema + a * f
+                seen += len(ls)
+            if ema is not None and seen >= int(cfg["chunk"]) and ema < float(cfg["threshold"]):
+                use_alt, hold = True, int(cfg["hold"])
+        return dec_ms, dec_wall, host, steps, alt_steps
 
     def _accept_stats(self, eng, n_prefill_steps: int):
         """Per decode step (accepted drafts, committed tokens, verify length, the block's confidences) from the
@@ -606,6 +695,18 @@ def load_session(model_dir: str, pack_dir: str, *, max_context: int = 4096, eos:
             with open(sts_path) as f:
                 dopts["sts"] = json.load(f)["temperatures"]
         drafter = DRAFTERS.get(drafter_kind).from_checkpoint(drafter_dir, target_lm_head=model.lm_head, max_context=max_context, **dopts)
+        adaptive = options.get('adaptive_block')
+        if adaptive and drafter_kind == 'dspark' and int(adaptive.get('block', 7)) < drafter.gamma:
+            # the same head drafting a shorter block (the adaptive block's second decode program)
+            short = int(adaptive.get('block', 7))
+            aopts = {k: v for k, v in dopts.items() if k != 'lookup'}
+            aopts['block_size'] = short
+            if aopts.get('sts') is not None:
+                aopts['sts'] = list(aopts['sts'])[:short]
+            options['alt_drafter'] = DRAFTERS.get(drafter_kind).from_checkpoint(drafter_dir, target_lm_head=model.lm_head, max_context=max_context, **aopts)
+            options['adaptive_block'] = {k: v for k, v in adaptive.items() if k != 'block'}
+        else:
+            options.pop('adaptive_block', None)
     return Session(model, pack_dir, eos=eos, drafter=drafter, drafter_pack=drafter_pack, **options)
 
 

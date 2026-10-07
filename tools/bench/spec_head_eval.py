@@ -47,6 +47,7 @@ ap.add_argument('--session-kw', default='{}')
 ap.add_argument('--verify-rule', default='fixed', choices=['fixed', 'cost'])
 ap.add_argument('--draft-lookup', action='store_true')
 ap.add_argument('--spec-sampling', default='match', choices=['match', 'q'])
+ap.add_argument('--adaptive-block', action='store_true', help='serve option: adaptive block (block 7 rounds when L>7 is rare)')
 ap.add_argument('--report', nargs='*', default=None)
 ap.add_argument('--by', default='suite,bucket')
 a = ap.parse_args()
@@ -129,6 +130,7 @@ ns.no_draft, ns.draft_revision, ns.draft_block_size = a.no_draft, None, a.block
 ns.max_context, ns.draft_quantization, ns.draft_pack, ns.pack = a.max_context, 'auto', a.draft_pack, a.pack
 ns.kernel_config, ns.kernel_config_key = None, None
 ns.verify_rule, ns.draft_lookup, ns.spec_sampling = a.verify_rule, a.draft_lookup, a.spec_sampling
+ns.draft_adaptive_block = a.adaptive_block
 t = time.time()
 assets = prepare(ns)
 setup_s = time.time() - t
@@ -210,7 +212,7 @@ for key, r, ids, mx, options in plan:
                prefill_wall_ms=g.prefill_wall_ms, prefill_gpu_ms=g.prefill_ms, decode_wall_ms=g.decode_wall_ms,
                decode_gpu_ms=g.decode_ms, decode_tok_s=((gen - 1) / (g.decode_wall_ms / 1e3)) if g.decode_wall_ms else None,
                prefill_tok_s=(len(ids) / (g.prefill_wall_ms / 1e3)) if g.prefill_wall_ms else None,
-               wall_s=wall, accepted=acc, committed=com, output_ids=toks, verify_len=list(g.verify_len or []),
+               wall_s=wall, accepted=acc, committed=com, output_ids=toks, verify_len=list(g.verify_len or []), alt_steps=int(getattr(g, 'alt_steps', 0)),
                confidences=[[round(x, 4) for x in c] for c in (g.confidences or [])], sampling=sampling, block=assets.gamma,
                max_new=mx, max_context=a.max_context, draft=str(assets.draft_dir) if assets.draft_dir else None,
                time=time.strftime('%Y-%m-%dT%H:%M:%S'))

@@ -34,6 +34,7 @@ class ServingAssets:
     verify_rule: str = 'fixed'
     lookup: bool = False
     spec_sampling: str = 'match'
+    adaptive_block: bool = False
     verify_costs: dict | None = None
 
     def options(self, prompt_tokens):
@@ -59,6 +60,8 @@ class ServingAssets:
                                                         and recipe.get('target') else 'v3'), accelerator='on')
         if self.draft_dir and self.spec_sampling != 'match':
             options['spec_sampling'] = self.spec_sampling          # temperature > 0 only; greedy requests are unaffected
+        if self.draft_dir and self.adaptive_block and self.gamma > 7:
+            options['adaptive_block'] = dict(block=7)              # block-7 rounds while the cost rule rarely verifies past 7
         if self.draft_dir and self.lookup:
             options['drafter_options'] = dict(options['drafter_options'], lookup={})
         if self.draft_dir and self.verify_rule == 'cost':
@@ -152,4 +155,5 @@ def prepare(args, *, device_info=None):
     return ServingAssets(model_dir, pack, args.max_context, capacity, profile,
                          draft_dir, draft_pack, gamma, recipes, args.kernel_config_key, prefill_chunk_size=chunk,
                          verify_rule=verify_rule, lookup=lookup, verify_costs=verify_costs,
-                         spec_sampling=getattr(args, 'spec_sampling', 'match') or 'match')
+                         spec_sampling=getattr(args, 'spec_sampling', 'match') or 'match',
+                         adaptive_block=bool(getattr(args, 'draft_adaptive_block', False)))
