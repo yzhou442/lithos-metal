@@ -47,3 +47,11 @@ def recipes(model, drafter, quantization):
     # The recipes were measured at block 7 (verify 8 rows); blocks 8-15 compile the same recipes at the sixteen-row
     # bound (TM16 tiles, T_HI 16, single-pass GDN at T <= 16: static_fusion / emit), with every per-row result equal.
     return selected
+
+
+def verify_costs():
+    """Measured full-round GPU ms per verify length l = 0 … 15 (l = 0 as l = 1) for the sixteen-row programs, per
+    context tier (``b15`` = block 15 drafts). The cost-aware verify rule (``verify='cost'``) uses them relative to
+    l = 0 (tools/bench/spec_cost_table.py)."""
+    path = Path(__file__).parent / 'recipes' / 'dspark' / 'verify-cost.json'
+    return json.loads(path.read_text()) if path.exists() else {}

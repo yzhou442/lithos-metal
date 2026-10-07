@@ -30,6 +30,8 @@ class ServingAssets:
     gamma: int = 0
     recipes: dict | None = None
     recipe_key: str | None = None
+    verify_rule: str = 'fixed'
+    verify_costs: dict | None = None
 
     def options(self, prompt_tokens):
         profile = copy.deepcopy(self.profile)
@@ -52,6 +54,13 @@ class ServingAssets:
                            decoder_kernel_config=copy.deepcopy(recipe.get('target')),
                            prefill_attention=recipe.get('prefill_attention', 'auto' if profile.backend == 'm5_max_40c'
                                                         and recipe.get('target') else 'v3'), accelerator='on')
+        if self.draft_dir and self.verify_rule == 'cost':
+            # The chip's measured whole-round cost per verify length, for this program shape and context tier.
+            tables = (self.verify_costs or {}).get('b15' if self.gamma > 7 else None) or {}
+            if tables:
+                tier = str(max((int(k) for k in tables if int(k) <= prompt_tokens), default=min(int(k) for k in tables)))
+                options.update(verify='cost', verify_cost=list(tables[tier]))
+                options.pop('verify_length', None)
         return key, options
 
 
@@ -127,7 +136,9 @@ def prepare(args, *, device_info=None):
             root/'draft-cache' if (root/'manifest.json').exists() else root)
         draft_pack = ensure_pack(draft_dir, draft, draft_root, capacity=capacity, layout=layout,
                                   backend=profile.backend, role='draft', quantization=quantization)
-    LOG.info('Serving backend=%s, target=%s, draft=%s, verify=%s, recipe contexts=%s',
-             profile.backend, model_dir, draft_dir, gamma + 1 if gamma else 1, sorted(recipes))
+    verify_rule = getattr(args, 'verify_rule', 'fixed') or 'fixed'
+    verify_costs = backend.serving_verify_costs() if draft and hasattr(backend, 'serving_verify_costs') else None
+    LOG.info('Serving backend=%s, target=%s, draft=%s, verify=%s (%s), recipe contexts=%s',
+             profile.backend, model_dir, draft_dir, gamma + 1 if gamma else 1, verify_rule, sorted(recipes))
     return ServingAssets(model_dir, pack, args.max_context, capacity, profile,
-                         draft_dir, draft_pack, gamma, recipes, args.kernel_config_key)
+                         draft_dir, draft_pack, gamma, recipes, args.kernel_config_key, verify_rule, verify_costs)

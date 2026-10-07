@@ -1505,7 +1505,8 @@ def lower_round(g: Graph, model: Model, drafter: Any, token: Value, profile: Pro
 def compile_program(model: Model, pack: PackFile, profile: Profile, *, t: Optional[int] = None, eos: Union[int, Sequence[int]] = -1, ring_capacity: int = 4096,
                     layout: Optional[StepStateLayout] = None, tg: int = 384, passes=DEFAULT_PASSES, dynamic_t: bool = False,
                     tuner: Any = None, drafter: Any = None, drafter_pack: Optional[PackFile] = None, verify: str = "cost",
-                    verify_threshold: Optional[float] = None, verify_length: Optional[int] = None, barriers: str = "minimal",
+                    verify_threshold: Optional[float] = None, verify_length: Optional[int] = None,
+                    verify_cost: Optional[Sequence[float]] = None, barriers: str = "minimal",
                     attention: Optional[str] = None, accelerator: Optional[str] = None, prefill: bool = False, commute_norm: bool = True,
                     gdn_mixer_fusion: bool = True) -> Program:
     """Lower ``model``, run the ``passes`` and emit its step program (see :func:`emit_program`). With a ``drafter``
@@ -1540,6 +1541,12 @@ def compile_program(model: Model, pack: PackFile, profile: Profile, *, t: Option
             raise ValueError(f"compile_program: verify='fixed' needs verify_length in 0..{drafter.gamma}")
         fixed = int(verify_length)
     cost = verify_costs(profile, pack, drafter.gamma, t or layout.t_max, accelerator) if verify == "cost" else None
+    if verify == "cost" and verify_cost is not None:
+        # a measured whole-round cost per verify length (l = 0 … γ drafts, relative units; spec_cost_table.py)
+        n = min(drafter.gamma, (t or layout.t_max) - 1) + 1
+        if len(verify_cost) < n or any(not c > 0 for c in verify_cost[:n]):
+            raise ValueError(f"compile_program: verify_cost needs {n} positive entries (l = 0 … {n - 1})")
+        cost = [float(c) / float(verify_cost[0]) for c in verify_cost[:n]]
     if cost is None and fixed is None and verify_threshold is None:
         verify_threshold = FALLBACK_THRESHOLD           # no cost table (or the threshold rule asked for without a threshold)
     lower_round(g, model, drafter, token, profile, cost=cost, threshold=verify_threshold, fixed=fixed)

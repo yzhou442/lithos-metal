@@ -20,3 +20,7 @@ class Backend(MetalBackend):
     def serving_recipes(self, model, drafter, quantization):
         from .serving import recipes
         return recipes(model, drafter, quantization)
+
+    def serving_verify_costs(self):
+        from .serving import verify_costs
+        return verify_costs()
