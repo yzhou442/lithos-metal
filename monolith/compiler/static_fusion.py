@@ -58,7 +58,7 @@ def normalize(p,sgs,mode="coop",groups=None, *, tn=16, split=False,
               gdn_tp=None, perm_sgs=None, staged_tk=None, fp8_decode='standard', gdn_global=None,
               q_outer=None, fp8_layout='blm', weight_prefetch=0, fp8_tile_block=1, fp8_storage='fp8', tm=16, attention_prepare=False, attention_chunk_tiles=1,
               attention_style='staged', attention_key_tile=32, attention_cached_prefix=False, attention_alias_scratch=False, attention_task_order='head',
-              attention_compact_partials=False, attention_kv_pipeline=False, nvfp4_layout="blm", nvfp4_tile_block=1, nvfp4_scale_mode="shared", nvfp4_operand="standard", nvfp4_prefetch=0, nvfp4_vector_loads=False,
+              attention_compact_partials=False, attention_kv_pipeline=False, attention_big_tile=0, attention_big_tile_exact=False, nvfp4_layout="blm", nvfp4_tile_block=1, nvfp4_scale_mode="shared", nvfp4_operand="standard", nvfp4_prefetch=0, nvfp4_vector_loads=False,
               post_norm_once=None, post_norm_loads=16, post_norm_prefold=False):
     if type(post_norm_prefold) is not bool or (post_norm_once is not None and type(post_norm_once) is not bool) or type(post_norm_loads) is not int or post_norm_loads not in (4,8,16,32):
         raise ValueError('unsupported post-product normalization fold')
@@ -161,7 +161,7 @@ def normalize(p,sgs,mode="coop",groups=None, *, tn=16, split=False,
                     attention_prepare=attention_prepare,attention_chunk_tiles=attention_chunk_tiles,
                     attention_style=attention_style,attention_key_tile=attention_key_tile,attention_cached_prefix=attention_cached_prefix,
                     attention_alias_scratch=attention_alias_scratch,attention_compact_partials=attention_compact_partials,
-                    attention_task_order=attention_task_order,attention_kv_pipeline=attention_kv_pipeline,
+                    attention_task_order=attention_task_order,attention_kv_pipeline=attention_kv_pipeline,attention_big_tile=attention_big_tile,attention_big_tile_exact=attention_big_tile_exact,
                     nvfp4_layout=nvfp4_layout,nvfp4_tile_block=nvfp4_tile_block,nvfp4_scale_mode=nvfp4_scale_mode,nvfp4_operand=nvfp4_operand,nvfp4_prefetch=nvfp4_prefetch,nvfp4_vector_loads=nvfp4_vector_loads,
                     post_norm_once=post_norm_once,post_norm_loads=post_norm_loads)
         out=normalize(p,sgs,mode,groups,**common)
@@ -561,9 +561,11 @@ def normalize(p,sgs,mode="coop",groups=None, *, tn=16, split=False,
         p=_gdn_recurrence_options(p,sgs,gdn_global,0,1)
     if type(attention_kv_pipeline) is not bool:
         raise ValueError('attention_kv_pipeline must be a boolean')
-    if attention_prepare or attention_chunk_tiles != 1 or attention_cached_prefix or attention_alias_scratch or attention_key_tile!=32 or attention_compact_partials or attention_task_order!='head' or attention_kv_pipeline:
+    if attention_big_tile not in (0, 32, 64) or (attention_big_tile and not attention_prepare) or type(attention_big_tile_exact) is not bool:
+        raise ValueError('attention_big_tile is 0, 32 or 64 keys and needs attention_prepare (attention_big_tile_exact: bool)')
+    if attention_prepare or attention_chunk_tiles != 1 or attention_cached_prefix or attention_alias_scratch or attention_key_tile!=32 or attention_compact_partials or attention_task_order!='head' or attention_kv_pipeline or attention_big_tile:
         from .attention_fusion import specialize_attention
-        p=specialize_attention(p,sgs,attention_prepare,attention_chunk_tiles,attention_style,attention_key_tile,attention_cached_prefix,attention_alias_scratch,attention_task_order,attention_kv_pipeline)
+        p=specialize_attention(p,sgs,attention_prepare,attention_chunk_tiles,attention_style,attention_key_tile,attention_cached_prefix,attention_alias_scratch,attention_task_order,attention_kv_pipeline,attention_big_tile,attention_big_tile_exact)
         if attention_compact_partials:
             from .attention_fusion import compact_partials
             compact_partials(p)

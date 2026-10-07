@@ -1,7 +1,40 @@
 """Select measured decoder/draft recipes by shapes and formats, independent of checkpoint names."""
 import copy
 import json
+import os
 from pathlib import Path
+
+# Opt-in numerics-changing recipe overlays (recipes/dspark/numerics-overlays.json), named in
+# LITHOS_NUMERICS_OVERLAYS (comma separated). Off by default: the selected recipes are the measured,
+# baseline-identical ones; an overlay changes rounding and is gated separately (see the overlay's _gate).
+OVERLAY_ENV = 'LITHOS_NUMERICS_OVERLAYS'
+
+
+def _merge(dst, src):
+    for k, v in src.items():
+        if v is None:
+            dst.pop(k, None)
+        elif isinstance(v, dict) and isinstance(dst.get(k), dict):
+            _merge(dst[k], v)
+        else:
+            dst[k] = copy.deepcopy(v)
+
+
+def apply_overlays(selected, names=None, root=None):
+    """Deep-merge the named overlays' per-context patches into selected (in place) and return it."""
+    names = os.environ.get(OVERLAY_ENV, '') if names is None else names
+    names = [n.strip() for n in (names.split(',') if isinstance(names, str) else names) if n.strip()]
+    if not names:
+        return selected
+    root = root or Path(__file__).parent / 'recipes' / 'dspark'
+    overlays = json.loads((root / 'numerics-overlays.json').read_text())
+    for name in names:
+        if name not in overlays:
+            raise ValueError(f'unknown numerics overlay {name!r} (known: {sorted(k for k in overlays if not k.startswith("_"))})')
+        for key, patch in overlays[name].items():
+            if not key.startswith('_') and key in selected:
+                _merge(selected[key], patch)
+    return selected
 
 
 def recipes(model, drafter, quantization):
@@ -37,11 +70,11 @@ def recipes(model, drafter, quantization):
     root = Path(__file__).parent / 'recipes' / 'dspark'
     contexts = json.loads((root / 'selected-contexts.json').read_text())
     if quantization is None:
-        return contexts
+        return apply_overlays(contexts)
     selected = json.loads((root / 'selected-nvfp4-endpoints.json').read_text())
     # Target recipes do not depend on draft precision. Reuse the long-context
     # NVFP4 draft with each measured target recipe instead of duplicating JSON.
     for key in ('4096', '8192', '16384'):
         selected[key] = copy.deepcopy(selected['32768'])
         selected[key]['target'] = contexts[key]['target']
-    return selected
+    return apply_overlays(selected)
