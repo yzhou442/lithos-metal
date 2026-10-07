@@ -18,6 +18,21 @@ from monolith.formats.blm import PackInfo, unpack_blm
 from monolith.runtime.program import BufferSpec
 
 
+# Derived operand layouts produced in this process, by source slab: the absolute
+# (file, byte offset) of the original pack slab -> the repack arguments used.
+# Another program over the same weights (prompt vs. verification graph) can
+# reuse an existing layout, so both map the same content-addressed file.
+LAYOUTS = {}
+
+
+def source_key(program, binding):
+    name, off = binding
+    spec = program.buffers[name]
+    if spec.file is None:
+        return None
+    return (os.path.realpath(spec.file), spec.file_offset + off)
+
+
 def projection_rows(program):
     rows = {}
     for op in program.ops:
@@ -107,6 +122,10 @@ def repack(program, binding, macros, rows, tn, tk=32, tile_block=1, scale_mode='
                 codes.tofile(f);scale_values.tofile(f);f.write(bytes(aligned-nbytes));f.flush()
                 os.replace(temporary,path)
             finally:temporary.unlink(missing_ok=True)
+    key=source_key(program,binding)
+    if key is not None:
+        LAYOUTS.setdefault(key,{})[identity]=dict(rows=rows,tn=tn,tk=tk,tile_block=tile_block,scale_mode=scale_mode,
+                                                  outer=outer,lane_order=lane_order,width=width,path=str(path))
     return name+'.nvfp4tile.'+identity,BufferSpec(aligned,role='weights',file=str(path)),code_bytes
 
 
