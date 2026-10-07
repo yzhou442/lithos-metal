@@ -161,7 +161,7 @@ for key, items in by_key.items():
                              tokens=g.tokens[:mx], committed=(sum(g.committed) if g.committed else None),
                              mean_accepted=g.mean_accepted, tokens_per_step=g.tokens_per_step,
                              accepted=g.accepted, committed_log=g.committed, verify_len=g.verify_len,
-                             confidences=g.confidences))
+                             confidences=g.confidences, alt_steps=int(getattr(g, 'alt_steps', 0))))
         reps.sort(key=lambda x: x['decode_wall_ms'])
         m = reps[len(reps) // 2]
         P = len(ids); gen = len(m['tokens'])
@@ -171,7 +171,7 @@ for key, items in by_key.items():
                    gpu_ms_per_token=m['decode_gpu_ms'] / max(1, (m['committed'] or gen - 1)),
                    tokens_per_step=m['tokens_per_step'], mean_accepted=m['mean_accepted'],
                    ttft_ms=m['prefill_wall_ms'], **{k: m[k] for k in ('prefill_wall_ms', 'decode_wall_ms',
-                   'decode_gpu_ms', 'steps', 'tokens', 'accepted', 'committed_log', 'verify_len', 'confidences')},
+                   'decode_gpu_ms', 'steps', 'tokens', 'accepted', 'committed_log', 'verify_len', 'confidences', 'alt_steps')},
                    load_s=load_s, warm_s=warm_s, round_ms=m['decode_gpu_ms'] / max(1, m['steps']),
                    decode_wall_all=[x['decode_wall_ms'] for x in reps])
         if base and name in base['prompts']:
@@ -186,6 +186,7 @@ for key, items in by_key.items():
         results[name] = rec
         print(f"{name:8s} P={P:6d} prefill {rec['prefill_tok_s'] or 0:8.1f} tok/s  decode {rec['decode_tok_s']:7.1f} "
               f"tok/s  tok/step {rec['tokens_per_step']:.2f}  acc {rec['mean_accepted']:.2f}"
+              + (f"  short-block steps {rec['alt_steps']}/{rec['steps']}" if rec['alt_steps'] else '')
               + (f"  ident={rec['identical']} dspd={rec['decode_speedup']:.3f}" if 'identical' in rec else ''),
               flush=True)
 gm = lambda xs: math.exp(sum(math.log(x) for x in xs) / len(xs)) if xs else None

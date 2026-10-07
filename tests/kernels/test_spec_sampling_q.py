@@ -165,20 +165,28 @@ def test_greedy_is_unchanged_by_the_flag(packs):
 
 # ---- the adaptive block: two decode programs (long / short block) switched by the host --------------------------------
 
-def _adaptive(packs, **kw):
-    """A session whose controller alternates between the block-3 and the block-2 program almost every round."""
+def _adaptive(packs, wide=False, **kw):
+    """A session whose controller alternates between the block-3 and the block-2 program almost every round. ``wide``:
+    the main program verifies up to 16 rows (lookup rows after its block), the short one 8 — a hand-off must cut the
+    pending block to the short program's bound."""
     tdir, ddir = packs
     model = _model(tdir)
     drafter, _, _, _ = build(ddir, target_lm_head=model.lm_head)
     short, _, _, _ = build(ddir, target_lm_head=model.lm_head, block_size=2)
+    if wide:
+        drafter.lookup = {"nmin": 1}
+        rule = dict(verify="fixed", verify_length=3, adaptive_block=dict(threshold=2.0, chunk=1, hold=1))      # always switch
+    else:
+        rule = dict(verify="cost", verify_cost=[1.0, 1.0, 1.25, 1.9], adaptive_block=dict(threshold=0.999, chunk=1, hold=1))
     return Session(model, str(tdir / "pack"), eos=-1, autotune=False, attention="v2", drafter=drafter, drafter_pack=str(ddir / "pack"),
-                   alt_drafter=short, adaptive_block=dict(threshold=0.999, chunk=1, hold=1), verify="cost", verify_cost=[1.0, 1.0, 1.25, 1.9], **kw)
+                   alt_drafter=short, **rule, **kw)
 
 
-def test_adaptive_block_greedy_equals_plain(packs):
+@pytest.mark.parametrize("wide", [False, True], ids=["bound8", "bound16-to-8"])
+def test_adaptive_block_greedy_equals_plain(packs, wide):
     tdir, _ = packs
     plain = Session(_model(tdir), str(tdir / "pack"), eos=-1, autotune=False, attention="v2")
-    spec = _adaptive(packs)
+    spec = _adaptive(packs, wide)
     rng = np.random.default_rng(3)
     alt = 0
     for n_prompt, n_new in ((5, 24), (11, 20), (1, 12)):
@@ -189,13 +197,14 @@ def test_adaptive_block_greedy_equals_plain(packs):
     assert alt > 0                                                    # the short-block program did draft rounds
 
 
-def test_adaptive_block_preserves_the_target_distribution(packs):
+@pytest.mark.parametrize("wide", [False, True], ids=["bound8", "bound16-to-8"])
+def test_adaptive_block_preserves_the_target_distribution(packs, wide):
     tdir, _ = packs
     sampling = dict(temperature=1.0, top_k=20, top_p=0.95)
     plain = Session(_model(tdir), str(tdir / "pack"), eos=-1, autotune=False, attention="v2", topp_in_topk=True, **sampling)
-    spec = _adaptive(packs, spec_sampling="q", **sampling)
-    ids = [7, 23, 41, 3]
-    n_seeds, n_new = 1500, 4
+    spec = _adaptive(packs, wide, spec_sampling="q", **sampling)
+    ids = [7, 23, 41, 3, 9, 7, 23, 41] if wide else [7, 23, 41, 3]
+    n_seeds, n_new = 1500, (6 if wide else 4)
     plain_seqs, spec_seqs, alt = [], [], 0
     for seed in range(n_seeds):
         plain.seed, spec.seed = seed, seed + 100_000
@@ -208,6 +217,9 @@ def test_adaptive_block_preserves_the_target_distribution(packs):
         stat, df, z = _chi2_homogeneity(_counts(plain_seqs, key), _counts(spec_seqs, key))
         zs[name] = z
         print(f"\nadaptive {name}: chi2 {stat:.1f} df {df} z {z:.2f}")
-    print(f"adaptive: {alt} short-block rounds over {n_seeds} generations")
+    caps = getattr(spec, "adaptive_caps", 0)
+    print(f"adaptive (wide={wide}): {alt} short-block rounds, {caps} capped hand-offs over {n_seeds} generations")
     assert all(z < 4.0 for z in zs.values()), zs
     assert alt > n_seeds // 2
+    if wide:
+        assert spec.decode_t_max == 16 and spec.alt_bound == 8 and caps > 20

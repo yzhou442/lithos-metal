@@ -274,10 +274,16 @@ class Session:
         self.engines.clear()
         self._last_engine = None
 
+    @property
+    def alt_bound(self) -> int:
+        """The short-block program's verify bound: eight rows when its block fits (at depth the sixteen-row program's
+        attention costs more even for T <= 8), else the main bound."""
+        return 8 if self.alt_drafter.gamma + 1 <= 8 else self.decode_t_max
+
     def alt_engine(self):
-        """The short-block decode program of the adaptive block (same bound, weights, states and StepState)."""
+        """The short-block decode program of the adaptive block (same weights, states and StepState)."""
         self.engine(0)                                       # the main program first: its (larger) states are the shared ones
-        return self._engine("alt", self.decode_t_max, dynamic=True, alt=True)
+        return self._engine("alt", self.alt_bound, dynamic=True, alt=True)
 
     def _engine(self, key, bound: int, *, dynamic: bool, prefill: bool = False, alt: bool = False):
         from .runtime import Engine
@@ -289,7 +295,8 @@ class Session:
                 # Derive the decoder's packed layouts before the prompt graph looks for them.
                 self._programs[0] = self._compile(self.decode_t_max, dynamic=True, prefill=False)
             if prog is None:
-                prog = self._compile(bound, dynamic=dynamic, prefill=prefill, alt=alt)
+                # (alt only when set: callers and tests may replace _compile with the pre-adaptive signature)
+                prog = self._compile(bound, dynamic=dynamic, prefill=prefill, **({'alt': True} if alt else {}))
                 self._programs[key] = prog
             # a second decode program never shares a megakernel's synchronization words with the first (crews may differ)
             private = ("mega.flags", "mega.tasks")
@@ -494,7 +501,7 @@ class Session:
             if self.decoder_kernel_config is not None and not resident_prefill and not keep:
                 self.release_engines(keep_state_from=pre)
                 del pre
-            if self.alt_drafter is not None:
+            if getattr(self, 'alt_drafter', None) is not None:
                 dec_ms, dec_wall, host, steps, alt_steps = self._decode_adaptive(tokens, max_new_tokens, on_tokens, cancelled)
             elif on_tokens:
                 # Bound each host pump for incremental output/cancellation, while
@@ -603,6 +610,14 @@ class Session:
                 seen += len(ls)
             if ema is not None and seen >= int(cfg["chunk"]) and ema < float(cfg["threshold"]):
                 use_alt, hold = True, int(cfg["hold"])
+                # the block just drafted may be longer than the short program verifies: keep its first rows (verifying
+                # fewer drafts is always valid; the rest is dropped and re-drafted)
+                st_buf = main.buffers[main.program.step_state]
+                state = self.layout.unpack(st_buf.read(0, self.layout.size))
+                if int(state["t_this_step"]) > self.alt_bound and not int(state["done"]):
+                    state.update(t_this_step=self.alt_bound, verify_len=self.alt_bound - 1)
+                    st_buf.write(self.layout.pack(state), 0)
+                    self.adaptive_caps = getattr(self, "adaptive_caps", 0) + 1
         return dec_ms, dec_wall, host, steps, alt_steps
 
     def _accept_stats(self, eng, n_prefill_steps: int):
