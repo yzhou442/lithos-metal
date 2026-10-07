@@ -18,6 +18,17 @@ from .cache import default_pack_cache, ensure_pack, resolve_checkpoint
 LOG = logging.getLogger(__name__)
 
 
+def _merge_recipe(dst, src):
+    """Deep-merge a recipe patch (None deletes a key)."""
+    for key, value in src.items():
+        if value is None:
+            dst.pop(key, None)
+        elif isinstance(value, dict) and isinstance(dst.get(key), dict):
+            _merge_recipe(dst[key], value)
+        else:
+            dst[key] = copy.deepcopy(value)
+
+
 @dataclass
 class ServingAssets:
     model_dir: Path
@@ -52,9 +63,14 @@ class ServingAssets:
                 for k, v in recipe.get('accelerator_min_t', {}).items()})
             if 'bf16_min_t' in recipe:
                 profile.accelerator_min_t['bf16'] = recipe['bf16_min_t']
+            target = copy.deepcopy(recipe.get('target'))
+            if target and recipe.get('target_rows8') and self.gamma <= 7 and not self.lookup:
+                # Recipe entries measured on the eight-row verify program only (blocks above 7 and the lookup
+                # extension compile a sixteen-row program, where they were measured slower).
+                _merge_recipe(target, recipe['target_rows8'])
             options.update(drafter_options=dict(block_size=self.gamma, attention=recipe.get('draft_attention', 'mma'),
                                                kernel_config=copy.deepcopy(recipe.get('draft'))),
-                           decoder_kernel_config=copy.deepcopy(recipe.get('target')),
+                           decoder_kernel_config=target,
                            prefill_attention=recipe.get('prefill_attention', 'auto' if profile.backend == 'm5_max_40c'
                                                         and recipe.get('target') else 'v3'), accelerator='on')
         if self.draft_dir and self.spec_sampling != 'match':

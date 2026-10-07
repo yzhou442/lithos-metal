@@ -34,6 +34,9 @@ def apply_overlays(selected, names=None, root=None):
         for key, patch in overlays[name].items():
             if not key.startswith('_') and key in selected:
                 _merge(selected[key], patch)
+                if 'target' in patch:
+                    # a named overlay decides the whole target recipe: drop the row-bound default (target_rows8)
+                    selected[key].pop('target_rows8', None)
     return selected
 
 
@@ -77,6 +80,10 @@ def recipes(model, drafter, quantization):
     for key in ('4096', '8192', '16384'):
         selected[key] = copy.deepcopy(selected['32768'])
         selected[key]['target'] = contexts[key]['target']
+        if 'target_rows8' in contexts[key]:
+            # a patch for the eight-row verify program only (serving.setup applies it when the block is <= 7 without
+            # the lookup extension): measured faster there and slower in the sixteen-row program
+            selected[key]['target_rows8'] = contexts[key]['target_rows8']
     # The recipes were measured at block 7 (verify 8 rows); blocks 8-15 compile the same recipes at the sixteen-row
     # bound (TM16 tiles, T_HI 16, single-pass GDN at T <= 16: static_fusion / emit), with every per-row result equal.
     return apply_overlays(selected)

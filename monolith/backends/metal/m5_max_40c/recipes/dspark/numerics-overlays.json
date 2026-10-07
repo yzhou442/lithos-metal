@@ -42,8 +42,8 @@
    "tool": "numerics_gate.py vs opt/kernels e326092 served recipes, tail 2048 (6,099 scored rows)",
    "logits": "byte-identical logits.npy on all 6,099 rows (agreement 100 %, KL 0)",
    "kernel_tests": "tests/kernels/test_attention_static.py -k big_tile: 13/13 pass, incl. byte identity vs the grouped core (8 rows, 16 rows with the 48/96-row paths, capacity 33024 and the served 32774)",
-   "first_divergence": "pending",
-   "speed": "pending"
+   "first_divergence": "none (lmbench quick/full/long identical to the 0.1.2 baseline with the eight-row default below)",
+   "speed": "paired rounds vs the served core (15 pairs each, variant/served): eight-row program 0.986 at 4K, 0.959 at 16K; sixteen-row program at 16 rows (block 15) 1.029 at 4K, 1.117 at 16K. Hence the default of the eight-row program only (selected-contexts.json target_rows8); this overlay still forces it for every program"
   },
   "4096": {
    "target": {

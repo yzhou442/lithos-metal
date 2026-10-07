@@ -452,6 +452,18 @@
         "q_outer": 1
       },
       "gdn_dead_state": true
+    },
+    "target_rows8": {
+      "attention": {
+        "fuse": false,
+        "attention_prepare": true,
+        "attention_cached_prefix": false,
+        "attention_alias_scratch": false,
+        "attention_kv_pipeline": false,
+        "attention_big_tile": 64,
+        "attention_big_tile_exact": true,
+        "attention_chunk_tiles": 16
+      }
     }
   },
   "8192": {
@@ -902,6 +914,18 @@
         "q_outer": 1
       },
       "gdn_dead_state": true
+    },
+    "target_rows8": {
+      "attention": {
+        "fuse": false,
+        "attention_prepare": true,
+        "attention_cached_prefix": false,
+        "attention_alias_scratch": false,
+        "attention_kv_pipeline": false,
+        "attention_big_tile": 64,
+        "attention_big_tile_exact": true,
+        "attention_chunk_tiles": 12
+      }
     }
   },
   "32768": {
