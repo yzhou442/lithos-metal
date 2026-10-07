@@ -136,7 +136,7 @@ class DSparkDrafter(Drafter):
                  confidence_threshold: float = 0.0, sts: Optional[Sequence[float]] = None,
                  shared_embedding: bool = False, kernel_config: Optional[Dict[str, Any]] = None,
                  attention: Optional[str] = None, checkpoint_lm_head: bool = False,
-                 block_size: Optional[int] = None) -> None:
+                 block_size: Optional[int] = None, vocab_subset: Optional[str] = None) -> None:
         """``target_lm_head``: fallback head when the draft checkpoint does not supply one (None when only packing).
         ``confidence_threshold``: the confident-prefix rule's threshold (≤ 0 verifies the whole block, the
         reference's default) used when the caller of ``lower_select`` has no cost table. ``sts``: per-position
@@ -150,6 +150,10 @@ class DSparkDrafter(Drafter):
             cfg = replace(cfg, block_size=block_size)
         self.cfg, self.gamma, self.max_context = cfg, cfg.block_size, max_context
         self.kernel_config = kernel_config
+        # Draft vocabulary subset ("path[:count]", vocab_subset.py): proposals only from those token ids. Off by
+        # default; LITHOS_DRAFT_VOCAB sets it for benches that build sessions through the serving setup.
+        import os
+        self.vocab_subset = vocab_subset if vocab_subset is not None else (os.environ.get('LITHOS_DRAFT_VOCAB') or None)
         if attention not in (None, 'v1', 'mma', 'auto'):
             raise ValueError('draft attention must be v1, mma or auto')
         self.confidence_threshold = float(confidence_threshold)
@@ -180,6 +184,11 @@ class DSparkDrafter(Drafter):
                                 epilogue="residual", round_residual=True)
 
     def optimize_program(self, program, *, prefill=False):
+        if self.vocab_subset:
+            import copy
+            from .vocab_subset import load_subset, restrict_draft_vocab
+            program = copy.deepcopy(program)
+            restrict_draft_vocab(program, load_subset(self.vocab_subset, self.cfg.vocab_size), vocab=self.cfg.vocab_size)
         if self.kernel_config is None or prefill:
             return program
         from .optimization import optimize
