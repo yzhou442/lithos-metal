@@ -49,10 +49,46 @@
 #ifndef N_SRC
 #define N_SRC 1
 #endif
+#ifndef HIST
+#define HIST 0                       // accept_scan: record every committed token at its position in hist (context lookup)
+#endif
+#ifndef HIST_CAP
+#define HIST_CAP 0u
+#endif
+#ifndef LOOKUP
+#define LOOKUP 0                     // verify_select: extend a whole-block verify with the context lookup's continuation
+#endif
+#ifndef LOOKUP_NMIN
+#define LOOKUP_NMIN 2u               // shortest suffix match that proposes
+#endif
+#ifndef LOOKUP_NMAX
+#define LOOKUP_NMAX 4u               // longest suffix compared (a longer match ranks first)
+#endif
+#ifndef LOOKUP_BASE
+#define LOOKUP_BASE 64u              // drafter rows before the lookup continuation (min with the block: the whole block)
+#endif
+#ifndef LOOKUP_ROWS
+#define LOOKUP_ROWS 16u              // continuation tokens the lookup reports
+#endif
+#ifndef LOOKUP_Q
+#define LOOKUP_Q 0.6f                // cost rule: prior per-token acceptance of a continuation token (match >= 3)
+#endif
+#ifndef LOOKUP_Q2
+#define LOOKUP_Q2 0.45f              // ... of a two-token match
+#endif
+#ifndef LOOKUP_ADAPT
+#define LOOKUP_ADAPT 1               // cost rule: q from this request's measured continuation acceptance (prior LOOKUP_Q, weight 2)
+#endif
+#ifndef LOOKUP_DECAY
+#define LOOKUP_DECAY 0.9f            // per extended round decay of the acceptance counts
+#endif
+#ifndef LOOKUP_MIN_SURVIVAL
+#define LOOKUP_MIN_SURVIVAL 0.0f     // fixed rule: extend only when the block's survival (product of confidences) reaches this
+#endif
 
 struct ConcatParams { uint k; uint t_active; uint pad0; uint pad1; };
 struct ConfParams { uint gamma; uint hidden; uint rank; uint pad; float sts[16]; };
-struct SelectParams { uint gamma; float threshold; uint t_max; uint mode; float cost[16]; uint log_cap; uint ctx_cap; uint lm; uint pad3; };
+struct SelectParams { uint gamma; float threshold; uint t_max; uint mode; float cost[16]; uint log_cap; uint ctx_cap; uint lm; uint ext_enable; };
 struct AcceptParams { uint ring_cap; int eos; uint log_cap; uint ctx_cap; uint lm; uint pad0; uint pad1; uint pad2; };
 // lm = 1: an LM drafter (design §5.8): drafter_ctx_len is the length of the committed prefix it has processed; the accept scan
 // leaves in n_inject the committed rows it has not (the last ones of the step: 0 in decode unless every draft was accepted,
@@ -106,7 +142,11 @@ kernel void confidence(device const ushort* hidden [[buffer(0)]], device const u
 }
 
 kernel void verify_select(device const int* drafts [[buffer(0)]], device const float* conf [[buffer(1)]], device StepState* st [[buffer(2)]],
-                          constant SelectParams& p [[buffer(3)]], device float* conf_log [[buffer(4)]], uint i [[thread_position_in_grid]]) {
+                          constant SelectParams& p [[buffer(3)]], device float* conf_log [[buffer(4)]],
+#if LOOKUP
+                          device const int* lookup [[buffer(5)]],
+#endif
+                          uint i [[thread_position_in_grid]]) {
   if (i != 0 || st->done) return;
   if (p.lm) st->drafter_ctx_len = st->position + ((st->prefill_left > 0u) ? 0u : p.gamma);   // the ingest reached position; the chain added gamma rows
   else st->drafter_ctx_len = st->drafter_ctx_len + st->n_inject;    // the draft pass appended the injected positions
@@ -119,36 +159,97 @@ kernel void verify_select(device const int* drafts [[buffer(0)]], device const f
   }
   uint L = 0u;
   uint lmax = min(p.gamma, p.t_max - 1u);
+  uint rows_cap = min(p.t_max, 16u) - 1u;                     // verify rows past the anchor: the decode bound (cost[16]) and the caches
   if (p.ctx_cap) {                                            // the verify rows must fit the target's caches
     if (st->position >= p.ctx_cap) { st->error = 2u; st->done = 1u; return; }
     lmax = min(lmax, p.ctx_cap - st->position - 1u);
+    rows_cap = min(rows_cap, p.ctx_cap - st->position - 1u);
   }
+#if LOOKUP
+  // the lookup's continuation after the whole block: lookup[0] = suffix match length (0 = none), then the tokens
+  // (a deeper block may instead hand the rows past its first LOOKUP_BASE drafts to the continuation)
+  const uint base = min(p.gamma, LOOKUP_BASE);
+  uint ext = 0u;
+  const uint m = uint(max(lookup[0], 0));
+  if (p.ext_enable && m >= LOOKUP_NMIN && lmax >= base) {
+    while (base + ext < rows_cap && ext < LOOKUP_ROWS && lookup[1u + ext] >= 0) ext++;
+  }
+  float q = (m >= 3u) ? LOOKUP_Q : LOOKUP_Q2;
+#if LOOKUP_ADAPT
+  q = clamp((st->lookup_hits + 2.0f * q) / (st->lookup_trials + 2.0f), 0.0f, 0.99f);
+#endif
+#endif
+  uint use_ext = 0u;                                          // lookup tokens appended after the block this step
+#if LOOKUP
+  // ext_enable bit 1: rounds that follow a wholly accepted block extend (code / file rewrites run in long accepted
+  // stretches; the confidence chain alone under-predicts them). st->accepted is the round just verified.
+  const bool prev_full = (p.ext_enable & 2u) != 0u && base == p.gamma && st->accepted >= p.gamma;
+#endif
   if (p.mode == 2u) {
     L = min(uint(max(p.threshold, 0.0f)), lmax);
+#if LOOKUP
+    if (L == base && ext > 0u) {
+      float surv = 1.0f;
+      for (uint k = 0; k < base; k++) surv *= conf[k];
+      if ((p.ext_enable & 2u) ? prev_full : surv >= LOOKUP_MIN_SURVIVAL) use_ext = ext;
+    }
+#endif
   } else if (p.mode == 1u) {
     float a = 1.0f, expect = 1.0f, best = 1.0f / p.cost[0];
+#if LOOKUP
+    float a_base = 1.0f, e_base = 1.0f;                       // survival and expectation through the lookup's base
+#endif
     for (uint l = 1; l <= lmax; l++) {
       a *= conf[l - 1u];
       expect += a;
       const float score = expect / p.cost[l];
       if (score > best) { best = score; L = l; }
+#if LOOKUP
+      if (l == base) { a_base = a; e_base = expect; }
+#endif
     }
+#if LOOKUP
+    if (ext > 0u) {                                           // the base's survival carries into the continuation
+      float qa = a_base, e2 = e_base;
+      for (uint x = 1; x <= ext; x++) {
+        qa *= q;
+        e2 += qa;
+        const float score = e2 / p.cost[base + x];
+        if (score > best) { best = score; L = base; use_ext = x; }
+      }
+      if (prev_full && use_ext < ext) { L = base; use_ext = ext; }
+    }
+#endif
   } else if (p.threshold <= 0.0f) {
     L = lmax;
   } else {
     while (L < lmax && conf[L] >= p.threshold) L++;
   }
-  st->gamma = p.gamma;
-  st->verify_len = L;
+  st->gamma = p.gamma;                                        // with a continuation: the drafter rows before it (accept_scan)
   st->pending_tokens[0] = st->anchor;
   for (uint k = 0; k < L; k++) st->pending_tokens[k + 1u] = drafts[k];
+#if LOOKUP
+  for (uint k = 0; k < use_ext; k++) st->pending_tokens[L + 1u + k] = lookup[1u + k];
+  if (use_ext) st->gamma = L;
+  L += use_ext;
+#endif
+  st->verify_len = L;
   st->t_this_step = 1u + L;
 }
 
 kernel void accept_scan(device const int* token [[buffer(0)]], device StepState* st [[buffer(1)]], device ulong* ring [[buffer(2)]],
-                        constant AcceptParams& p [[buffer(3)]], device uint* log [[buffer(4)]], uint i [[thread_position_in_grid]]) {
+                        constant AcceptParams& p [[buffer(3)]], device uint* log [[buffer(4)]],
+#if HIST
+                        device int* hist [[buffer(5)]],
+#endif
+                        uint i [[thread_position_in_grid]]) {
   if (i != 0 || st->done) return;
   const uint t = st->t_this_step;
+#if HIST
+  if (st->prefill_left > 0u) {                                // every prompt row is a committed token at its position
+    for (uint r = 0; r < t; r++) if (st->position + r < HIST_CAP) hist[st->position + r] = st->pending_tokens[r];
+  }
+#endif
   if (st->prefill_left > 0u) {                                // a prefill chunk: nothing to verify, inject its positions
     if (p.log_cap) log[st->step % p.log_cap] = (t << 16) | 0xFFFFu;
     st->position = st->position + t;
@@ -178,6 +279,18 @@ kernel void accept_scan(device const int* token [[buffer(0)]], device StepState*
     if (EOS_TEST) { stop = true; break; }   // nothing after the first EOS is committed
   }
   if (p.log_cap) log[st->step % p.log_cap] = (committed << 16) | (L << 8) | acc;
+#if HIST
+  if (L > st->gamma && acc >= st->gamma) {                    // a context-lookup continuation followed a whole accepted block
+    const float hits = float(acc - st->gamma), trials = hits + ((acc < L) ? 1.0f : 0.0f);
+    st->lookup_hits = st->lookup_hits * LOOKUP_DECAY + hits;
+    st->lookup_trials = st->lookup_trials * LOOKUP_DECAY + trials;
+  }
+  for (uint r = 0; r <= base; r++) if (st->position + r < HIST_CAP) hist[st->position + r] = st->pending_tokens[r];   // prompt tail + anchor
+  for (uint k = 0; k < committed; k++) {                      // the accepted drafts and the bonus, after the anchor
+    const uint at = st->position + base + 1u + k;
+    if (at < HIST_CAP) hist[at] = (k < acc) ? st->pending_tokens[base + k + 1u] : bonus;
+  }
+#endif
   st->ring_head = head;
   if (st->stop_at && head >= st->stop_at) stop = true;        // the request is served: the queued steps return at once
   st->accepted = acc;
@@ -192,4 +305,49 @@ kernel void accept_scan(device const int* token [[buffer(0)]], device StepState*
   if (p.lm) st->n_inject = (st->position > st->drafter_ctx_len) ? st->position - st->drafter_ctx_len : 0u;   // the committed rows the LM drafter has not seen
   if (stop) st->done = 1u;
   if (p.ctx_cap && st->position >= p.ctx_cap) { st->error = 2u; st->done = 1u; }     // the context is full
+}
+
+// ngram_lookup: the context-lookup proposal for the next verify (spec campaign; prompt lookup / copy drafting).
+// S = hist[0 .. position] (every committed token; hist[position] = the anchor) ++ the drafter's block d_0 … d_{γ-1}.
+// Over every earlier end index j < |S| - 1 it measures how many trailing tokens of S match the tokens ending at j
+// (up to LOOKUP_NMAX), keeps the longest match (the most recent on ties) and writes out[0] = its length (0 when
+// shorter than LOOKUP_NMIN) and out[1 .. LOOKUP_ROWS] = S[j + 1 …], -1 past the end of S. One threadgroup.
+struct LookupParams { uint gamma; uint cap; uint pad0; uint pad1; };
+static inline int lookup_tok(device const int* hist, device const int* drafts, uint P, uint i) {
+  return (i <= P) ? hist[i] : drafts[i - P - 1u];
+}
+kernel void ngram_lookup(device const int* hist [[buffer(0)]], device const int* drafts [[buffer(1)]], device int* out [[buffer(2)]],
+                         constant LookupParams& p [[buffer(3)]],
+#if STEP_STATE
+                         device const StepState* st [[buffer(15)]],
+#endif
+                         uint tid [[thread_position_in_threadgroup]], uint tpg [[threads_per_threadgroup]]) {
+  threadgroup atomic_uint best;
+#if STEP_STATE
+  if (st->done) return;
+  const uint P = min(st->position, p.cap - 1u);
+  const bool active = st->prefill_left == 0u;
+#else
+  const uint P = 0u;
+  const bool active = false;
+#endif
+  if (tid == 0) atomic_store_explicit(&best, 0u, memory_order_relaxed);
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  const uint n = P + 1u + p.gamma;                            // |S|
+  if (active && n > LOOKUP_NMIN) {
+    int tail[LOOKUP_NMAX];
+    for (uint k = 0; k < LOOKUP_NMAX; k++) tail[k] = (k < n) ? lookup_tok(hist, drafts, P, n - 1u - k) : -2;
+    for (uint j = tid; j + 1u < n; j += tpg) {
+      uint m = 0;
+      while (m < LOOKUP_NMAX && m <= j && lookup_tok(hist, drafts, P, j - m) == tail[m]) m++;
+      if (m >= LOOKUP_NMIN) atomic_fetch_max_explicit(&best, (m << 24) | j, memory_order_relaxed);
+    }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (tid == 0) {
+    const uint b = atomic_load_explicit(&best, memory_order_relaxed);
+    const uint m = b >> 24, j = b & 0xFFFFFFu;
+    out[0] = int(m);
+    for (uint k = 0; k < LOOKUP_ROWS; k++) out[1u + k] = (m > 0u && j + 1u + k < n) ? lookup_tok(hist, drafts, P, j + 1u + k) : -1;
+  }
 }

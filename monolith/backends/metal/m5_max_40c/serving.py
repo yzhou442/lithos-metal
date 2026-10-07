@@ -51,7 +51,7 @@ def recipes(model, drafter, quantization):
 
 def verify_costs():
     """Measured full-round GPU ms per verify length l = 0 … 15 (l = 0 as l = 1) for the sixteen-row programs, per
-    context tier (``b15`` = block 15 drafts). The cost-aware verify rule (``verify='cost'``) uses them relative to
-    l = 0 (tools/bench/spec_cost_table.py)."""
+    context tier: ``b15`` = block 15 drafts; ``b7lk`` = block 7 drafts + the context-lookup extension in rows 9-16.
+    The cost-aware verify rule (``verify='cost'``) uses them relative to l = 0 (tools/bench/spec_cost_table.py)."""
     path = Path(__file__).parent / 'recipes' / 'dspark' / 'verify-cost.json'
     return json.loads(path.read_text()) if path.exists() else {}

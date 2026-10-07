@@ -107,7 +107,8 @@ class Session:
             bind_pack_formats(drafter, self.drafter_pack)
         if layout is None and drafter is not None:
             # verify bounds come in the two row counts the recipes compile for: 8, else 16 (blocks 8-15)
-            layout = StepStateLayout(t_max=8 if drafter.gamma + 1 <= 8 else 16, gamma_max=max(7, drafter.gamma))
+            wide = drafter.gamma + 1 > 8 or getattr(drafter, "lookup", None) is not None   # a lookup extends past the block
+            layout = StepStateLayout(t_max=16 if wide else 8, gamma_max=max(7, drafter.gamma))
         decode_layout = layout or StepStateLayout()
         if not isinstance(prefill_chunk_size, int) or isinstance(prefill_chunk_size, bool) or prefill_chunk_size < 1:
             raise ValueError("prefill_chunk_size must be a positive integer")
