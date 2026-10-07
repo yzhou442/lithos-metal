@@ -14,6 +14,9 @@
 struct SampleParams { uint vocab; uint t_active; uint n_sg; uint n_spans; uint top_k; float temperature; float top_p; float min_p;
                       uint seed_lo; uint seed_hi; uint step; uint flags; };   // flags: 1 top_k, 2 top_p, 4 min_p,
                                                                              // 8 top-p over the top-k renormalized (HF / sglang order)
+#ifndef KEY_BOUNDS
+#define KEY_BOUNDS 0                 // sample_hist records each row's occupied key range (bounds[2t] = max key, [2t+1] = 65535 - min
+#endif                               // key); sample_select then scans only that range (32 lanes x ~100 keys instead of 2048 each)
 #ifndef SPEC_STATS
 #define SPEC_STATS 0                 // sample_select also writes stats[t] = (max logit, softmax mass of the kept logits)
 #endif
@@ -32,6 +35,9 @@ static inline float gumbel(uint seed_lo, uint seed_hi, uint step, uint t, uint i
 }
 
 kernel void sample_hist(device const ushort* logits [[buffer(0)]], device atomic_uint* hist [[buffer(1)]], constant SampleParams& p [[buffer(3)]],
+#if KEY_BOUNDS
+                        device atomic_uint* bounds [[buffer(2)]],
+#endif
 #if STEP_STATE
                         device const StepState* st [[buffer(15)]],
 #endif
@@ -47,20 +53,32 @@ kernel void sample_hist(device const ushort* logits [[buffer(0)]], device atomic
   for (uint t = 0; t < T_act; t++) {
     device const ushort* row = logits + (ulong)t * p.vocab;
     device atomic_uint* h = hist + (ulong)t * HIST_KEYS;
+    uint kmx = 0u, kmn_inv = 0u;
     for (uint s = sg; s < p.n_spans; s += p.n_sg) {
       const uint base = s * 256u + lane * 8u;
       for (uint e = 0; e < 8u; e++) {
         const uint i = base + e;
-        if (i < p.vocab) atomic_fetch_add_explicit(h + key16(row[i]), 1u, memory_order_relaxed);
+        if (i < p.vocab) {
+          const uint key = key16(row[i]);
+          atomic_fetch_add_explicit(h + key, 1u, memory_order_relaxed);
+          kmx = max(kmx, key); kmn_inv = max(kmn_inv, 65535u - key);
+        }
       }
     }
+#if KEY_BOUNDS
+    kmx = simd_max(kmx); kmn_inv = simd_max(kmn_inv);
+    if (lane == 0) {
+      atomic_fetch_max_explicit(bounds + 2u * t, kmx, memory_order_relaxed);
+      atomic_fetch_max_explicit(bounds + 2u * t + 1u, kmn_inv, memory_order_relaxed);
+    }
+#endif
   }
 }
 
 // the softmax mass (of logits / temperature, relative to vmax) of this lane's stripe at keys whose value is >= th
-static inline float stripe_mass_above(device atomic_uint* h, uint hi, float th, float vmax, float inv_t) {
+static inline float stripe_mass_above(device atomic_uint* h, uint hi, uint nk, float th, float vmax, float inv_t) {
   float m = 0.0f;
-  for (uint j = 0; j < LANE_KEYS; j++) {
+  for (uint j = 0; j < nk; j++) {
     const uint k = hi - j;
     const float v = key_val(k);
     if (v < th) break;                                               // keys descend within the stripe
@@ -74,6 +92,9 @@ kernel void sample_select(device atomic_uint* hist [[buffer(1)]], device float* 
 #if SPEC_STATS
                           device float* stats [[buffer(4)]],
 #endif
+#if KEY_BOUNDS
+                          device atomic_uint* bounds [[buffer(5)]],
+#endif
 #if STEP_STATE
                           device const StepState* st [[buffer(15)]],
 #endif
@@ -85,17 +106,31 @@ kernel void sample_select(device atomic_uint* hist [[buffer(1)]], device float* 
   if (t >= p.t_active) return;
 #endif
   device atomic_uint* h = hist + (ulong)t * HIST_KEYS;
-  const uint hi = HIST_KEYS - 1u - lane * LANE_KEYS;                 // this lane's stripe: keys (hi - LANE_KEYS, hi], descending
+#if KEY_BOUNDS
+  // the row's occupied key range [bmin, top], cut into 32 descending stripes of SK keys
+  const uint top = atomic_load_explicit(bounds + 2u * t, memory_order_relaxed);
+  const uint bmin = 65535u - atomic_load_explicit(bounds + 2u * t + 1u, memory_order_relaxed);
+  const uint SK = (top - min(bmin, top) + 32u) / 32u;
+#else
+  const uint top = HIST_KEYS - 1u, SK = LANE_KEYS;
+#endif
+  const uint off0 = lane * SK;
+  const uint nk = (off0 > top) ? 0u : min(SK, top - off0 + 1u);      // this lane's keys: hi, hi - 1, … (nk of them)
+  const uint hi = top - min(off0, top);
   const float inv_t = 1.0f / p.temperature;
+#if KEY_BOUNDS
+  const uint gmax = top;                                             // the highest occupied key
+#else
   // pass a: the maximum logit (the highest non-empty key)
   uint kmax = 0u;
-  for (uint j = 0; j < LANE_KEYS; j++) { const uint k = hi - j; if (atomic_load_explicit(h + k, memory_order_relaxed) != 0u) { kmax = k; break; } }
+  for (uint j = 0; j < nk; j++) { const uint k = hi - j; if (atomic_load_explicit(h + k, memory_order_relaxed) != 0u) { kmax = k; break; } }
   const uint gmax = simd_max(kmax);
+#endif
   const float vmax = key_val(gmax);
   // pass b: per-stripe count and softmax mass (of logits / temperature, relative to the max)
   uint cnt = 0u;
   float mass = 0.0f;
-  for (uint j = 0; j < LANE_KEYS; j++) {
+  for (uint j = 0; j < nk; j++) {
     const uint k = hi - j;
     const uint c = atomic_load_explicit(h + k, memory_order_relaxed);
     if (c != 0u) { cnt += c; mass += float(c) * exp((key_val(k) - vmax) * inv_t); }
@@ -105,37 +140,61 @@ kernel void sample_select(device atomic_uint* hist [[buffer(1)]], device float* 
   const float z = simd_sum(mass);
   // top-k: the bucket where the descending cumulative count reaches k
   float tau_k = -INFINITY, tau_p = -INFINITY, tau_m = -INFINITY;
+  // mass_k / mass_p: the softmax mass of the keys >= tau_k / tau_p, accumulated by the lane that finds the threshold
+  // (needed for top-p within top-k and for the kept distribution's normalizer; no extra pass over the histogram)
+  float mass_k = -1.0f, mass_p = -1.0f;
+#if SPEC_STATS
+  const bool want_mass = true;
+#else
+  const bool want_mass = (p.flags & 8u) != 0u;
+#endif
   if (p.flags & 1u) {
     const uint k_target = p.top_k;
     if (cnt_before < k_target && cnt_before + cnt >= k_target) {
       uint run = cnt_before;
-      for (uint j = 0; j < LANE_KEYS; j++) { const uint k = hi - j; run += atomic_load_explicit(h + k, memory_order_relaxed); if (run >= k_target) { tau_k = key_val(k); break; } }
+      float mrun = mass_before;
+      for (uint j = 0; j < nk; j++) {
+        const uint k = hi - j;
+        const uint c = atomic_load_explicit(h + k, memory_order_relaxed);
+        run += c;
+        if (want_mass && c != 0u) mrun += float(c) * exp((key_val(k) - vmax) * inv_t);
+        if (run >= k_target) { tau_k = key_val(k); mass_k = mrun; break; }
+      }
     }
     tau_k = simd_max(tau_k);
+    mass_k = simd_max(mass_k);
+    if (mass_k < 0.0f) mass_k = z;                                    // fewer than k logits: everything is kept
   }
   if (p.flags & 2u) {
     // flag 8: top-p within the top-k set, renormalized (HF warpers / sglang: top-k first, then top-p on its softmax)
-    const float zk = ((p.flags & 9u) == 9u) ? simd_sum(stripe_mass_above(h, hi, tau_k, vmax, inv_t)) : z;
+    const float zk = ((p.flags & 9u) == 9u) ? mass_k : z;
     const float target = p.top_p * zk;
     if (mass_before < target && mass_before + mass >= target) {
       float run = mass_before;
-      for (uint j = 0; j < LANE_KEYS; j++) {
+      for (uint j = 0; j < nk; j++) {
         const uint k = hi - j;
         const uint c = atomic_load_explicit(h + k, memory_order_relaxed);
-        if (c != 0u) { run += float(c) * exp((key_val(k) - vmax) * inv_t); if (run >= target) { tau_p = key_val(k); break; } }
+        if (c != 0u) { run += float(c) * exp((key_val(k) - vmax) * inv_t); if (run >= target) { tau_p = key_val(k); mass_p = run; break; } }
       }
     }
     tau_p = simd_max(tau_p);
+    mass_p = simd_max(mass_p);
   }
   if (p.flags & 4u) tau_m = vmax + p.temperature * log(p.min_p);
   const float th = max(max(tau_k, tau_p), tau_m);
   if (lane == 0) tau[t] = th;
 #if SPEC_STATS
   // the kept distribution p(v) = exp((v - vmax) / T) / zkept for v >= th: what the exact speculative-sampling rule needs
-  const float zkept = simd_sum(stripe_mass_above(h, hi, th, vmax, inv_t));
+  float zkept = z;                                                   // nothing truncated
+  if ((p.flags & 4u) && tau_m > max(tau_k, tau_p)) zkept = simd_sum(stripe_mass_above(h, hi, nk, th, vmax, inv_t));   // min-p binds: one more pass
+  else if ((p.flags & 2u) && tau_p >= tau_k && mass_p >= 0.0f) zkept = mass_p;
+  else if ((p.flags & 1u) && tau_k > -INFINITY) zkept = mass_k;
   if (lane == 0) { stats[2u * t] = vmax; stats[2u * t + 1u] = zkept; }
 #endif
-  for (uint j = 0; j < LANE_KEYS; j++) atomic_store_explicit(h + (hi - j), 0u, memory_order_relaxed);   // clear for the next step
+  for (uint j = 0; j < nk; j++) atomic_store_explicit(h + (hi - j), 0u, memory_order_relaxed);   // clear for the next step
+#if KEY_BOUNDS
+  if (lane == 0) { atomic_store_explicit(bounds + 2u * t, 0u, memory_order_relaxed); atomic_store_explicit(bounds + 2u * t + 1u, 0u, memory_order_relaxed); }
+#endif
 }
 
 kernel void sample_gumbel(device const ushort* logits [[buffer(0)]], device const float* tau [[buffer(2)]], constant SampleParams& p [[buffer(3)]],

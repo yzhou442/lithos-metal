@@ -1203,8 +1203,11 @@ def _sample(ctx: _Ctx, op: Op) -> None:
     a = op.attrs
     src = kernels.sample_source()
     macros = {"STEP_STATE": "1"}                                       # seed and step always come from StepState
-    kh, kg, kf = (ctx.kernel("sample", src, f, macros) for f in ("sample_hist", "sample_gumbel", "argmax_final"))
-    ks = ctx.kernel("sample", src, "sample_select", dict(macros, **({"SPEC_STATS": "1"} if spec_q else {})))
+    kg, kf = (ctx.kernel("sample", src, f, macros) for f in ("sample_gumbel", "argmax_final"))
+    # with the q rule the select scans only each row's occupied key range (KEY_BOUNDS: ~100 keys per lane instead of 2048;
+    # the mass sums partition differently, so it stays with the flag) and reports the kept distribution's normalizer
+    kh = ctx.kernel("sample", src, "sample_hist", dict(macros, **({"KEY_BOUNDS": "1"} if spec_q else {})))
+    ks = ctx.kernel("sample", src, "sample_select", dict(macros, **({"SPEC_STATS": "1", "KEY_BOUNDS": "1"} if spec_q else {})))
     hb, tb, pb = kernels.sample_workspace(ctx.t, ctx.n_sg)
     hist, tau = ctx.scratch("sample.hist", hb), ctx.scratch("sample.tau", tb)
     pv, pi = ctx.scratch("sample.val", pb), ctx.scratch("sample.idx", pb)
@@ -1214,10 +1217,12 @@ def _sample(ctx: _Ctx, op: Op) -> None:
                                                      topp_in_topk=bool(a.get("topp_in_topk"))))
     st = ctx.program.step_state
     grid, tg = ctx.crew_grid()
-    ctx.add(kh, [(0, *ctx.buf(logits)), (1, hist, 0), (3, prm, 0), (15, st, 0)], grid, tg, op.kind, writes=[1])
+    bounds = ctx.scratch("sample.bounds", ctx.t * 8) if spec_q else None
+    ctx.add(kh, [(0, *ctx.buf(logits)), (1, hist, 0), (3, prm, 0), (15, st, 0)] + ([(2, bounds, 0)] if spec_q else []), grid, tg, op.kind,
+            writes=[1] + ([2] if spec_q else []))
     stats = ctx.scratch("sample.stats", ctx.t * 8) if spec_q else None
-    ctx.add(ks, [(1, hist, 0), (2, tau, 0), (3, prm, 0), (15, st, 0)] + ([(4, stats, 0)] if spec_q else []), (ctx.t, 1, 1), (32, 1, 1),
-            "sample_select", writes=[2] + ([4] if spec_q else []))
+    ctx.add(ks, [(1, hist, 0), (2, tau, 0), (3, prm, 0), (15, st, 0)] + ([(4, stats, 0), (5, bounds, 0)] if spec_q else []), (ctx.t, 1, 1), (32, 1, 1),
+            "sample_select", writes=[2] + ([4, 5] if spec_q else []))
     ctx.add(kg, [(0, *ctx.buf(logits)), (2, tau, 0), (3, prm, 0), (4, pv, 0), (5, pi, 0), (15, st, 0)], grid, tg, "sample_gumbel", writes=[4, 5])
     ctx.add(kf, [(0, pv, 0), (1, pi, 0), (2, *ctx.buf(token)), (3, prm, 0), (15, st, 0)], (ctx.t, 1, 1), (32, 1, 1), "argmax_final", writes=[2])
     if spec_q:
