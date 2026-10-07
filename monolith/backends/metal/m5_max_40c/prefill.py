@@ -21,6 +21,10 @@ from ....compiler.prefill import (projection_geometry, device_attention_tiles, p
 # reduction order (same sums as the private layouts), 'retarget' writes x' in
 # the files' order (faster for none measured, changes the in-tile sum order).
 EXACT_ATTENTION = os.environ.get('LITHOS_PREFILL_EXACT_ATTENTION', '0') == '1'
+# EXACT_ATTENTION_CORE (exact mode, 512 rows): 'device32' = 32-query device tiles over 32-key blocks — the
+# same per-row softmax blocks, rescales and partial merges as the 16/32 core (bit-identical logits, gated
+# 2026-10-07) without staging K/V per 16-row group; 'staged' = the 128-row graph's own core.
+EXACT_ATTENTION_CORE = os.environ.get('LITHOS_PREFILL_EXACT_ATTENTION_CORE', 'device32')
 SHARED_READS = os.environ.get('LITHOS_PREFILL_SHARED_READS', 'retarget')
 
 # 512-row FP8 projections reading the verification graph's packed operands
@@ -91,7 +95,11 @@ def optimize(program, exact=False):
             part.kernels[private] = copy.deepcopy(part.kernels[op.kernel])
             op.kernel = private
         tuned = part.kernels[part.ops[0].kernel]
-        sgs, groups = ((8, 80) if rows == 512 and not exact_attention else
+        # Exact mode: 32-query device tiles over 32-key blocks reproduce the staged 16/32 core's per-row
+        # arithmetic (same score/value reductions, same per-block softmax, same rescale) without restaging
+        # K/V for every 16-row group; EXACT_ATTENTION_CORE=staged keeps the 128-row graph's own core.
+        exact_device = exact_attention and rows == 512 and EXACT_ATTENTION_CORE == 'device32'
+        sgs, groups = ((8, 80) if rows == 512 and (not exact_attention or exact_device) else
                        ((8, 320) if exact_attention or rows < 256 else (4, 160)))
         tuned.macros.update(MMA_SG=str(sgs), STATIC_GQA_P_N_SG=f'{groups}u')
         record = bytearray(part.buffers[params].init)
@@ -100,7 +108,9 @@ def optimize(program, exact=False):
         part.ops[0].grid = (groups, 1, 1)
         part.ops[0].threadgroup = (sgs*32, 1, 1)
         part = specialize_attention(part, sgs, True, 64)
-        if rows == 512 and not exact_attention:
+        if exact_device:
+            device_attention_tiles(part, qm=32, kn=32)
+        elif rows == 512 and not exact_attention:
             device_attention_tiles(part)
         compact_partials(part)
         # Preparation has explicit writes so lifetime analysis can reuse Q.
