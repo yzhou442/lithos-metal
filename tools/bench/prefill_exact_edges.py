@@ -6,8 +6,8 @@ chunks (the reference) and ``--chunk``-row exact chunks — on prompts whose pro
 a cache hit, one-token chunks made by a boundary). Compares greedy tokens, the bits of the verification graph's
 final logits, and the speculative rounds (accepted / committed per round: the drafter's context).
 
-usage (the model must fit, so always under the GPU lock):
-  python tools/bench/prefill_exact_edges.py run --out DIR [--groups 128,cache,4096,8192,16384] [--max-new 32]
+usage (run nothing else on the GPU meanwhile; the model must fit):
+  python tools/bench/prefill_exact_edges.py run --model path/to/target --out DIR [--groups 128,cache,4096,8192,16384] [--max-new 32]
                                                  [--chunk 512] [--budget-s 1000]
   python tools/bench/prefill_exact_edges.py report --out DIR        # exit 0 iff every case that ran is identical
   python tools/bench/prefill_exact_edges.py plan --out DIR          # CPU only: the cases and their recipe tiers
@@ -24,7 +24,7 @@ ROOT = Path(__file__).resolve().parents[2]
 ap = argparse.ArgumentParser()
 ap.add_argument('cmd', choices=['run', 'report', 'plan'])
 ap.add_argument('--out', required=True)
-ap.add_argument('--model', default='nvidia/Qwen3.8-27B-NVFP4')
+ap.add_argument('--model', default=None, help='target checkpoint (path or hub id); required for run and plan')
 ap.add_argument('--groups', default='128,cache,4096,8192,16384')
 ap.add_argument('--chunk', type=int, default=512)
 ap.add_argument('--max-new', type=int, default=32)
@@ -79,6 +79,8 @@ def report():
 
 if a.cmd == 'report':
     sys.exit(report())
+if not a.model:
+    ap.error('--model is required for run and plan')
 
 sys.path.insert(0, str(ROOT))
 os.environ.setdefault('HF_HUB_OFFLINE', '1')

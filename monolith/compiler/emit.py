@@ -1152,7 +1152,7 @@ def _gdn_norm(ctx: _Ctx, op: Op) -> None:
 
 
 def _draft_q_sample(ctx: _Ctx, op: Op) -> None:
-    """A Markov step of a drafter that samples (exact speculative sampling, spec campaign): d_k ~ softmax(corrected / T)
+    """A Markov step of a drafter that samples (exact speculative sampling): d_k ~ softmax(corrected / T)
     over the whole vocabulary by Gumbel-max (noise stream 2000 + k), its log-sum-exp into ``q_lse[k]`` and the corrected
     row into ``q_logits[k]`` (persistent: the next verify recomputes q from them)."""
     logits, q_logits, q_lse = op.inputs
@@ -1569,7 +1569,7 @@ def lower_round(g: Graph, model: Model, drafter: Any, token: Value, profile: Pro
     lm = bool(getattr(drafter, "lm_drafter", False))          # an LM drafter: the scan's bookkeeping differs (design §5.8)
     if getattr(drafter, "sampling", None):
         # exact speculative sampling: the target's sampler also runs the accept test against the drafter's q, which the
-        # previous round's draft pass left in the drafter's state (spec campaign)
+        # previous round's draft pass left in the drafter's state
         sop = next((op for op in g.ops if op.kind == "sample" and op.outputs and op.outputs[0] is token), None)
         if sop is None:
             raise ValueError("lower_round: sampled drafts need the target's stochastic sampler")

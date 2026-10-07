@@ -162,7 +162,7 @@ class DSparkDrafter(Drafter):
         # context lookup: extend a whole-block verify with the continuation of the latest earlier
         # occurrence of the context's suffix (prompt lookup) into the verify rows past the block; {} = defaults
         self.lookup = None if lookup is None else dict(lookup)
-        # exact speculative sampling (spec campaign): {"temperature": T} makes the Markov chain draw d_k ~ softmax(corrected
+        # exact speculative sampling: {"temperature": T} makes the Markov chain draw d_k ~ softmax(corrected
         # / T) and keep q for the verify (set by the Session for temperature > 0 with spec_sampling="q"); None = greedy drafts
         self.sampling: Optional[Dict[str, Any]] = None
         if attention not in (None, 'v1', 'mma', 'auto'):

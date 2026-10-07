@@ -234,7 +234,7 @@ kernel void sample_gumbel(device const ushort* logits [[buffer(0)]], device cons
 }
 
 
-// ---- exact speculative sampling with sampled drafts (spec campaign; sglang chain_speculative_sampling semantics) ----
+// ---- exact speculative sampling with sampled drafts (SGLang's chain_speculative_sampling semantics) ----
 // The draft side samples d_k ~ q_k = softmax(corrected_k / T) over the whole vocabulary (no truncation), Gumbel-max
 // with noise stream 2000 + k, and keeps the corrected logits row (q_logits[k]) and log Σ exp(corrected_k / T)
 // (q_lse[k]) in persistent state. The verify side computes p (the target's kept softmax, from sample_select's stats)

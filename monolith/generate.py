@@ -166,7 +166,7 @@ class Session:
             drafter.sampling = dict(temperature=float(temperature)) if q_rule else None
         elif q_rule:
             raise ValueError("spec_sampling='q' needs a DSpark drafter")
-        # Adaptive block (spec campaign): a second decode program drafting a shorter block with the same head. The host
+        # Adaptive block: a second decode program drafting a shorter block with the same head. The host
         # switches per chunk of rounds: while the cost rule rarely verifies past the short block (EMA of the fraction of
         # rounds with L > short block below `threshold`), rounds are drafted by the short-block program (cheaper draft,
         # T <= 8 verify); every `hold` rounds the long block is probed again. Every round is still a valid chain

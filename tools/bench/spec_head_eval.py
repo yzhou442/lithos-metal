@@ -1,32 +1,32 @@
 #!/usr/bin/env python3
-"""[spec campaign copy of ~/lmopt/bin/head_eval.py (head-eval agent): + the serve flags --verify-rule, --draft-lookup,
---spec-sampling, so the policies run through serving.setup exactly as `lithos-metal serve` would.]
-Replay chat rows through lithos-metal's exact serving configuration (serving.setup.prepare + the recipe-selected
-load_session, like ~/lmopt/bin/lmbench.py) with a chosen DSpark head, sampling and block size; EOS honored.
+"""Replay chat rows through lithos-metal's exact serving configuration (serving.setup.prepare + the recipe-selected
+load_session) with a chosen DSpark head, sampling parameters, block size and the serve verify flags (--verify-rule,
+--draft-lookup, --spec-sampling, --adaptive-block), so the policies run exactly as `lithos-metal serve` would; the
+checkpoint's EOS ids end a row unless --ignore-eos.
 
 Resumable: one JSON line per finished row is appended to --out; rows whose id is already there are skipped. Use
---budget-s to stop starting new rows after N seconds so a call fits a short gpu_run slot, and call again.
+--budget-s to stop starting new rows after N seconds and call again. Run nothing else on the GPU meanwhile.
 
-usage (always through gpu_run):
-  gpu_run --agent head-eval --timeout 900 -- ~/lmopt/venv/bin/python ~/lmopt/bin/head_eval.py --repo ~/lmopt/base \
-      --rows rows.jsonl --out out.jsonl --draft ~/lmopt/heads/g3 --tag g3 [--temperature 0] [--top-k 20 --top-p 0.95]
-      [--seed 42] [--block 7] [--max-new 1024] [--max-context 32768] [--pack DIR] [--budget-s 660]
-  python head_eval.py --report out1.jsonl [out2.jsonl ...]      (CPU only: per-domain / per-bucket table)
+    python tools/bench/spec_head_eval.py --model path/to/target --rows rows.jsonl --out out.jsonl
+        [--draft path/to/dspark-head] [--tag NAME] [--temperature 0] [--top-k 20 --top-p 0.95] [--seed 42]
+        [--block 7] [--max-new 1024] [--max-context 32768] [--pack DIR] [--budget-s 660]
+    python tools/bench/spec_head_eval.py --report out1.jsonl [out2.jsonl ...]   (CPU only: per-suite / per-bucket table)
 
 Row fields used: id, input_ids (pre-rendered; else messages + tmpl chat-template kwargs), suite/domain, bucket,
 max_new (optional per-row cap). Per row recorded: prompt/generated tokens, output_ids, per-step accepted/committed,
-steps, accept length = generated / steps (sglang's completion / verify_ct), sum committed / steps, prefill and
-decode wall, decode tok/s, finish (stop|length).
+steps, accept length = generated / steps, sum committed / steps, prefill and decode wall, decode tok/s, finish
+(stop|length).
 """
 import argparse, json, math, os, sys, time
 from pathlib import Path
 
 ap = argparse.ArgumentParser()
-ap.add_argument('--repo')
+ap.add_argument('--repo', default=str(Path(__file__).resolve().parents[2]),
+                help='lithos-metal checkout to import (default: the one containing this script)')
 ap.add_argument('--rows')
 ap.add_argument('--out')
 ap.add_argument('--tag', default='')
-ap.add_argument('--model', default='nvidia/Qwen3.8-27B-NVFP4')
+ap.add_argument('--model', default=None, help='target checkpoint (path or hub id); required unless --report')
 ap.add_argument('--draft', default=None)
 ap.add_argument('--no-draft', action='store_true')
 ap.add_argument('--block', type=int, default=None, help='DSpark block (proposals per round); default = serving (7)')
@@ -40,6 +40,7 @@ ap.add_argument('--top-k', type=int, default=0)
 ap.add_argument('--top-p', type=float, default=0.0)
 ap.add_argument('--seed', type=int, default=42)
 ap.add_argument('--ignore-eos', action='store_true')
+ap.add_argument('--eos-ids', default=None, help='comma list of stop token ids (default: the checkpoint generation_config eos_token_id)')
 ap.add_argument('--budget-s', type=float, default=0, help='do not start a new row after this many seconds')
 ap.add_argument('--max-rows', type=int, default=0)
 ap.add_argument('--only', default=None, help='comma list of row ids')
@@ -51,9 +52,6 @@ ap.add_argument('--adaptive-block', action='store_true', help='serve option: ada
 ap.add_argument('--report', nargs='*', default=None)
 ap.add_argument('--by', default='suite,bucket')
 a = ap.parse_args()
-
-EOS_DEFAULT = (248046, 248044)
-
 
 def ctx_bucket(n):
     for lim, name in ((4096, '<4K'), (16384, '4-16K'), (32768, '16-32K'), (65536, '32-64K')):
@@ -91,6 +89,8 @@ if a.report is not None:
     report(a.report, a.by)
     sys.exit(0)
 
+if not a.model or not a.rows or not a.out:
+    ap.error('--model, --rows and --out are required unless --report')
 sys.path.insert(0, str(Path(a.repo).expanduser().resolve()))
 os.environ.setdefault('HF_HUB_OFFLINE', '1')
 import monolith
@@ -113,9 +113,9 @@ if a.only:
     keep = set(a.only.split(','))
     rows = [r for r in rows if r['id'] in keep]
 todo = [r for r in rows if r['id'] not in done]
-print(f'[head_eval] {len(rows)} rows, {len(done)} done, {len(todo)} to do; tag={a.tag}', flush=True)
+print(f'[spec_head_eval] {len(rows)} rows, {len(done)} done, {len(todo)} to do; tag={a.tag}', flush=True)
 if not todo:
-    print('[head_eval] ALL_DONE', flush=True)
+    print('[spec_head_eval] ALL_DONE', flush=True)
     sys.exit(0)
 
 
@@ -149,8 +149,17 @@ def ids_of(r):
                                         **({'tools': r['tools']} if r.get('tools') else {}), **kw))
 
 
+def stop_ids(model_dir):
+    """--eos-ids, else the checkpoint's generation_config.json eos_token_id (an id or a list), else none."""
+    if a.eos_ids:
+        return {int(x) for x in a.eos_ids.split(',')}
+    path = Path(model_dir) / 'generation_config.json'
+    eos_id = json.loads(path.read_text()).get('eos_token_id') if path.exists() else None
+    return set() if eos_id is None else {int(eos_id)} if isinstance(eos_id, int) else {int(x) for x in eos_id}
+
+
 eos = -1 if a.ignore_eos else None
-eos_set = set() if a.ignore_eos else set(EOS_DEFAULT)
+eos_set = set() if a.ignore_eos else stop_ids(assets.model_dir)
 extra = json.loads(a.session_kw)
 plan = []
 for r in todo:
@@ -169,7 +178,7 @@ session, cur_key, n_done = None, object(), 0
 sampling = dict(temperature=a.temperature, top_k=a.top_k, top_p=a.top_p, seed=a.seed)
 for key, r, ids, mx, options in plan:
     if a.budget_s and time.time() - t_start > a.budget_s:
-        print(f'[head_eval] budget reached after {n_done} rows', flush=True)
+        print(f'[spec_head_eval] budget reached after {n_done} rows', flush=True)
         break
     if a.max_rows and n_done >= a.max_rows:
         break
@@ -183,7 +192,7 @@ for key, r, ids, mx, options in plan:
         load_s = time.time() - t
         t = time.time(); session.generate(ids[:64], 8); warm_s = time.time() - t
         cur_key = key
-        print(f'[head_eval] session recipe={key} load {load_s:.1f}s warm {warm_s:.1f}s', flush=True)
+        print(f'[spec_head_eval] session recipe={key} load {load_s:.1f}s warm {warm_s:.1f}s', flush=True)
     t0 = time.time()
     try:
         g = session.generate(ids, mx)
@@ -192,7 +201,7 @@ for key, r, ids, mx, options in plan:
                    error=f'{type(exc).__name__}: {exc}')
         with open(out_path, 'a') as f:
             f.write(json.dumps(rec) + '\n')
-        print(f"[head_eval] {r['id']} ERROR {rec['error']}", flush=True)
+        print(f"[spec_head_eval] {r['id']} ERROR {rec['error']}", flush=True)
         continue
     wall = time.time() - t0
     toks = list(g.tokens[:mx])
@@ -219,7 +228,7 @@ for key, r, ids, mx, options in plan:
     with open(out_path, 'a') as f:
         f.write(json.dumps(rec) + '\n')
     n_done += 1
-    print(f"[head_eval] {r['id'][:34]:34s} P={len(ids):6d} gen={gen:5d} acc={rec['accept_len'] or 0:5.2f} "
+    print(f"[spec_head_eval] {r['id'][:34]:34s} P={len(ids):6d} gen={gen:5d} acc={rec['accept_len'] or 0:5.2f} "
           f"dec={rec['decode_tok_s'] or 0:6.1f} tok/s pre={rec['prefill_tok_s'] or 0:6.1f} tok/s wall={wall:5.1f}s", flush=True)
 left = len(plan) - n_done
-print(f'[head_eval] wrote {n_done} rows this call; {left} left' + ('' if left else '; ALL_DONE'), flush=True)
+print(f'[spec_head_eval] wrote {n_done} rows this call; {left} left' + ('' if left else '; ALL_DONE'), flush=True)
