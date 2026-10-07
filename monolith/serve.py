@@ -390,6 +390,9 @@ def parse_args(argv=None):
     draft.add_argument("--no-draft", action='store_true', help="Disable automatic DSpark speculative decoding")
     parser.add_argument("--draft-kind", choices=['dspark'], default='dspark')
     parser.add_argument("--draft-block-size", type=int, help="Draft proposals per round (default: up to seven, plus one target anchor)")
+    parser.add_argument("--spec-sampling", choices=['match', 'q'], default='match',
+                        help="Draft acceptance at temperature > 0: match = argmax drafts kept while the target's samples equal them; "
+                             "q = sampled drafts accepted with min(1, p/q). Both preserve the target's distribution")
     parser.add_argument("--pack", help="Local pack-cache directory (default: $XDG_CACHE_HOME/lithos-metal/packs; reuses legacy cache); existing packs also accepted")
     parser.add_argument("--draft-pack", help="Optional separate draft cache or existing draft pack")
     parser.add_argument("--draft-quantization", choices=['auto', 'none', 'nvfp4'], default='auto',

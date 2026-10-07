@@ -126,7 +126,8 @@ def test_template_sampling_context_and_stop(monkeypatch, eos):
 def test_cli_accepts_hub_ids_and_optional_cache():
     from monolith.serve import parse_args
     args = parse_args(['--model', 'org/target', '--draft', 'org/draft'])
-    assert args.pack is None and args.draft == 'org/draft' and args.draft_kind == 'dspark'
+    assert args.pack is None and args.draft == 'org/draft' and args.draft_kind == 'dspark' and args.spec_sampling == 'match'
+    assert parse_args(['--model', 'org/target', '--spec-sampling', 'q']).spec_sampling == 'q'
     for flags in (['--draft-kind', 'lm'], ['--draft-pack', 'pack'], ['--kernel-config-key', '128']):
         with pytest.raises(SystemExit):
             parse_args(['--model', 'org/target', *flags])
@@ -157,7 +158,7 @@ def test_draft_options_survive_sampling_changes_and_metrics_are_per_request(monk
         assert response.headers['x-monolith-verify-tokens'] == '8'
     assert len(calls) == 2
     assert all(c['drafter_dir'] == 'draft' and c['drafter_pack'] == 'draft-pack'
-               and c['verify_length'] == 7 for c in calls)
+               and c['verify_length'] == 7 and c['spec_sampling'] == 'match' for c in calls)
 
 
 def test_cli_prefill_chunk_is_a_size_an_exact_size_or_the_chips_exact_size():
