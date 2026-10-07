@@ -39,6 +39,10 @@ ap.add_argument('--no-draft-recipe', action='store_true')
 ap.add_argument('--recipe-key', default=None)
 ap.add_argument('--verify-rule', default='fixed', choices=['fixed', 'cost'], help='serve option: per-round verify length rule')
 ap.add_argument('--draft-lookup', action='store_true', help='serve option: context-lookup extension into rows 9-16')
+ap.add_argument('--spec-sampling', default='match', choices=['match', 'q'], help='serve option: T > 0 accept rule')
+ap.add_argument('--top-k', type=int, default=0)
+ap.add_argument('--top-p', type=float, default=0.0)
+ap.add_argument('--seed', type=int, default=0)
 a = ap.parse_args()
 sys.path.insert(0, str(Path(a.repo).expanduser().resolve()))
 os.environ.setdefault('HF_HUB_OFFLINE', '1')
@@ -102,6 +106,7 @@ ns.no_draft, ns.draft_revision, ns.draft_block_size = a.no_draft, None, a.draft_
 ns.max_context, ns.draft_quantization, ns.draft_pack, ns.pack = a.max_context, 'auto', None, None
 ns.kernel_config, ns.kernel_config_key = None, a.recipe_key
 ns.verify_rule, ns.draft_lookup = a.verify_rule, a.draft_lookup
+ns.spec_sampling = a.spec_sampling
 t = time.time()
 assets = prepare(ns)
 setup_s = time.time() - t
@@ -137,8 +142,11 @@ for key, items in by_key.items():
         if a.no_draft_recipe:
             options['drafter_options'].pop('kernel_config', None)
     options.update(extra)
-    session = load_session(str(assets.model_dir), str(assets.pack_dir), **options, eos=-1,
-                           temperature=a.temperature, autotune=False, prefill_chunk_size=a.prefill_chunk_size)
+    options.setdefault('temperature', a.temperature)
+    if a.temperature > 0:
+        options.setdefault('top_k', a.top_k); options.setdefault('top_p', a.top_p); options.setdefault('seed', a.seed)
+    session = load_session(str(assets.model_dir), str(assets.pack_dir), **options, eos=-1, autotune=False,
+                           prefill_chunk_size=a.prefill_chunk_size)
     load_s = time.time() - t; sessions_built += 1
     t = time.time(); session.generate(items[0][1][:64], 16); warm_s = time.time() - t   # compile + warm
     for name, ids, mx, _ in items:
