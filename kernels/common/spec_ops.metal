@@ -82,6 +82,9 @@
 #ifndef LOOKUP_DECAY
 #define LOOKUP_DECAY 0.9f            // per extended round decay of the acceptance counts
 #endif
+#ifndef LOOKUP_PREV_SURVIVAL
+#define LOOKUP_PREV_SURVIVAL 0.85f   // cost rule, ext_enable bit 1: after a wholly accepted block, the block's survival is at least this
+#endif
 #ifndef LOOKUP_MIN_SURVIVAL
 #define LOOKUP_MIN_SURVIVAL 0.0f     // fixed rule: extend only when the block's survival (product of confidences) reaches this
 #endif
@@ -210,14 +213,15 @@ kernel void verify_select(device const int* drafts [[buffer(0)]], device const f
     }
 #if LOOKUP
     if (ext > 0u) {                                           // the base's survival carries into the continuation
-      float qa = a_base, e2 = e_base;
+      // after a wholly accepted block the chain under-predicts the next one: lift its survival (the step's cost and
+      // the request's measured q still decide, so deep contexts with a costly 9-16 step and poor lookups do not extend)
+      float qa = prev_full ? max(a_base, LOOKUP_PREV_SURVIVAL) : a_base, e2 = e_base;
       for (uint x = 1; x <= ext; x++) {
         qa *= q;
         e2 += qa;
         const float score = e2 / p.cost[base + x];
         if (score > best) { best = score; L = base; use_ext = x; }
       }
-      if (prev_full && use_ext < ext) { L = base; use_ext = ext; }
     }
 #endif
   } else if (p.threshold <= 0.0f) {

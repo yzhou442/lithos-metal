@@ -1251,9 +1251,9 @@ def _verify_select(ctx: _Ctx, op: Op) -> None:
         mode, thr = 1, float(op.attrs.get("threshold", 0.0))
     else:
         mode, thr = 0, (float(op.attrs.get("threshold", 0.0)) if conf is not None else 0.0)
-    # the lookup extension: bit 0 = append when it pays (cost rule) / always (fixed), bit 1 = also after a wholly accepted
-    # block (measured: code +4 %, agent equal, others +-1 % vs bit 0 alone; spec_policy_ab.py)
-    ext_enable = (1 | (2 if (lk or {}).get('prev_full', True) else 0)) if lookup is not None else 0
+    # the lookup extension: bit 0 = append when it pays (cost rule) / always (fixed), bit 1 = after a wholly accepted block
+    # lift the block's survival (opt-in: measured code +0..4 %, but doc4k -5 % / doc16k -2 % vs bit 0; spec_policy_ab.py)
+    ext_enable = (1 | (2 if (lk or {}).get('prev_full', False) else 0)) if lookup is not None else 0
     prm = ctx.params("verify_select", kernels.select_params(gamma, thr, ctx.t, mode=mode, cost=cost, log_cap=kernels.ACCEPT_LOG_CAP,
                                                             ctx_cap=ctx.ctx_cap_target, lm=bool(op.attrs.get("lm")), ext_enable=ext_enable))
     ctx.program.buffers.setdefault(CONF_LOG, BufferSpec(kernels.ACCEPT_LOG_CAP * kernels.CONF_LOG_WIDTH * 4, None, "arena"))
