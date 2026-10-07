@@ -54,7 +54,7 @@ class DSparkConfig:
             target_hidden_size=d.get("target_hidden_size"), rope_type=str(rope.get("rope_type", "default")),
             rope_parameters=dict(rope),
             architecture=(d.get("architectures") or [""])[0],
-            training_block_size=(int(d["training_block_size"]) if d.get("training_block_size") else None),
+            training_block_size=(int(get("training_block_size")) if get("training_block_size") else None),
         )
         if cfg.markov_head_type not in ("vanilla",):
             raise ValueError(f"unsupported markov_head_type {cfg.markov_head_type!r} (vanilla only)")
@@ -74,10 +74,11 @@ class DSparkConfig:
     @property
     def max_block_size(self) -> int:
         """The largest serving block (drafts per round) this head may run at: its configured block, or up to the
-        block it was trained at (a head trained at 16 positions drafts 15 and the verify pass takes anchor + 15 = 16
-        rows, the kernels' row limit: SelectParams.cost / ConfParams.sts / the confidence log hold 16 entries)."""
-        trained = min(int(self.training_block_size or 0), MAX_SERVING_BLOCK)
-        return max(int(self.block_size), trained)
+        block it was trained at minus the anchor (``training_block_size`` counts the anchor position: a head trained
+        at 16 positions drafts 15), capped at MAX_SERVING_BLOCK because the verify pass takes anchor + drafts <= 16
+        rows (the kernels' row limit: SelectParams.cost / ConfParams.sts / the confidence log hold 16 entries)."""
+        trained = int(self.training_block_size or 0) - 1
+        return min(max(int(self.block_size), trained), MAX_SERVING_BLOCK)
 
     @property
     def n_taps(self) -> int:

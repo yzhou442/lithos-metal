@@ -37,6 +37,31 @@ def test_config_layouts():
         DSparkConfig.from_dict(dict(CFG, rope_parameters={"rope_type": "yarn", "rope_theta": 1e7}))
 
 
+@pytest.mark.parametrize("trained, expected", [(None, 7), (8, 7), (12, 11), (16, 15), (17, 15), (32, 15)])
+@pytest.mark.parametrize("nested", [None, "dspark_config", "dflash_config"])
+def test_max_block_size_from_the_trained_block(trained, expected, nested):
+    """Proposals per round: training_block_size counts the anchor (trained - 1), never below the configured block,
+    capped at the 16-row verify limit (15); the trained bound is read from nested DSpark configs too."""
+    cfg = dict(CFG)
+    if trained is not None:
+        if nested is None:
+            cfg["training_block_size"] = trained
+        else:
+            cfg[nested] = {"training_block_size": trained}
+    c = DSparkConfig.from_dict(cfg)
+    assert c.training_block_size == trained
+    assert c.max_block_size == expected
+    head = LMHead(64, 50, hf_name="lm_head.weight", prefix="lm_head.")
+    assert DSparkDrafter(c, target_lm_head=head, max_context=32, block_size=expected).gamma == expected
+    with pytest.raises(ValueError, match="block_size"):
+        DSparkDrafter(c, target_lm_head=head, max_context=32, block_size=expected + 1)
+
+
+def test_max_block_size_caps_an_oversized_configured_block():
+    c = DSparkConfig.from_dict(dict(CFG, block_size=16, training_block_size=16))
+    assert c.block_size == 16 and c.max_block_size == 15
+
+
 def test_weight_map_matches_the_drafter_inventory():
     d, c = _drafter()
     names = {k.split("#")[0] for k in d.full_weight_map()}
