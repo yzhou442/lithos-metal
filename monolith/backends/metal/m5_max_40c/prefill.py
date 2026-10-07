@@ -14,12 +14,15 @@ from ....compiler.prefill import (projection_geometry, device_attention_tiles, p
                                  shared_fp8_layout, input_tile_order)
 
 # 512-row FP8 projections reading the verification graph's packed operands
-# (32-row tiles of 32 reduction columns): (SIMD groups per worker, workers).
+# (32-row file tiles of 32 reduction columns) through 32x16x128 matrix tiles:
+# (output rows per tile, SIMD groups per worker, workers). Measured 2026-10-06
+# at T=512 against the private 16x128 layout: qkv 1.05 vs 1.13 ms, z 0.63 vs
+# 0.66, out 0.61 vs 0.64 (sweep2_fp8_*.json in the prefill results).
 SHARED_FP8_GEOMETRY = {
-    ('fp8_e4m3', 10240, 5120): (4, 80),
-    ('fp8_e4m3', 6144, 5120): (8, 80),
-    ('fp8_e4m3', 8192, 5120): (8, 80),
-    ('fp8_e4m3', 5120, 6144): (8, 40),
+    ('fp8_e4m3', 10240, 5120): (16, 16, 80),
+    ('fp8_e4m3', 6144, 5120): (16, 16, 40),
+    ('fp8_e4m3', 8192, 5120): (16, 16, 80),
+    ('fp8_e4m3', 5120, 6144): (16, 16, 80),
 }
 
 
@@ -129,13 +132,17 @@ def optimize(program):
         shape = (op.meta.get('format'), op.meta.get('n'), op.meta.get('k'))
         if id(op) in fp8_plan:
             # The decoder's FP8 operands (6.7 GiB otherwise duplicated): 128-column
-            # matrix tiles assembled from its 32-column file tiles.
+            # matrix tiles assembled from its 32-column file tiles, half a file tile
+            # of rows per matrix tile. Changes the reduction order (not the values)
+            # of the products: outputs within one BF16 rounding of the private path.
             shared = fp8_plan[id(op)]
-            sgs, groups = SHARED_FP8_GEOMETRY[shape]
-            projection_geometry(program, op, tm=32, tn=shared['tn'], sgs=sgs, groups=groups, q_outer=0)
+            tn, sgs, groups = SHARED_FP8_GEOMETRY[shape]
+            tn = min(tn, shared['tn'])
+            projection_geometry(program, op, tm=32, tn=tn, sgs=sgs, groups=groups, q_outer=0)
             program.kernels[op.kernel].macros['FP8_DECODE'] = '1'
             binding = next((name, offset) for slot, name, offset in op.bindings if slot == 0)
-            packed_fp8_projection(program, op, fp8_rows[binding], tile_block=shared['tile_block'], file_tk=shared['tk'])
+            packed_fp8_projection(program, op, fp8_rows[binding], tile_block=shared['tile_block'], file_tk=shared['tk'],
+                                  file_tn=shared['tn'])
             retile.append((op, shared['tk']))
             continue
         if shape == ('bf16', 96, 5120) and op.meta['t_variant'] == 512:

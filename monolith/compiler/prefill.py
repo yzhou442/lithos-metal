@@ -149,19 +149,22 @@ def input_tile_order(program, consumer, tk):
 FP8_SUBTILE_FILL = """
       {
         const ulong packed_tile = min(tile, p.tile0 + p.n_tiles - 1u);
+        // A FILE_TN-row file tile holds FILE_TN / TN of this kernel's output tiles: row slots [slot0, slot0 + NS_B).
+        const ulong ftile = packed_tile * TN / FILE_TN;
+        const uint slot0 = uint(packed_tile * TN % FILE_TN) / 8u;
 #pragma clang loop unroll(full)
         for (uint sub = 0; sub < TK / FILE_TK; sub++) {
           // File tile kf = kt * (TK / FILE_TK) + sub holds FILE_TK/4 consecutive codes per (row slot, lane); its
           // columns are this matrix tile's jumps [sub * FILE_TK / 16, +FILE_TK / 16), the x' order of FILE_TK.
-          const ulong pg = (packed_tile / FILE_BLOCK * (K / FILE_TK) + kt * (TK / FILE_TK) + sub) * FILE_BLOCK
-                           + packed_tile % FILE_BLOCK;
+          const ulong pg = (ftile / FILE_BLOCK * (K / FILE_TK) + kt * (TK / FILE_TK) + sub) * FILE_BLOCK
+                           + ftile % FILE_BLOCK;
 #pragma clang loop unroll(full)
           for (uint s = 0; s < NS_B; s++) {
 #if FILE_TK == 32
-            const uint2 c2 = reinterpret_cast<device const uint2*>(w)[(pg * NS_B + s) * 32u + lane];
+            const uint2 c2 = reinterpret_cast<device const uint2*>(w)[(pg * (FILE_TN / 8u) + slot0 + s) * 32u + lane];
             const uint cw[2] = {c2.x, c2.y};
 #else
-            const uint4 c4 = w[(pg * NS_B + s) * 32u + lane];
+            const uint4 c4 = w[(pg * (FILE_TN / 8u) + slot0 + s) * 32u + lane];
             const uint cw[4] = {c4.x, c4.y, c4.z, c4.w};
 #endif
 #pragma clang loop unroll(full)
@@ -196,7 +199,7 @@ def shared_fp8_layout(program, op, rows):
     return found[0] if found else None
 
 
-def packed_fp8_projection(program, op, rows, *, tile_block=1, file_tk=None):
+def packed_fp8_projection(program, op, rows, *, tile_block=1, file_tk=None, file_tn=None):
     """Keep FP8 codes unchanged while making each operand load contiguous.
 
     ``file_tk`` < TK reads a file packed in narrower reduction tiles (the verification graph's), consuming
@@ -208,16 +211,17 @@ def packed_fp8_projection(program, op, rows, *, tile_block=1, file_tk=None):
     if tk != 128:
         raise ValueError('packed prefill FP8 operands require a 128-column tile')
     if file_tk is not None and file_tk != tk:
-        if file_tk not in (32, 64) or kernel.macros.get('Q_OUTER', '0') != '0':
+        file_tn = file_tn or tn
+        if file_tk not in (32, 64) or kernel.macros.get('Q_OUTER', '0') != '0' or file_tn % tn:
             raise ValueError('narrow FP8 file tiles need 32/64 columns in reduction order')
         binding = next((name, offset) for slot, name, offset in op.bindings if slot == 0)
-        name, spec = fp8_tiles.repack(program, binding, kernel.macros, rows, tn, file_tk, tile_block)
+        name, spec = fp8_tiles.repack(program, binding, kernel.macros, rows, file_tn, file_tk, tile_block)
         program.buffers[name] = spec
         op.bindings = [(slot, name, 0) if slot == 0 else (slot, n, offset) for slot, n, offset in op.bindings]
         begin = kernel.source.index('#pragma clang loop unroll(full)\n      for (uint s = 0; s < NS_B; s++)')
         end = kernel.source.index('#if EXP_MODE == 2\n      }', begin)
         kernel.source = kernel.source[:begin] + FP8_SUBTILE_FILL + kernel.source[end:]
-        kernel.macros.update(FILE_TK=f'{file_tk}u', FILE_BLOCK=f'{tile_block}u')
+        kernel.macros.update(FILE_TK=f'{file_tk}u', FILE_BLOCK=f'{tile_block}u', FILE_TN=f'{file_tn}u')
         op.meta.update(prefill_packed_fp8=True, xp_tk=file_tk)
         return
     binding = next((name, offset) for slot, name, offset in op.bindings if slot == 0)
