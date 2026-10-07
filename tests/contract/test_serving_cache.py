@@ -238,3 +238,29 @@ def test_load_session_uses_seven_fixed_dspark_proposals(checkpoint, tmp_path, mo
     assert unset.drafter.gamma==7 and unset.verify_length==7
     explicit=generate.load_session(str(path),'unused',**options,drafter_options={'block_size':8},verify='cost')
     assert explicit.drafter.gamma==8 and explicit.verify=='cost'
+
+
+def test_verify_cost_tables_only_for_the_recipes_they_were_measured_on():
+    import copy
+    from monolith.backends.metal.m5_max_40c import serving
+    own = serving.measured_recipes('nvfp4')
+    tables = serving.verify_costs(own)
+    assert {'b15', 'b7lk'} <= set(tables)
+    assert all(len(row) == 16 for kind in ('b15', 'b7lk') for row in tables[kind].values())
+    assert serving.verify_costs(None) == {} and serving.verify_costs({}) == {}
+    assert serving.verify_costs(serving.measured_recipes(None)) == {}                    # source-precision draft recipes
+    assert serving.verify_costs({'0': dict(bf16_min_t=2, draft_attention='mma')}) == {}   # another pairing's recipe map
+    custom = copy.deepcopy(own)
+    custom['128']['draft_attention'] = 'custom'
+    assert serving.verify_costs(custom) == {}                                            # a custom --kernel-config
+
+
+def test_cost_rule_without_a_table_keeps_fixed_verification():
+    profile = load_configs()['apple-m5-max-40c']
+    assets = ServingAssets(Path('m'), Path('p'), 4096, 4110, profile, Path('d'), Path('dp'), 15, None, None,
+                           verify_rule='cost', verify_costs={})
+    _, options = assets.options(300)
+    assert options['verify'] == 'fixed' and options['verify_length'] == 15 and 'verify_cost' not in options
+    assets.verify_costs = {'b15': {'128': [1.0 + i / 100 for i in range(16)], '4096': [2.0] * 16}}
+    _, options = assets.options(300)
+    assert options['verify'] == 'cost' and options['verify_cost'][1] == 1.01 and 'verify_length' not in options

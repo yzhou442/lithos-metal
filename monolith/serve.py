@@ -66,7 +66,8 @@ class Backend:
 
         assets = getattr(self, 'assets', None)
         recipe_key, options = assets.options(prompt_tokens) if assets else (None, {'max_context': self.max_context})
-        sampling = (request.temperature, request.top_p, request.seed, recipe_key)
+        # the session identity: sampling, recipe and the cost rule's table (a pinned recipe key can span cost tiers)
+        sampling = (request.temperature, request.top_p, request.seed, recipe_key, tuple(options.get('verify_cost') or ()))
         if self.session is not None and sampling == self.sampling:
             return
         # Keep CPU programs for a bounded number of recipe/sampling variants.

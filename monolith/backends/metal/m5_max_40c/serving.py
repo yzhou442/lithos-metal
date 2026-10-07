@@ -34,6 +34,11 @@ def recipes(model, drafter, quantization):
     formats = {s.format for _, mod in model.named_modules() for s in mod.weight_map().values() if not s.aux}
     if not {'nvfp4', 'fp8_e4m3'} <= formats:
         return {}
+    return measured_recipes(quantization)
+
+
+def measured_recipes(quantization):
+    """The measured 27B DSpark recipe map for a draft quantization (None or 'nvfp4'), without the shape checks."""
     root = Path(__file__).parent / 'recipes' / 'dspark'
     contexts = json.loads((root / 'selected-contexts.json').read_text())
     if quantization is None:
@@ -49,9 +54,14 @@ def recipes(model, drafter, quantization):
     return selected
 
 
-def verify_costs():
+def verify_costs(recipes=None):
     """Measured full-round GPU ms per verify length l = 0 … 15 (l = 0 as l = 1) for the sixteen-row programs, per
     context tier: ``b15`` = block 15 drafts; ``b7lk`` = block 7 drafts + the context-lookup extension in rows 9-16.
-    The cost-aware verify rule (``verify='cost'``) uses them relative to l = 0 (tools/bench/spec_cost_table.py)."""
+    The cost-aware verify rule (``verify='cost'``) uses them relative to l = 0 (tools/bench/spec_cost_table.py).
+    They were measured on one workload, the NVFP4-draft DSpark serving recipes selected by ``recipes()``, so they
+    are returned only when the session's recipe map is exactly that one (empty otherwise: other models, the MoE
+    pairing, a source-precision draft or a custom ``--kernel-config`` keep fixed verification)."""
+    if not recipes or recipes != measured_recipes('nvfp4'):
+        return {}
     path = Path(__file__).parent / 'recipes' / 'dspark' / 'verify-cost.json'
     return json.loads(path.read_text()) if path.exists() else {}

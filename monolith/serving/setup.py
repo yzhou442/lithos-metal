@@ -18,6 +18,11 @@ from .cache import default_pack_cache, ensure_pack, resolve_checkpoint
 LOG = logging.getLogger(__name__)
 
 
+def cost_table_kind(gamma, lookup):
+    """The verify-cost table measured for this program shape: block <= 7 + lookup ('b7lk') or blocks 8-15 ('b15')."""
+    return 'b7lk' if lookup and gamma <= 7 else 'b15' if gamma > 7 else None
+
+
 @dataclass
 class ServingAssets:
     model_dir: Path
@@ -60,8 +65,7 @@ class ServingAssets:
             options['drafter_options'] = dict(options['drafter_options'], lookup={})
         if self.draft_dir and self.verify_rule == 'cost':
             # The chip's measured whole-round cost per verify length, for this program shape and context tier.
-            kind = 'b7lk' if self.lookup and self.gamma <= 7 else 'b15' if self.gamma > 7 else None
-            tables = (self.verify_costs or {}).get(kind) or {}
+            tables = (self.verify_costs or {}).get(cost_table_kind(self.gamma, self.lookup)) or {}
             if tables:
                 tier = str(max((int(k) for k in tables if int(k) <= prompt_tokens), default=min(int(k) for k in tables)))
                 options.update(verify='cost', verify_cost=list(tables[tier]))
@@ -142,7 +146,10 @@ def prepare(args, *, device_info=None):
         draft_pack = ensure_pack(draft_dir, draft, draft_root, capacity=capacity, layout=layout,
                                   backend=profile.backend, role='draft', quantization=quantization)
     verify_rule, lookup = getattr(args, 'verify_rule', 'fixed') or 'fixed', bool(getattr(args, 'draft_lookup', False))
-    verify_costs = backend.serving_verify_costs() if draft and hasattr(backend, 'serving_verify_costs') else None
+    verify_costs = backend.serving_verify_costs(recipes) if draft and hasattr(backend, 'serving_verify_costs') else None
+    if draft and verify_rule == 'cost' and not (verify_costs or {}).get(cost_table_kind(gamma, lookup)):
+        LOG.warning('--verify-rule cost: no measured round-cost table for this workload and block; verifying the '
+                    'whole block (fixed rule)')
     LOG.info('Serving backend=%s, target=%s, draft=%s, verify=%s (%s%s), recipe contexts=%s',
              profile.backend, model_dir, draft_dir, gamma + 1 if gamma else 1, verify_rule, ', lookup' if lookup else '', sorted(recipes))
     chunk = backend.serving_prefill_chunk(model, draft, recipes)

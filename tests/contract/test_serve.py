@@ -160,3 +160,23 @@ def test_draft_options_survive_sampling_changes_and_metrics_are_per_request(monk
     assert len(calls) == 2
     assert all(c['drafter_dir'] == 'draft' and c['drafter_pack'] == 'draft-pack'
                and c['verify_length'] == 7 for c in calls)
+
+
+def test_session_identity_includes_the_verify_cost_tier(monkeypatch):
+    """A pinned recipe key spans several cost tiers: crossing one rebuilds (or reuses) the session of that tier."""
+    from pathlib import Path
+    from monolith import generate
+    from monolith.backends.metal import load_configs
+    from monolith.serving.setup import ServingAssets
+    calls = []
+    monkeypatch.setattr(generate, 'load_session', lambda *a, **kw: calls.append(kw) or SimpleNamespace(eos=99))
+    backend = Backend.__new__(Backend)
+    backend.model_dir, backend.pack_dir, backend.max_context, backend.prefill_chunk_size = 'model', 'pack', 32768, 128
+    backend.session, backend.sampling = None, None
+    tables = {'b15': {'128': [1.0] * 16, '4096': [2.0] * 16}}
+    backend.assets = ServingAssets(Path('m'), Path('p'), 32768, 32782, load_configs()['apple-m5-max-40c'], Path('d'),
+                                   Path('dp'), 15, {'128': {}}, '128', verify_rule='cost', verify_costs=tables)
+    request = SimpleNamespace(temperature=0.0, top_p=1.0, seed=0)
+    for prompt_tokens in (200, 300, 5000, 6000, 250):
+        backend.select_session(request, prompt_tokens)
+    assert [c['verify_cost'][0] for c in calls] == [1.0, 2.0]            # one session per tier, the first one reused

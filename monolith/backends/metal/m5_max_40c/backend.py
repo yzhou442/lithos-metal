@@ -28,6 +28,7 @@ class Backend(MetalBackend):
             return 512
         return None
 
-    def serving_verify_costs(self):
+    def serving_verify_costs(self, recipes):
+        # measured round costs of the recipes' workload only (serving.verify_costs)
         from .serving import verify_costs
-        return verify_costs()
+        return verify_costs(recipes)
