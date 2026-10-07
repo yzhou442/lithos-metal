@@ -40,6 +40,7 @@ ap.add_argument('--recipe-key', default=None)
 ap.add_argument('--verify-rule', default='fixed', choices=['fixed', 'cost'], help='serve option: per-round verify length rule')
 ap.add_argument('--draft-lookup', action='store_true', help='serve option: context-lookup extension into rows 9-16')
 ap.add_argument('--spec-sampling', default='match', choices=['match', 'q'], help='serve option: T > 0 accept rule')
+ap.add_argument('--adaptive-block', action='store_true', help='serve option: adaptive block (block 7 rounds when L>7 is rare)')
 ap.add_argument('--top-k', type=int, default=0)
 ap.add_argument('--top-p', type=float, default=0.0)
 ap.add_argument('--seed', type=int, default=0)
@@ -107,6 +108,7 @@ ns.max_context, ns.draft_quantization, ns.draft_pack, ns.pack = a.max_context, '
 ns.kernel_config, ns.kernel_config_key = None, a.recipe_key
 ns.verify_rule, ns.draft_lookup = a.verify_rule, a.draft_lookup
 ns.spec_sampling = a.spec_sampling
+ns.draft_adaptive_block = a.adaptive_block
 t = time.time()
 assets = prepare(ns)
 setup_s = time.time() - t

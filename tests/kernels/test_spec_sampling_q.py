@@ -161,3 +161,53 @@ def test_greedy_is_unchanged_by_the_flag(packs):
     for n_prompt, n_new in ((5, 24), (11, 20), (1, 12)):
         ids = [int(x) for x in rng.integers(0, 50, n_prompt)]
         assert spec.generate(ids, n_new).tokens == plain.generate(ids, n_new).tokens
+
+
+# ---- the adaptive block: two decode programs (long / short block) switched by the host --------------------------------
+
+def _adaptive(packs, **kw):
+    """A session whose controller alternates between the block-3 and the block-2 program almost every round."""
+    tdir, ddir = packs
+    model = _model(tdir)
+    drafter, _, _, _ = build(ddir, target_lm_head=model.lm_head)
+    short, _, _, _ = build(ddir, target_lm_head=model.lm_head, block_size=2)
+    return Session(model, str(tdir / "pack"), eos=-1, autotune=False, attention="v2", drafter=drafter, drafter_pack=str(ddir / "pack"),
+                   alt_drafter=short, adaptive_block=dict(threshold=0.999, chunk=1, hold=1), verify="cost", verify_cost=[1.0, 1.0, 1.25, 1.9], **kw)
+
+
+def test_adaptive_block_greedy_equals_plain(packs):
+    tdir, _ = packs
+    plain = Session(_model(tdir), str(tdir / "pack"), eos=-1, autotune=False, attention="v2")
+    spec = _adaptive(packs)
+    rng = np.random.default_rng(3)
+    alt = 0
+    for n_prompt, n_new in ((5, 24), (11, 20), (1, 12)):
+        ids = [int(x) for x in rng.integers(0, 50, n_prompt)]
+        g = spec.generate(ids, n_new)
+        assert g.tokens == plain.generate(ids, n_new).tokens
+        alt += g.alt_steps
+    assert alt > 0                                                    # the short-block program did draft rounds
+
+
+def test_adaptive_block_preserves_the_target_distribution(packs):
+    tdir, _ = packs
+    sampling = dict(temperature=1.0, top_k=20, top_p=0.95)
+    plain = Session(_model(tdir), str(tdir / "pack"), eos=-1, autotune=False, attention="v2", topp_in_topk=True, **sampling)
+    spec = _adaptive(packs, spec_sampling="q", **sampling)
+    ids = [7, 23, 41, 3]
+    n_seeds, n_new = 1500, 4
+    plain_seqs, spec_seqs, alt = [], [], 0
+    for seed in range(n_seeds):
+        plain.seed, spec.seed = seed, seed + 100_000
+        plain_seqs.append(tuple(plain.generate(ids, n_new).tokens))
+        g = spec.generate(ids, n_new)
+        spec_seqs.append(tuple(g.tokens))
+        alt += g.alt_steps
+    zs = {}
+    for name, key in (("t0", lambda s: s[0]), ("t1", lambda s: s[1]), ("t2", lambda s: s[2]), ("t3", lambda s: s[3]), ("t1t2", lambda s: s[1:3])):
+        stat, df, z = _chi2_homogeneity(_counts(plain_seqs, key), _counts(spec_seqs, key))
+        zs[name] = z
+        print(f"\nadaptive {name}: chi2 {stat:.1f} df {df} z {z:.2f}")
+    print(f"adaptive: {alt} short-block rounds over {n_seeds} generations")
+    assert all(z < 4.0 for z in zs.values()), zs
+    assert alt > n_seeds // 2

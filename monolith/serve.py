@@ -393,6 +393,9 @@ def parse_args(argv=None):
     parser.add_argument("--spec-sampling", choices=['match', 'q'], default='match',
                         help="temperature > 0 with a draft head: match = greedy drafts accepted iff the target's sample equals them; "
                              "q = sampled drafts accepted with min(1, p/q) and residual corrections (exact; sglang's rule; top-p within top-k)")
+    parser.add_argument("--draft-adaptive-block", action='store_true',
+                        help="with --draft-block-size above 7 and --verify-rule cost: draft block-7 rounds while the rule rarely "
+                             "verifies more than 7 drafts (thinking / chat-like text), probing the long block periodically")
     parser.add_argument("--draft-lookup", action='store_true',
                         help="Extend a whole-block verify with the context-lookup continuation (prompt lookup) into rows 9-16")
     parser.add_argument("--pack", help="Local pack-cache directory (default: $XDG_CACHE_HOME/lithos-metal/packs; reuses legacy cache); existing packs also accepted")
