@@ -177,6 +177,8 @@ that is a [client limitation](https://github.com/anomalyco/opencode/blob/v1.18.3
 not buffering by this endpoint. Ordinary assistant text continues to stream separately.
 
 Defaults are 256 output tokens, greedy decoding, `top_p=1`, seed 0, and thinking disabled.
+All three request formats also accept `top_k` (default 0: off); with `--spec-sampling q`, `top_p`
+is then taken over the renormalized top-k.
 Sampling changes rebuild the session while preserving the selected draft and kernel recipes.
 At `temperature > 0` a draft is by default the drafter's argmax and survives only when the
 target's sample equals it. `--spec-sampling q` samples each draft from the drafter's
