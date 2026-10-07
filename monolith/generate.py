@@ -293,7 +293,9 @@ class Session:
         if can_ingest and not resident_prefill:
             # Move to the compact decoder before the first output token. The
             # potentially expensive layout transition must not interrupt SSE.
-            boundaries.add(max(offset, p - self.decode_t_max))
+            # (at most eight rows: a sixteen-row decoder must see the same prompt rows the eight-row one does, so
+            # the target's cache holds the same values whatever the verify bound)
+            boundaries.add(max(offset, p - min(8, self.decode_t_max)))
         if cache is not None:
             # A reusable message prefix is enough for short tails. Copying a
             # second multi-GB checkpoint just before sampling costs more than
