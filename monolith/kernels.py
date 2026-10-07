@@ -704,9 +704,12 @@ def sample_source() -> str:
 
 
 def sample_params(*, vocab: int, t_active: int, n_sg: int, top_k: int = 0, temperature: float = 1.0, top_p: float = 0.0,
-                  min_p: float = 0.0, seed: int = 0, step: int = 0) -> bytes:
-    """The ``SampleParams`` record (buffer 3 of the sampling kernels); ``top_k``/``top_p``/``min_p`` of 0 disable."""
+                  min_p: float = 0.0, seed: int = 0, step: int = 0, topp_in_topk: bool = False) -> bytes:
+    """The ``SampleParams`` record (buffer 3 of the sampling kernels); ``top_k``/``top_p``/``min_p`` of 0 disable.
+    ``topp_in_topk``: top-p over the top-k set's renormalized softmax (HF warpers, sglang) instead of the full softmax."""
     flags = (1 if top_k > 0 else 0) | (2 if 0.0 < top_p < 1.0 else 0) | (4 if min_p > 0.0 else 0)
+    if topp_in_topk and top_k > 0:
+        flags |= 8
     if temperature <= 0.0:
         raise ValueError("sample_params: temperature must be positive (use the argmax path for greedy)")
     return struct.pack("<IIIIIfffIIII", vocab, t_active, n_sg, -(-vocab // ARGMAX_SPAN), top_k, temperature, top_p, min_p,

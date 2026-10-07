@@ -78,7 +78,7 @@ class Session:
                  eos: Union[int, Sequence[int]] = -1, ring_capacity: int = 4096, temperature: float = 0.0, top_k: int = 0, top_p: float = 0.0,
                  min_p: float = 0.0, seed: int = 0, autotune: bool = True, drafter: Any = None, drafter_pack: Optional[str] = None,
                  verify: str = "cost", verify_threshold: Optional[float] = None, verify_length: Optional[int] = None,
-                 verify_cost: Optional[Sequence[float]] = None,
+                 verify_cost: Optional[Sequence[float]] = None, spec_sampling: str = "match", topp_in_topk: Optional[bool] = None,
                  barriers: str = "minimal", attention: Optional[str] = None, fast_math: bool = False, accelerator: Optional[str] = None,
                  prefill_chunk_size: int = 128, commute_norm: bool = True, gdn_mixer_fusion: bool = True,
                  prefill_attention: Optional[str] = None, decoder_kernel_config: Optional[Dict[str, Any]] = None,
@@ -146,8 +146,23 @@ class Session:
             self.accelerator = os.environ["MONOLITH_ACCELERATOR"]                    # an A/B knob for the test tiers
         self.eos, self.ring_capacity = eos, ring_capacity
         self.seed = seed
-        # temperature 0 = greedy (the argmax path); otherwise the Gumbel-max sampler with the thresholds
-        model.sampler = GreedySampler(prefix="sampler.") if temperature <= 0 else StochasticSampler(temperature, top_k, top_p, min_p, seed, prefix="sampler.")
+        # temperature 0 = greedy (the argmax path); otherwise the Gumbel-max sampler with the thresholds.
+        # spec_sampling (a drafter at temperature > 0): "match" = greedy drafts accepted iff the target's sample equals them
+        # (exact, accepts with p(argmax q)); "q" = sampled drafts d ~ q, accepted with min(1, p/q), corrections from
+        # norm(max(p - q, 0)) (exact, accepts with sum min(p, q); sglang's chain rule) and top-p within top-k by default.
+        if spec_sampling not in ("match", "q"):
+            raise ValueError("spec_sampling must be 'match' or 'q'")
+        self.spec_sampling = spec_sampling
+        q_rule = spec_sampling == "q" and temperature > 0 and drafter is not None
+        if drafter is not None and hasattr(drafter, "sampling"):
+            if q_rule and getattr(drafter, "vocab_subset", None):
+                raise ValueError("spec_sampling='q' needs the full draft vocabulary (no vocab_subset)")
+            drafter.sampling = dict(temperature=float(temperature)) if q_rule else None
+        elif q_rule:
+            raise ValueError("spec_sampling='q' needs a DSpark drafter")
+        topp_in_topk = q_rule if topp_in_topk is None else bool(topp_in_topk)
+        model.sampler = GreedySampler(prefix="sampler.") if temperature <= 0 else StochasticSampler(temperature, top_k, top_p, min_p, seed, prefix="sampler.",
+                                                                                                     topp_in_topk=topp_in_topk)
         self.engines: Dict[Any, Any] = {}
         self._programs: Dict[Any, Any] = {}
         # Pipelines do not retain weight buffers. Keep them even when memory

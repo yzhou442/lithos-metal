@@ -33,6 +33,7 @@ class ServingAssets:
     prefill_chunk_size: int | None = None   # the backend's measured prefill pass size for this model, if any
     verify_rule: str = 'fixed'
     lookup: bool = False
+    spec_sampling: str = 'match'
     verify_costs: dict | None = None
 
     def options(self, prompt_tokens):
@@ -56,6 +57,8 @@ class ServingAssets:
                            decoder_kernel_config=copy.deepcopy(recipe.get('target')),
                            prefill_attention=recipe.get('prefill_attention', 'auto' if profile.backend == 'm5_max_40c'
                                                         and recipe.get('target') else 'v3'), accelerator='on')
+        if self.draft_dir and self.spec_sampling != 'match':
+            options['spec_sampling'] = self.spec_sampling          # temperature > 0 only; greedy requests are unaffected
         if self.draft_dir and self.lookup:
             options['drafter_options'] = dict(options['drafter_options'], lookup={})
         if self.draft_dir and self.verify_rule == 'cost':
@@ -148,4 +151,5 @@ def prepare(args, *, device_info=None):
     chunk = backend.serving_prefill_chunk(model, draft, recipes)
     return ServingAssets(model_dir, pack, args.max_context, capacity, profile,
                          draft_dir, draft_pack, gamma, recipes, args.kernel_config_key, prefill_chunk_size=chunk,
-                         verify_rule=verify_rule, lookup=lookup, verify_costs=verify_costs)
+                         verify_rule=verify_rule, lookup=lookup, verify_costs=verify_costs,
+                         spec_sampling=getattr(args, 'spec_sampling', 'match') or 'match')
