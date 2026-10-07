@@ -369,6 +369,10 @@ def create_app(backend, model_name, api_key=None):
     return app
 
 
+def _chunk_size(value):
+    return value if value == 'auto' else int(value)
+
+
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(prog="lithos-metal serve", description=__doc__)
     parser.add_argument("--model", required=True, help="Hugging Face repo ID or local checkpoint path")
@@ -389,8 +393,10 @@ def parse_args(argv=None):
     parser.add_argument("--kernel-config-key", help="Pin a context key in the selected recipe map")
     parser.add_argument("--served-model-name", default=None)
     parser.add_argument("--max-context", type=int, default=32768)
-    parser.add_argument("--prefill-chunk-size", type=int, default=None,
-                        help="Prompt tokens per prefill pass (default: the chip's measured size for the model, else 128)")
+    parser.add_argument("--prefill-chunk-size", type=_chunk_size, default=128,
+                        help="Prompt tokens per prefill pass (default 128). 'auto' selects the chip's measured size for the "
+                             "model (512 on the 40-core M5 Max recipe: ~2-2.6x faster long-prompt prefill; different "
+                             "reduction order, so very long prompts can change greedy tokens)")
     parser.add_argument("--no-warmup", action='store_true', help="Skip startup compilation/warmup; the first request pays this cost")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
@@ -400,7 +406,7 @@ def parse_args(argv=None):
         args.draft = default_draft(args.model)
     if args.max_context < 1:
         parser.error("--max-context must be positive")
-    if args.prefill_chunk_size is not None and args.prefill_chunk_size < 1:
+    if args.prefill_chunk_size != 'auto' and args.prefill_chunk_size < 1:
         parser.error("--prefill-chunk-size must be positive")
     if args.draft_block_size is not None and args.draft_block_size < 1:
         parser.error('--draft-block-size must be positive')
@@ -418,7 +424,9 @@ def main(argv=None):
     logging.basicConfig(level=logging.INFO)
     assets = prepare(args)
     api_key = os.environ.get("LITHOS_METAL_API_KEY") or os.environ.get("LMK_API_KEY") or os.environ.get("MONOLITH_API_KEY")
-    chunk = args.prefill_chunk_size or getattr(assets, 'prefill_chunk_size', None) or 128
+    chunk = args.prefill_chunk_size
+    if chunk == 'auto':
+        chunk = getattr(assets, 'prefill_chunk_size', None) or 128
     backend = Backend(str(assets.model_dir), str(assets.pack_dir), args.max_context, chunk, assets=assets)
     model_name = args.served_model_name or (assets.model_dir.name if Path(args.model).expanduser().exists() else args.model)
     if not args.no_warmup:
