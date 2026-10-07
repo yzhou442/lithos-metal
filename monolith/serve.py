@@ -410,13 +410,12 @@ def parse_args(argv=None):
     parser.add_argument("--kernel-config-key", help="Pin a context key in the selected recipe map")
     parser.add_argument("--served-model-name", default=None)
     parser.add_argument("--max-context", type=int, default=32768)
-    parser.add_argument("--prefill-chunk-size", type=_chunk_size, default=128,
-                        help="Prompt tokens per prefill pass (default 128). 'auto-exact' / 'N-exact': the chip's measured size "
-                             "for the model (512 on the 40-core M5 Max recipe) or N rows with the 128-row graph's reduction "
-                             "orders — faster long prompts, identical results except for prompts whose length L has "
-                             "(L - 8) mod 128 == 1 (the 128-row graph computes that single-token chunk with the 1-row kernel); "
-                             "it becomes the default once that case is exact. 'auto' drops the exact orders (fastest; very "
-                             "long prompts can change greedy tokens)")
+    parser.add_argument("--prefill-chunk-size", type=_chunk_size, default='auto-exact',
+                        help="Prompt tokens per prefill pass. Default 'auto-exact': the chip's measured size for the model "
+                             "(512 on the 40-core M5 Max recipe, else 128) with the 128-row graph's reduction orders — "
+                             "identical results, faster long prompts (a request whose 128-row chunking ends in a one-token "
+                             "chunk runs the 128-row path itself). 'auto' drops the exact orders (fastest; very long "
+                             "prompts can change greedy tokens); N or 'N-exact' pick the size explicitly")
     parser.add_argument("--no-warmup", action='store_true', help="Skip startup compilation/warmup; the first request pays this cost")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
