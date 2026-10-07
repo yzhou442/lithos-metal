@@ -15,6 +15,9 @@
 #ifndef T_STATIC_ROWS
 #define T_STATIC_ROWS 1u
 #endif
+#ifndef VOCAB_MAP
+#define VOCAB_MAP 0                  // 1: the logits are a vocabulary subset's rows; argmax_final writes vocab_ids[row] (buffer 4)
+#endif
 struct ArgmaxParams { uint vocab; uint t_active; uint n_sg; uint n_spans; };
 
 static inline float bf16f(ushort u) { return as_type<float>(uint(u) << 16); }
@@ -76,6 +79,9 @@ kernel void argmax_partial(device const ushort* logits [[buffer(0)]], device flo
 
 kernel void argmax_final(device const float* part_val [[buffer(0)]], device const uint* part_idx [[buffer(1)]], device int* token [[buffer(2)]],
                          constant ArgmaxParams& p [[buffer(3)]],
+#if VOCAB_MAP
+                         device const int* vocab_ids [[buffer(4)]],
+#endif
 #if STEP_STATE
                          device const StepState* st [[buffer(15)]],
 #endif
@@ -95,5 +101,9 @@ kernel void argmax_final(device const float* part_val [[buffer(0)]], device cons
   uint bi = 0xFFFFFFFFu;
   for (uint i = lane; i < p.n_sg; i += 32u) better(best, bi, part_val[t * p.n_sg + i], part_idx[t * p.n_sg + i]);
   simd_argmax(best, bi);
+#if VOCAB_MAP
+  if (lane == 0) token[t] = bi < p.vocab ? vocab_ids[bi] : 0;
+#else
   if (lane == 0) token[t] = int(bi);
+#endif
 }

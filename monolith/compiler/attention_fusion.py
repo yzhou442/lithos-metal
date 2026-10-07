@@ -160,8 +160,175 @@ def _group_tiles(source,key_tile=32):
     return source[:start]+body+source[end:]
 
 
+def _kv_pipeline_body(cached_prefix):
+    kpref = 'prefix_k' if cached_prefix else 'k_cache'
+    vpref = 'prefix_v' if cached_prefix else 'v_cache'
+    return f'''
+  threadgroup GqaTileScratch scratch;
+  threadgroup bfloat kv_tile[KN * D];
+  threadgroup GqaProbability prob[QM * KN];
+  threadgroup float row_md[QM * 2];
+  threadgroup float carry[QM * 2];
+  if (st->done) return;
+  const uint T = st->t_this_step, position = st->position;
+  const uint qpos0 = position;
+  if (T == 0u) return;
+  const uint rows = T * (p.heads / p.kv_heads), rep = p.heads / p.kv_heads;
+  const uint ctx = qpos0 + T, chunks = (ctx + CH - 1u) / CH;
+  const uint groups = (rows + QM - 1u) / QM;
+  for (uint block = tgid; block < p.kv_heads * chunks * groups; block += p.n_sg) {{
+    const uint j = block / (chunks * groups), c = (block / groups) % chunks, r0 = (block % groups) * QM;
+    if (j >= p.kv_heads) return;
+    for (uint r = sgi; r < QM; r += MMA_SG) {{
+      float q[DL];
+      const uint row = r0 + r, t = row / rep, h = j * rep + row % rep;
+      for (uint e = 0; e < DL; e++) q[e] = 0.0f;
+      if (row < rows) {{
+        load_dl(qkvg + t * p.in_stride + p.q_off + h * D + lane * DL, q);
+        norm_rope(q, q_norm, cos_t + (position + t) * D, sin_t + (position + t) * D, p.eps, lane);
+      }}
+      for (uint e = 0; e < DL; e++) scratch.query[r * D + lane * DL + e] = bfloat(q[e]);
+    }}
+    matmul2d<value_desc, execution_simdgroups<MMA_SG>> value_op;
+    matmul2d<score_desc, execution_simdgroups<MMA_SG>> score_op;
+    GqaTG vt(kv_tile, dextents<int, 2>(D, KN));
+    GqaTG kt(kv_tile, dextents<int, 2>(D, KN));
+    GqaTG qt(scratch.query, dextents<int, 2>(D, QM));
+    GqaFloatTG score_tile(scratch.score, dextents<int, 2>(KN, QM));
+    auto accum = value_op.get_destination_cooperative_tensor<GqaProbTG, GqaTG, float>();
+    for (uint16_t i = 0; i < accum.get_capacity(); i++) if (accum.is_valid_element(i)) accum[i] = 0.0f;
+    for (uint r = sgi; r < QM; r += MMA_SG) if (lane == 0) {{ row_md[2 * r] = -INFINITY; row_md[2 * r + 1] = 0.0f; }}
+    // prefix K/V words of this SIMD-group's keys in the next tile (keys sgi, sgi + MMA_SG, ...)
+    uint4 kpre[KN / MMA_SG];
+    {{
+      const uint key_base = c * CH;
+      for (uint i = 0; i < KN / MMA_SG; i++) {{
+        const uint key = key_base + sgi + i * MMA_SG;
+        kpre[i] = key < position ? *(device const uint4*)({kpref} + (key * p.kv_heads + j) * D + lane * DL) : uint4(0u);
+      }}
+    }}
+    for (uint sub = 0; sub < CH / KN && c * CH + sub * KN < ctx; sub++) {{
+      const uint key_base = c * CH + sub * KN;
+      const bool more = sub + 1u < CH / KN && key_base + KN < ctx;
+      uint4 vcur[KN / MMA_SG];
+      for (uint i = 0; i < KN / MMA_SG; i++) {{
+        const uint kk = sgi + i * MMA_SG, key = key_base + kk;
+        float k[DL];
+        for (uint e = 0; e < DL; e++) k[e] = 0.0f;
+        if (key < position) {{
+          const uint4 qw = kpre[i];
+          k[0] = bf16lo(qw.x); k[1] = bf16hi(qw.x); k[2] = bf16lo(qw.y); k[3] = bf16hi(qw.y);
+          k[4] = bf16lo(qw.z); k[5] = bf16hi(qw.z); k[6] = bf16lo(qw.w); k[7] = bf16hi(qw.w);
+        }} else if (key < ctx) {{
+          const uint tk = key - position;
+          load_dl(qkvg + tk * p.in_stride + p.k_off + j * D + lane * DL, k);
+          norm_rope(k, k_norm, cos_t + key * D, sin_t + key * D, p.eps, lane);
+          if (r0 == 0) {{
+            store_dl(k_cache + (key * p.kv_heads + j) * D + lane * DL, k);
+            copy_dl(v_cache + (key * p.kv_heads + j) * D + lane * DL, qkvg + tk * p.in_stride + p.v_off + j * D + lane * DL);
+          }}
+        }}
+        for (uint e = 0; e < DL; e++) kv_tile[kk * D + lane * DL + e] = bfloat(k[e]);
+        vcur[i] = key < position ? *(device const uint4*)({vpref} + (key * p.kv_heads + j) * D + lane * DL) : uint4(0u);
+        const uint nkey = key + KN;
+        if (more) kpre[i] = nkey < position ? *(device const uint4*)({kpref} + (nkey * p.kv_heads + j) * D + lane * DL) : uint4(0u);
+      }}
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      auto scores = score_op.get_destination_cooperative_tensor<GqaTG, decltype(kt), float>();
+      for (uint16_t i = 0; i < scores.get_capacity(); i++) if (scores.is_valid_element(i)) scores[i] = 0.0f;
+      score_op.run(qt, kt, scores);
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      scores.store(score_tile);
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      for (uint r = sgi; r < QM; r += MMA_SG) {{
+        const uint row = r0 + r, t = row / rep;
+        float sc[KN / 32];
+        for (uint u = 0; u < KN / 32; u++) {{
+          const uint key = key_base + lane + u * 32;
+          sc[u] = row < rows && key < ctx && key <= position + t ? round_bf16(round_bf16(scratch.score[r * KN + lane + u * 32]) * p.scaling) : -INFINITY;
+        }}
+        float local_max = -INFINITY;
+        for (uint u = 0; u < KN / 32; u++) local_max = max(local_max, sc[u]);
+        const float m = simd_max(local_max);
+        float den = 0;
+        for (uint u = 0; u < KN / 32; u++) {{
+          const float pr = sc[u] == -INFINITY ? 0.0f : exp(sc[u] - m);
+          prob[r * KN + lane + u * 32] = GqaProbability(pr);
+          den += pr;
+        }}
+        den = simd_sum(den);
+        if (lane == 0) {{
+          const float old_m = row_md[2 * r], new_m = max(old_m, m);
+          const float a = old_m == -INFINITY ? 0.0f : exp(old_m - new_m);
+          const float b = m == -INFINITY ? 0.0f : exp(m - new_m);
+          row_md[2 * r] = new_m;
+          row_md[2 * r + 1] = a * row_md[2 * r + 1] + b * den;
+          carry[2 * r] = a; carry[2 * r + 1] = b;
+        }}
+      }}
+      for (uint i = 0; i < KN / MMA_SG; i++) {{
+        const uint kk = sgi + i * MMA_SG, key = key_base + kk;
+        float v[DL];
+        for (uint e = 0; e < DL; e++) v[e] = 0.0f;
+        if (key < position) {{
+          const uint4 qw = vcur[i];
+          v[0] = bf16lo(qw.x); v[1] = bf16hi(qw.x); v[2] = bf16lo(qw.y); v[3] = bf16hi(qw.y);
+          v[4] = bf16lo(qw.z); v[5] = bf16hi(qw.z); v[6] = bf16lo(qw.w); v[7] = bf16hi(qw.w);
+        }}
+        else if (key < ctx) load_dl(qkvg + (key - position) * p.in_stride + p.v_off + j * D + lane * DL, v);
+        for (uint e = 0; e < DL; e++) kv_tile[kk * D + lane * DL + e] = bfloat(v[e]);
+      }}
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      GqaProbTG pt(prob, dextents<int, 2>(KN, QM));
+      auto out = value_op.get_destination_cooperative_tensor<GqaProbTG, decltype(vt), float>();
+      for (uint16_t i = 0; i < out.get_capacity(); i++) if (out.is_valid_element(i)) out[i] = 0.0f;
+      value_op.run(pt, vt, out);
+      for (uint16_t i = 0; i < out.get_capacity(); i++) if (out.is_valid_element(i)) {{
+        const uint r = out.get_multidimensional_index(i)[1];
+        accum[i] = carry[2 * r] * accum[i] + carry[2 * r + 1] * out[i];
+      }}
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+    }}
+    for (uint16_t i = 0; i < accum.get_capacity(); i++) if (accum.is_valid_element(i)) {{
+      auto idx = accum.get_multidimensional_index(i);
+      const uint row = r0 + idx[1], dim = idx[0];
+      if (row < rows) part_o[((j * p.n_chunks_max + c) * p.rows_max + row) * D + dim] = accum[i];
+    }}
+    for (uint r = sgi; r < QM; r += MMA_SG) if (lane == 0 && r0 + r < rows) {{
+      const uint base = ((j * p.n_chunks_max + c) * p.rows_max + r0 + r) * 2;
+      part_md[base] = row_md[2 * r]; part_md[base + 1] = row_md[2 * r + 1];
+    }}
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }}
+}}
+'''
+
+
+
+def _kv_pipeline(source):
+    """Software-pipelined K/V staging for the chunk-grouped staged target core (``attention_kv_pipeline``).
+
+    Each SIMD-group issues the next 32-key tile's cached-prefix K loads (and the current tile's V loads) as raw
+    16-byte words before the current tile's matrix work, so DRAM latency overlaps the score/softmax/value sequence
+    instead of sitting between threadgroup barriers. Words are converted exactly as before (bf16 -> float ->
+    bfloat): every tile, matrix operation, softmax and partial record is byte-identical. Measured at 16K context:
+    core 484 -> 364 us; at 4K it is slower (196 -> 230 us), so recipes opt in per context.
+    """
+    start = source.rindex('kernel void gqa_decode_mma(')
+    open_ = source.index('{', source.index('simdgroup_index_in_threadgroup]]', start))
+    end = source.find('\n#if DIRECT_KV\n// Prepare', start)
+    if end < 0:
+        raise ValueError('attention kernel end not found')
+    old = source[open_ + 1:end]
+    if 'row_md' not in old or 'GqaKVTileScratch' in source or 'prepared_q' in source or 'prefix_load_dl(prefix_k' not in old:
+        raise ValueError('the K/V pipeline needs the chunk-grouped staged core with cached-prefix loads, no preparation or aliasing')
+    if re.search(r'#define QM (\d+)', source)[1] != '16':
+        raise ValueError('the K/V pipeline expects 16-row query tiles')
+    return source[:open_ + 1] + _kv_pipeline_body(True) + source[end:]
+
+
 @program_scope
-def specialize_attention(program, sgs, prepare, chunk_tiles, style='staged', key_tile=32, cached_prefix=False, alias_scratch=False, task_order='head'):
+def specialize_attention(program, sgs, prepare, chunk_tiles, style='staged', key_tile=32, cached_prefix=False, alias_scratch=False, task_order='head', kv_pipeline=False):
     p = copy.deepcopy(program)
     cores = [o for o in p.ops if p.kernels[o.kernel].function == 'gqa_decode_mma']
     if not cores:
@@ -192,9 +359,13 @@ def specialize_attention(program, sgs, prepare, chunk_tiles, style='staged', key
                 fk = p.kernels[fold.kernel]
                 if fk.function == 'gqa_merge' and any(n == cb[7][0] for _,n,_ in fold.bindings):
                     fk.macros['CH'] = k.macros['CH']
+        if kv_pipeline and (prepare or alias_scratch or not cached_prefix or style!='staged' or chunk_tiles<2
+                            or key_tile!=32 or k.macros.get('DRAFT')=='1' or int(k.macros['D'].rstrip('u'))!=256):
+            raise ValueError('the K/V pipeline needs the grouped staged target core (D 256, 32-key tiles) with cached-prefix loads')
         if not prepare:
             if alias_scratch:k.source=_alias_scratch(k.source)
             if cached_prefix:_cache_prefix(p,op,k,False)
+            if kv_pipeline:k.source=_kv_pipeline(k.source)
             for macro,field in constants.items():k.source=re.sub(r'\b'+re.escape(field)+r'\b',macro,k.source)
             continue
         if k.macros.get('DRAFT') == '1':

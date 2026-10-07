@@ -151,7 +151,8 @@
         },
         "perm_sgs": 64,
         "direct_norm": true,
-        "dual_permute": true
+        "dual_permute": true,
+        "fuse": false
       },
       "attention": {
         "attention_chunk_tiles": 3,
@@ -189,7 +190,8 @@
         "task_seed": true,
         "task_seed_bound": true,
         "tn": 32,
-        "workers": 160
+        "workers": 160,
+        "fuse": false
       },
       "mlp": {
         "cache_external_inputs": false,
@@ -210,7 +212,21 @@
         "staged_tk": 64,
         "tn": 32,
         "workers": 160
-      }
+      },
+      "lm_head": {
+        "workers": 80,
+        "sgs": 8,
+        "tn": 16,
+        "compact": true,
+        "ksplit": 1,
+        "mode": "native",
+        "staged_tk": 128,
+        "ragged_teams": true,
+        "nvfp4_layout": "tile",
+        "nvfp4_tile_block": 16,
+        "q_outer": 1
+      },
+      "gdn_dead_state": true
     }
   },
   "4096": {
@@ -360,7 +376,8 @@
         },
         "perm_sgs": 64,
         "direct_norm": true,
-        "dual_permute": true
+        "dual_permute": true,
+        "fuse": false
       },
       "attention": {
         "attention_cached_prefix": true,
@@ -398,7 +415,8 @@
         "task_grain": "tile",
         "task_seed": true,
         "tn": 32,
-        "workers": 120
+        "workers": 120,
+        "fuse": false
       },
       "mlp": {
         "cache_external_inputs": false,
@@ -419,7 +437,21 @@
         "staged_tk": 64,
         "tn": 32,
         "workers": 160
-      }
+      },
+      "lm_head": {
+        "workers": 80,
+        "sgs": 8,
+        "tn": 16,
+        "compact": true,
+        "ksplit": 1,
+        "mode": "native",
+        "staged_tk": 128,
+        "ragged_teams": true,
+        "nvfp4_layout": "tile",
+        "nvfp4_tile_block": 16,
+        "q_outer": 1
+      },
+      "gdn_dead_state": true
     }
   },
   "8192": {
@@ -569,7 +601,8 @@
         },
         "perm_sgs": 64,
         "direct_norm": true,
-        "dual_permute": true
+        "dual_permute": true,
+        "fuse": false
       },
       "attention": {
         "attention_cached_prefix": true,
@@ -628,7 +661,21 @@
         "staged_tk": 64,
         "tn": 32,
         "workers": 160
-      }
+      },
+      "lm_head": {
+        "workers": 80,
+        "sgs": 8,
+        "tn": 16,
+        "compact": true,
+        "ksplit": 1,
+        "mode": "native",
+        "staged_tk": 128,
+        "ragged_teams": true,
+        "nvfp4_layout": "tile",
+        "nvfp4_tile_block": 16,
+        "q_outer": 1
+      },
+      "gdn_dead_state": true
     }
   },
   "16384": {
@@ -778,7 +825,8 @@
         },
         "perm_sgs": 64,
         "direct_norm": true,
-        "dual_permute": true
+        "dual_permute": true,
+        "fuse": false
       },
       "attention": {
         "attention_cached_prefix": true,
@@ -816,7 +864,9 @@
         "task_grain": "tile",
         "task_seed": true,
         "tn": 32,
-        "workers": 120
+        "workers": 120,
+        "fuse": false,
+        "attention_kv_pipeline": true
       },
       "mlp": {
         "cache_external_inputs": false,
@@ -837,7 +887,21 @@
         "staged_tk": 64,
         "tn": 32,
         "workers": 160
-      }
+      },
+      "lm_head": {
+        "workers": 80,
+        "sgs": 8,
+        "tn": 16,
+        "compact": true,
+        "ksplit": 1,
+        "mode": "native",
+        "staged_tk": 128,
+        "ragged_teams": true,
+        "nvfp4_layout": "tile",
+        "nvfp4_tile_block": 16,
+        "q_outer": 1
+      },
+      "gdn_dead_state": true
     }
   },
   "32768": {
@@ -995,7 +1059,8 @@
         },
         "perm_sgs": 64,
         "direct_norm": true,
-        "dual_permute": true
+        "dual_permute": true,
+        "fuse": false
       },
       "attention": {
         "attention_alias_scratch": true,
@@ -1055,7 +1120,21 @@
         "staged_tk": 64,
         "tn": 32,
         "workers": 160
-      }
+      },
+      "lm_head": {
+        "workers": 80,
+        "sgs": 8,
+        "tn": 16,
+        "compact": true,
+        "ksplit": 1,
+        "mode": "native",
+        "staged_tk": 128,
+        "ragged_teams": true,
+        "nvfp4_layout": "tile",
+        "nvfp4_tile_block": 16,
+        "q_outer": 1
+      },
+      "gdn_dead_state": true
     }
   }
 }
