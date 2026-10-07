@@ -149,6 +149,10 @@ class DSparkDrafter(Drafter):
             if isinstance(block_size, bool) or not isinstance(block_size, int) or not 1 <= block_size <= cfg.max_block_size:
                 raise ValueError(f"DSpark: block_size must be in 1..{cfg.max_block_size}")
             cfg = replace(cfg, block_size=block_size)
+        elif cfg.block_size > cfg.max_block_size:
+            # a checkpoint whose configured block exceeds the 16-row verify limit drafts at the limit by default
+            from dataclasses import replace
+            cfg = replace(cfg, block_size=cfg.max_block_size)
         self.cfg, self.gamma, self.max_context = cfg, cfg.block_size, max_context
         self.kernel_config = kernel_config
         # Draft vocabulary subset ("path[:count]", vocab_subset.py): proposals only from those token ids. Off by

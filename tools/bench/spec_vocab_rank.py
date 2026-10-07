@@ -5,7 +5,7 @@ Counts target-tokenizer tokens over a text corpus (JSONL lines {"role", "t"}; as
 coverage of reference generations (spec_lmbench JSONs: the fraction of generated tokens inside the
 top-K set, per prompt and overall) for K in --ks.
 
-    python tools/bench/spec_vocab_rank.py --corpus fr_corpus.jsonl --refs spec_lmbench_full.json --out vocab_rank.json
+    python tools/bench/spec_vocab_rank.py --model path/to/target --corpus fr_corpus.jsonl --refs spec_lmbench_full.json --out vocab_rank.json
 """
 import argparse
 import collections
@@ -15,7 +15,7 @@ import os
 ap = argparse.ArgumentParser()
 ap.add_argument('--corpus', required=True)
 ap.add_argument('--refs', nargs='*', default=[])
-ap.add_argument('--model', default='nvidia/Qwen3.8-27B-NVFP4')
+ap.add_argument('--model', required=True, help='target checkpoint (path or hub id; its tokenizer)')
 ap.add_argument('--assistant-weight', type=float, default=3.0)
 ap.add_argument('--ks', default='8192,16384,32768,49152,65536')
 ap.add_argument('--out', required=True)

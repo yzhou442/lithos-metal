@@ -8,7 +8,7 @@ the median decode tok/s, tokens/round, GPU ms/round, identity with the baseline 
 the first policy; JSON keeps everything raw. Prompts are spec_lmbench's (tools/bench/spec_prompts.py). Run nothing
 else on the GPU meanwhile.
 
-    python tools/bench/spec_policy_ab.py --draft path/to/dspark-head --lookup --suite full --reps 3 \
+    python tools/bench/spec_policy_ab.py --model path/to/target --draft path/to/dspark-head --lookup --suite full --reps 3 \
         --policies '{"fixed7": {"mode": "fixed", "L": 7, "ext": false}, "cost_lk": {"mode": "cost", "ext": true}}' \
         [--baseline spec_lmbench_full.json] --out ab.json
 """
@@ -27,7 +27,7 @@ ap.add_argument('--repo', default=str(Path(__file__).resolve().parents[2]),
                 help='lithos-metal checkout to import (default: the one containing this script)')
 ap.add_argument('--prompt-source', default=None,
                 help='checkout whose files supply the document/agent prompt text (default: --repo)')
-ap.add_argument('--model', default='nvidia/Qwen3.8-27B-NVFP4')
+ap.add_argument('--model', required=True, help='target checkpoint (path or hub id)')
 ap.add_argument('--draft', default=None)
 ap.add_argument('--block', type=int, default=None)
 ap.add_argument('--lookup', action='store_true', help='compile the context-lookup extension (policies toggle it)')

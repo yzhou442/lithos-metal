@@ -60,6 +60,10 @@ def test_max_block_size_from_the_trained_block(trained, expected, nested):
 def test_max_block_size_caps_an_oversized_configured_block():
     c = DSparkConfig.from_dict(dict(CFG, block_size=16, training_block_size=16))
     assert c.block_size == 16 and c.max_block_size == 15
+    head = LMHead(64, 50, hf_name="lm_head.weight", prefix="lm_head.")
+    d = DSparkDrafter(c, target_lm_head=head, max_context=32)          # the checkpoint default drafts at the limit
+    assert d.gamma == 15 and d.cfg.block_size == 15
+    assert DSparkDrafter(DSparkConfig.from_dict(CFG), target_lm_head=head, max_context=32).gamma == 7
 
 
 def test_weight_map_matches_the_drafter_inventory():

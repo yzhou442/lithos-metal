@@ -127,9 +127,11 @@ def test_cli_accepts_hub_ids_and_optional_cache():
     from monolith.serve import parse_args
     args = parse_args(['--model', 'org/target', '--draft', 'org/draft'])
     assert args.pack is None and args.draft == 'org/draft' and args.draft_kind == 'dspark'
-    for flags in (['--draft-kind', 'lm'], ['--draft-pack', 'pack'], ['--kernel-config-key', '128']):
+    for flags in (['--draft-kind', 'lm'], ['--draft-pack', 'pack'], ['--kernel-config-key', '128'], ['--draft-lookup'],
+                  ['--verify-rule', 'cost'], ['--no-draft', '--draft-lookup'], ['--no-draft', '--verify-rule', 'cost']):
         with pytest.raises(SystemExit):
             parse_args(['--model', 'org/target', *flags])
+    assert parse_args(['--model', 'org/target', '--draft', 'org/draft', '--draft-lookup', '--verify-rule', 'cost']).draft_lookup
 
 
 def test_draft_options_survive_sampling_changes_and_metrics_are_per_request(monkeypatch):

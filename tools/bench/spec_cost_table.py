@@ -9,7 +9,7 @@ round (verification + accept/commit + next draft + select) and, once, the accept
 Optionally attributes the verification span to kernel functions with per-dispatch timestamps (re-encoded, so the
 absolute numbers carry encoder gaps; use the shares and the T-scaling, not the totals).
 
-    python tools/bench/spec_cost_table.py --block 15 --ls 1,3,7,11,15 [--draft path/to/dspark-head] --out cost.json
+    python tools/bench/spec_cost_table.py --model path/to/target --block 15 --ls 1,3,7,11,15 [--draft path/to/dspark-head] --out cost.json
 
 Run nothing else on the GPU meanwhile; the output's per-L full-round medians are the format of
 monolith/backends/metal/<backend>/recipes/dspark/verify-cost.json.
@@ -26,7 +26,7 @@ from pathlib import Path
 ap = argparse.ArgumentParser()
 ap.add_argument('--repo', default=str(Path(__file__).resolve().parents[2]),
                 help='lithos-metal checkout to import (default: the one containing this script)')
-ap.add_argument('--model', default='nvidia/Qwen3.8-27B-NVFP4')
+ap.add_argument('--model', required=True, help='target checkpoint (path or hub id)')
 ap.add_argument('--draft', default=None)
 ap.add_argument('--block', type=int, default=None, help='serving block (drafts per round); default the serve default')
 ap.add_argument('--max-context', type=int, default=32768)

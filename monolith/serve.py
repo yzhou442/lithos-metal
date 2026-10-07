@@ -416,7 +416,7 @@ def parse_args(argv=None):
     if args.draft_block_size is not None and args.draft_block_size < 1:
         parser.error('--draft-block-size must be positive')
     if not args.draft and (args.draft_pack or args.draft_revision or args.draft_block_size is not None or args.kernel_config or args.kernel_config_key
-                          or args.draft_quantization != 'auto'):
+                          or args.draft_quantization != 'auto' or args.draft_lookup or args.verify_rule != 'fixed'):
         parser.error('draft options require --draft or a target with an automatic DSpark head')
     return args
 

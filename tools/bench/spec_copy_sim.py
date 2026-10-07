@@ -16,7 +16,7 @@ from pathlib import Path
 ap = argparse.ArgumentParser()
 ap.add_argument('--prompt-source', default=str(Path(__file__).resolve().parents[2]),
                 help='checkout that supplied the run\'s prompt text (spec_lmbench --prompt-source; default: this checkout)')
-ap.add_argument('--model', default='nvidia/Qwen3.8-27B-NVFP4', help='tokenizer of the run\'s target')
+ap.add_argument('--model', required=True, help='the run\'s target checkpoint (path or hub id; its tokenizer)')
 ap.add_argument('--run', required=True)
 ap.add_argument('--min-match', type=int, default=3)
 ap.add_argument('--max-ngram', type=int, default=8)

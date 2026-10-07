@@ -7,7 +7,7 @@ the confidence head predicts c_k = P(accept k | accepted < k) and the cost rule 
 probabilities. Writes ``{"temperatures": [...], ...stats}`` for ``load_session(sts_path=...)`` /
 ``drafter_options={"sts": [...]}``. Run nothing else on the GPU meanwhile.
 
-    python tools/bench/spec_sts_fit.py --draft path/to/dspark-head --block 15 --out sts_b15.json
+    python tools/bench/spec_sts_fit.py --model path/to/target --draft path/to/dspark-head --block 15 --out sts_b15.json
 """
 import argparse
 import json
@@ -22,7 +22,7 @@ import numpy as np
 ap = argparse.ArgumentParser()
 ap.add_argument('--repo', default=str(Path(__file__).resolve().parents[2]),
                 help='lithos-metal checkout to import (default: the one containing this script)')
-ap.add_argument('--model', default='nvidia/Qwen3.8-27B-NVFP4')
+ap.add_argument('--model', required=True, help='target checkpoint (path or hub id)')
 ap.add_argument('--draft', default=None)
 ap.add_argument('--block', type=int, default=15)
 ap.add_argument('--max-new', type=int, default=160)

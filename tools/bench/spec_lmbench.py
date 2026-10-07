@@ -3,7 +3,7 @@ recipe-selected load_session): greedy, fixed-length generations (EOS ignored), p
 baseline JSON written by an earlier run. `--session-kw` entries override the serving options (verify rule, STS,
 drafter options), and every repetition records the per-round accepted / committed / verify-length / confidence logs.
 
-    python tools/bench/spec_lmbench.py --suite quick|full|long|prefill|agent --out run.json
+    python tools/bench/spec_lmbench.py --model path/to/target --suite quick|full|long|prefill|agent --out run.json
         [--repo path/to/lithos-metal] [--prompt-source path/to/fixed-checkout] [--baseline base.json]
         [--draft path/to/dspark-head | --no-draft] [--draft-block-size N] [--repeat 3]
         [--verify-rule fixed|cost] [--draft-lookup]
@@ -27,7 +27,7 @@ ap.add_argument('--prompt-source', default=None,
 ap.add_argument('--suite', default='quick', choices=['quick', 'full', 'long', 'prefill', 'agent'])
 ap.add_argument('--out', required=True)
 ap.add_argument('--baseline')
-ap.add_argument('--model', default='nvidia/Qwen3.8-27B-NVFP4')
+ap.add_argument('--model', required=True, help='target checkpoint (path or hub id)')
 ap.add_argument('--draft', default=None)
 ap.add_argument('--no-draft', action='store_true')
 ap.add_argument('--draft-block-size', type=int, default=None)
