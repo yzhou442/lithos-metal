@@ -124,17 +124,24 @@ The 35B-A3B uses one configuration across contexts. Selection happens once per r
 
 Heads whose config records `training_block_size` (a DSpark head trained at 16 positions) can serve up to
 `min(training_block_size - 1, 15)` proposals; `--draft-block-size 8` to `15` compiles the same recipes at a
-sixteen-row verification bound. Two opt-in rules decide how many rows a round verifies; neither changes greedy
-output, only how many tokens a round commits:
+sixteen-row verification bound. These opt-in rules decide how a round drafts and how many rows it verifies; none of
+them changes greedy output, only how many tokens a round commits, and all of them need a draft head:
 
 * `--verify-rule cost` picks each round's verification length from the drafter's confidence chain and the chip's
   measured whole-round cost per length (`recipes/dspark/verify-cost.json` in the backend, measured with
-  `tools/bench/spec_cost_table.py`). It applies to blocks above seven and to `--draft-lookup`; backends without
-  a table keep fixed verification.
+  `tools/bench/spec_cost_table.py`). It applies to blocks above seven and to `--draft-lookup`, and only to the
+  workload the table was measured on; otherwise verification stays fixed (a warning says so).
 * `--draft-lookup` extends a fully drafted block with a context-lookup continuation (the tokens that followed the
   latest earlier occurrence of the current suffix in the prompt or output) in verification rows 9-16. It helps
   copy-heavy requests such as file rewrites and structured edits; combine it with `--verify-rule cost`, which
   weighs the continuation by the request's measured lookup acceptance.
+* `--draft-adaptive-block` (with `--draft-block-size` above seven and `--verify-rule cost`) keeps a second,
+  eight-row decode program that drafts block 7 with the same head, and runs it while the cost rule rarely verifies
+  more than seven drafts (chat or reasoning text), probing the long block again periodically.
+* `--spec-sampling q` changes speculative sampling at temperature > 0 from "greedy drafts, accepted when the
+  target's sample equals them" (`match`, the default) to sampled drafts accepted with probability min(1, p/q) and
+  residual corrections. Both are exact (the output distribution is the target's); `q` accepts more drafts at
+  higher temperatures and applies top-p within the renormalized top-k. Greedy requests are unaffected.
 
 The checkpoint must include its tokenizer and chat template.
 Experimental support for NVIDIA's Qwen3.6-35B-A3B hybrid MoE, including its
@@ -204,7 +211,9 @@ The default context capacity is 32768; use `--max-context` to fit the model and 
 DSpark reserves another `block_size - 1` positions internally for its attention block (six for
 this drafter). Thus `--max-context 33018` uses the same 33024-position capacity as the earlier
 27B benchmarks. Changing capacity creates another cache entry rather than modifying an old pack.
-Large prompts use 128-token prefill chunks by default (`--prefill-chunk-size`). With an explicit
+Large prompts are prefilled in chunks (`--prefill-chunk-size`, default `auto-exact`: the chip's measured chunk
+for the model, 512 rows on the 40-core M5 Max recipe and 128 elsewhere, computed with the 128-row graph's
+reduction orders, so results are bit-identical to 128-row chunks). With an explicit
 fixed-verification decoder recipe, short prompts and cached tails of up to that length reuse
 the resident eight-row graph. This avoids remapping the prefill and decode weight layouts.
 Large prompts switch to the decoder for their final input rows before publishing any text,
@@ -255,12 +264,15 @@ accepted prompt rows, and the forward GDN pass retains state in registers throug
 the chunk. Temporary allocations are reused after their last consumer. Decode
 still uses the existing seven-proposal DSpark recipe.
 
-The measured throughput choice for this model/device is `--prefill-chunk-size 512`
-(`--prefill-chunk-size auto` selects it wherever a backend reports a measured size). The portable default remains
-128: 512-row chunks reduce in a different order, which can change greedy tokens on very long prompts. With 512-row
-chunks the prompt graph reads the decoder's packed weight files where the layouts allow, so the prompt and decoder
-engines (which stay allocated together whenever both fit in 0.9x Metal's recommended working set) share most of
-their weights and long requests no longer re-map them between prefill and decode. In isolated whole-program GPU measurements
+`--prefill-chunk-size` takes `128` (or any `N`), `N-exact`, `auto` or `auto-exact`. The default `auto-exact` uses
+the backend's measured chunk (512 rows for this model/device, 128 where a backend reports none) with the 128-row
+graph's reduction orders: logits and greedy tokens are bit-identical to 128-row chunks for every prompt length. A
+request whose 128-row chunking would end in a one-token chunk (one prompt-graph token past a multiple of 128) runs
+the 128-row reference path itself, because that token is computed by a one-row kernel there. `auto` (plain 512-row
+chunks) is the fastest path but reduces in a different order, which can change greedy tokens on very long prompts.
+With 512-row chunks the prompt graph reads the decoder's packed weight files where the layouts allow, so the prompt
+and decoder engines (which stay allocated together whenever both fit in 0.9x Metal's recommended working set) share
+most of their weights and long requests no longer re-map them between prefill and decode. In isolated whole-program GPU measurements
 (three samples after warmup, synthetic cached KV), 128-row chunks improved as
 follows; these numbers exclude HTTP, tokenizer, checkpoint and layout-transition
 costs and are not time to first token:

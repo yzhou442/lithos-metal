@@ -128,10 +128,17 @@ def test_cli_accepts_hub_ids_and_optional_cache():
     args = parse_args(['--model', 'org/target', '--draft', 'org/draft'])
     assert args.pack is None and args.draft == 'org/draft' and args.draft_kind == 'dspark'
     for flags in (['--draft-kind', 'lm'], ['--draft-pack', 'pack'], ['--kernel-config-key', '128'], ['--draft-lookup'],
-                  ['--verify-rule', 'cost'], ['--no-draft', '--draft-lookup'], ['--no-draft', '--verify-rule', 'cost']):
+                  ['--verify-rule', 'cost'], ['--no-draft', '--draft-lookup'], ['--no-draft', '--verify-rule', 'cost'],
+                  ['--spec-sampling', 'q'], ['--no-draft', '--spec-sampling', 'q'], ['--draft-adaptive-block'],
+                  ['--draft', 'org/draft', '--draft-adaptive-block'],                       # needs block > 7 + cost
+                  ['--draft', 'org/draft', '--draft-adaptive-block', '--draft-block-size', '15'],
+                  ['--draft', 'org/draft', '--draft-adaptive-block', '--verify-rule', 'cost']):
         with pytest.raises(SystemExit):
             parse_args(['--model', 'org/target', *flags])
     assert parse_args(['--model', 'org/target', '--draft', 'org/draft', '--draft-lookup', '--verify-rule', 'cost']).draft_lookup
+    args = parse_args(['--model', 'org/target', '--draft', 'org/draft', '--draft-block-size', '15', '--verify-rule', 'cost',
+                       '--draft-adaptive-block', '--spec-sampling', 'q'])
+    assert args.draft_adaptive_block and args.spec_sampling == 'q'
 
 
 def test_draft_options_survive_sampling_changes_and_metrics_are_per_request(monkeypatch):

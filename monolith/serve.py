@@ -432,8 +432,11 @@ def parse_args(argv=None):
     if args.draft_block_size is not None and args.draft_block_size < 1:
         parser.error('--draft-block-size must be positive')
     if not args.draft and (args.draft_pack or args.draft_revision or args.draft_block_size is not None or args.kernel_config or args.kernel_config_key
-                          or args.draft_quantization != 'auto' or args.draft_lookup or args.verify_rule != 'fixed'):
+                          or args.draft_quantization != 'auto' or args.draft_lookup or args.verify_rule != 'fixed'
+                          or args.spec_sampling != 'match' or args.draft_adaptive_block):
         parser.error('draft options require --draft or a target with an automatic DSpark head')
+    if args.draft_adaptive_block and not ((args.draft_block_size or 0) > 7 and args.verify_rule == 'cost'):
+        parser.error('--draft-adaptive-block requires --draft-block-size above 7 and --verify-rule cost')
     return args
 
 
