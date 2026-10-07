@@ -9,6 +9,9 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 
+MAX_SERVING_BLOCK = 15      # verify rows = block + 1 <= 16 (spec_ops.metal: cost[16], sts[16], conf_log width 16)
+
+
 @dataclass
 class DSparkConfig:
     hidden_size: int
@@ -31,6 +34,7 @@ class DSparkConfig:
     rope_type: str = "default"
     rope_parameters: Dict[str, Any] = field(default_factory=dict)
     architecture: str = ""                  # informational: the checkpoint's architectures[0]
+    training_block_size: Optional[int] = None   # the block the head was trained at (DeepSpec's training_block_size)
     extra: Dict[str, Any] = field(default_factory=dict)
 
     @classmethod
@@ -50,6 +54,7 @@ class DSparkConfig:
             target_hidden_size=d.get("target_hidden_size"), rope_type=str(rope.get("rope_type", "default")),
             rope_parameters=dict(rope),
             architecture=(d.get("architectures") or [""])[0],
+            training_block_size=(int(d["training_block_size"]) if d.get("training_block_size") else None),
         )
         if cfg.markov_head_type not in ("vanilla",):
             raise ValueError(f"unsupported markov_head_type {cfg.markov_head_type!r} (vanilla only)")
@@ -65,6 +70,14 @@ class DSparkConfig:
     @property
     def target_hidden(self) -> int:
         return self.target_hidden_size or self.hidden_size
+
+    @property
+    def max_block_size(self) -> int:
+        """The largest serving block (drafts per round) this head may run at: its configured block, or up to the
+        block it was trained at (a head trained at 16 positions drafts 15 and the verify pass takes anchor + 15 = 16
+        rows, the kernels' row limit: SelectParams.cost / ConfParams.sts / the confidence log hold 16 entries)."""
+        trained = min(int(self.training_block_size or 0), MAX_SERVING_BLOCK)
+        return max(int(self.block_size), trained)
 
     @property
     def n_taps(self) -> int:

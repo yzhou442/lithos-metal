@@ -78,6 +78,7 @@ class Session:
                  eos: Union[int, Sequence[int]] = -1, ring_capacity: int = 4096, temperature: float = 0.0, top_k: int = 0, top_p: float = 0.0,
                  min_p: float = 0.0, seed: int = 0, autotune: bool = True, drafter: Any = None, drafter_pack: Optional[str] = None,
                  verify: str = "cost", verify_threshold: Optional[float] = None, verify_length: Optional[int] = None,
+                 verify_cost: Optional[Sequence[float]] = None,
                  barriers: str = "minimal", attention: Optional[str] = None, fast_math: bool = False, accelerator: Optional[str] = None,
                  prefill_chunk_size: int = 128, commute_norm: bool = True, gdn_mixer_fusion: bool = True,
                  prefill_attention: Optional[str] = None, decoder_kernel_config: Optional[Dict[str, Any]] = None,
@@ -106,7 +107,9 @@ class Session:
             drafter.bind_target(model)
             bind_pack_formats(drafter, self.drafter_pack)
         if layout is None and drafter is not None:
-            layout = StepStateLayout(t_max=max(8, drafter.gamma + 1), gamma_max=max(7, drafter.gamma))
+            # verify bounds come in the two row counts the recipes compile for: 8, else 16 (blocks 8-15)
+            wide = drafter.gamma + 1 > 8 or getattr(drafter, "lookup", None) is not None   # a lookup extends past the block
+            layout = StepStateLayout(t_max=16 if wide else 8, gamma_max=max(7, drafter.gamma))
         decode_layout = layout or StepStateLayout()
         if not isinstance(prefill_chunk_size, int) or isinstance(prefill_chunk_size, bool) or prefill_chunk_size < 1:
             raise ValueError("prefill_chunk_size must be a positive integer")
@@ -132,6 +135,7 @@ class Session:
         # are independent. A large pending-token array does not enlarge decode ops.
         self.layout = StepStateLayout(max(prefill_chunk_size, decode_layout.t_max), decode_layout.gamma_max)
         self.verify, self.verify_threshold, self.verify_length = verify, verify_threshold, verify_length
+        self.verify_cost = None if verify_cost is None else [float(c) for c in verify_cost]
         self.barriers, self.attention, self.fast_math, self.accelerator = barriers, attention, fast_math, accelerator
         # Prompt chunks can need much larger matrix-attention partials than the
         # verification block. Allow a lower-memory prefill path independently.
@@ -292,7 +296,7 @@ class Session:
         prog = compile_program(self.model, self.pack, self.profile, t=bound, dynamic_t=dynamic, eos=self.eos,
                                ring_capacity=self.ring_capacity, layout=self.layout, tuner=None if prefill else self.tuner, drafter=self.drafter,
                                drafter_pack=self.drafter_pack, verify=self.verify, verify_threshold=self.verify_threshold,
-                               verify_length=self.verify_length, barriers=self.barriers,
+                               verify_length=self.verify_length, verify_cost=self.verify_cost, barriers=self.barriers,
                                attention=self.prefill_attention if prefill and self.prefill_attention is not None else self.attention,
                                accelerator=self.accelerator, commute_norm=self.commute_norm,
                                prefill=prefill, gdn_mixer_fusion=self.gdn_mixer_fusion)
@@ -308,8 +312,8 @@ class Session:
         if self.tuner is not None:
             self.tuner.save(self.dev.info().name)
         if self.decoder_kernel_config is not None and not prefill:
-            if not dynamic or bound != 8:
-                raise ValueError('explicit decoder recipes require a dynamic eight-row verification program')
+            if not dynamic or bound not in (8, 16):
+                raise ValueError('explicit decoder recipes require a dynamic eight- or sixteen-row verification program')
             from .compiler.barriers import place_barriers
             if self.decoder_kernel_config:
                 with using_backend(self.profile.backend) as backend:
@@ -343,7 +347,7 @@ class Session:
         # projection variants cover T=1 as well. Keep the compact weights and
         # ICB resident for short prompts/tails instead of remapping both packs.
         can_ingest = (self.decoder_kernel_config is not None and self.drafter is not None
-                      and self.verify == 'fixed' and (self.verify_length or 0) >= 1)
+                      and ((self.verify == 'fixed' and (self.verify_length or 0) >= 1) or self.verify == 'cost'))
         resident_prefill = can_ingest and p - offset <= self.resident_prefill_tokens
         keep = self._keep_both() if self.decoder_kernel_config is not None else False
         if self.decoder_kernel_config is not None and not resident_prefill and not keep:
@@ -368,7 +372,9 @@ class Session:
         if can_ingest and not resident_prefill:
             # Move to the compact decoder before the first output token. The
             # potentially expensive layout transition must not interrupt SSE.
-            boundaries.add(max(offset, p - self.decode_t_max))
+            # (at most eight rows: a sixteen-row decoder must see the same prompt rows the eight-row one does, so
+            # the target's cache holds the same values whatever the verify bound)
+            boundaries.add(max(offset, p - min(8, self.decode_t_max)))
         if cache is not None:
             # A reusable message prefix is enough for short tails. Copying a
             # second multi-GB checkpoint just before sampling costs more than

@@ -136,7 +136,8 @@ class DSparkDrafter(Drafter):
                  confidence_threshold: float = 0.0, sts: Optional[Sequence[float]] = None,
                  shared_embedding: bool = False, kernel_config: Optional[Dict[str, Any]] = None,
                  attention: Optional[str] = None, checkpoint_lm_head: bool = False,
-                 block_size: Optional[int] = None, vocab_subset: Optional[str] = None) -> None:
+                 block_size: Optional[int] = None, vocab_subset: Optional[str] = None,
+                 lookup: Optional[Dict[str, Any]] = None) -> None:
         """``target_lm_head``: fallback head when the draft checkpoint does not supply one (None when only packing).
         ``confidence_threshold``: the confident-prefix rule's threshold (≤ 0 verifies the whole block, the
         reference's default) used when the caller of ``lower_select`` has no cost table. ``sts``: per-position
@@ -145,8 +146,8 @@ class DSparkDrafter(Drafter):
         super().__init__(prefix="draft.")
         if block_size is not None:
             from dataclasses import replace
-            if isinstance(block_size, bool) or not isinstance(block_size, int) or not 1 <= block_size <= cfg.block_size:
-                raise ValueError(f"DSpark: block_size must be in 1..{cfg.block_size}")
+            if isinstance(block_size, bool) or not isinstance(block_size, int) or not 1 <= block_size <= cfg.max_block_size:
+                raise ValueError(f"DSpark: block_size must be in 1..{cfg.max_block_size}")
             cfg = replace(cfg, block_size=block_size)
         self.cfg, self.gamma, self.max_context = cfg, cfg.block_size, max_context
         self.kernel_config = kernel_config
@@ -154,6 +155,9 @@ class DSparkDrafter(Drafter):
         # default; LITHOS_DRAFT_VOCAB sets it for benches that build sessions through the serving setup.
         import os
         self.vocab_subset = vocab_subset if vocab_subset is not None else (os.environ.get('LITHOS_DRAFT_VOCAB') or None)
+        # context lookup (spec campaign): extend a whole-block verify with the continuation of the latest earlier
+        # occurrence of the context's suffix (prompt lookup) into the verify rows past the block; {} = defaults
+        self.lookup = None if lookup is None else dict(lookup)
         if attention not in (None, 'v1', 'mma', 'auto'):
             raise ValueError('draft attention must be v1, mma or auto')
         self.confidence_threshold = float(confidence_threshold)
@@ -271,7 +275,17 @@ class DSparkDrafter(Drafter):
         out: List[StateEntry] = []
         for blk in self.blocks:
             out += blk.mixer.state_entries()
+        if self.lookup is not None:
+            out.append(StateEntry("draft.token_hist", (self.max_context,), DType.I32))
         return out
+
+    def history_value(self, g: Graph) -> Optional[Value]:
+        """The committed-token history (``draft.token_hist``, one I32 per position) the accept scan writes and the
+        context lookup reads; None without the lookup."""
+        if self.lookup is None:
+            return None
+        name = "draft.token_hist"
+        return g.values[name] if name in g.values else g.state(name, (self.max_context,), DType.I32)
 
     def tables(self) -> Dict[str, Tuple[str, Any]]:
         from ...formats.fp import f32_to_bf16
@@ -426,12 +440,27 @@ class DSparkDrafter(Drafter):
         (the drafter's default when None; the whole block without a confidence head or with a threshold ≤ 0)."""
         sel = g.value("draft.verify_len", (1,), DType.U32)
         ins = [block.tokens] + ([block.confidences] if block.confidences is not None else [])
+        lookup_attrs = None
+        if self.lookup is not None:
+            if block.confidences is None:
+                raise ValueError("DSpark lookup extension needs the confidence head")
+            hist = self.history_value(g)
+            found = g.value("draft.lookup", (17,), DType.I32)
+            # the continuation follows the first `base` drafts (default: the whole block; a deeper block may hand its
+            # tail rows to the lookup when the confidence chain fades)
+            base = min(block.gamma, int(self.lookup.get('base', block.gamma)))
+            g.op("ngram_lookup", [hist, block.tokens], [found], domain=BlockDomain("span", 1), klass=OpClass.SERIAL,
+                 gamma=base)
+            ins.append(found)
+            lookup_attrs = dict(self.lookup)
         thr = self.confidence_threshold if threshold is None else float(threshold)
         attrs: Dict[str, Any] = dict(gamma=block.gamma, threshold=thr if block.confidences is not None else 0.0)
         if fixed is not None:
             attrs["fixed"] = int(fixed)
         elif cost is not None and block.confidences is not None:
             attrs["cost"] = [float(c) for c in cost]
+        if lookup_attrs is not None:
+            attrs["lookup"] = lookup_attrs
         g.op("verify_select", ins, [sel], domain=BlockDomain("span", 1), klass=OpClass.SERIAL, **attrs)
         return sel
 

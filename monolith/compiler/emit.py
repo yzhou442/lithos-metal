@@ -16,6 +16,8 @@ compiles to that count.
 
 from __future__ import annotations
 
+import struct
+
 from ..backends.metal.context import dispatch, current_backend
 
 from dataclasses import dataclass, field
@@ -532,7 +534,7 @@ def _norm_output(ctx: _Ctx, v: Value) -> Optional[Tuple[str, Dict[str, str], Tup
             continue
         tm, wpw, tk, t_src, lo, hi = plan
         info = ctx.slab_info(c.inputs[1].name)
-        if not 2 <= hi <= 8 or (info.format == "bf16" and info.k == 1024 and hi == 4):
+        if not 2 <= hi <= 16 or (info.format == "bf16" and info.k == 1024 and hi == 4):
             continue  # the small BF16 path uses a separate SIMD kernel
         if ctx.rows_of(v.producer) != (hi, t_src):
             continue
@@ -1070,16 +1072,16 @@ def _gdn(ctx: _Ctx, op: Op) -> None:
     prepared_blocks = hv * (dv // 4)
     if prepared:
         macros.update(PREPARED="1", SPB="1u", SL="4u", TP="8u")
-    local_prepare = (prepared and ctx.t in (1, 4, 6, 8) and dk == dv == 128 and hv >= 16
+    local_prepare = (prepared and ctx.t in (1, 4, 6, 8, 16) and dk == dv == 128 and hv >= 16
                      and len(o_part.consumers) == 1 and o_part.consumers[0].kind == "gdn_norm")
     fuse_norm = local_prepare and ctx.t == 1
     local_groups = 16 if ctx.t == 4 else 32
     if local_prepare:
         # Multi-token recurrence can overlap the gate projection. Smaller slices
         # at T=6/8 provide more independent work without duplicating device state.
-        sl = 2 if ctx.t in (6, 8) else 4
+        sl = 2 if ctx.t in (6, 8, 16) else 4
         prepared_blocks = hv * (dv // sl)
-        macros.update(LOCAL_PREPARE="1", SINGLE_PASS="1", LOCAL_GROUPS=f"{local_groups}u", SL=f"{sl}u", TP=f"{min(8, ctx.t)}u")
+        macros.update(LOCAL_PREPARE="1", SINGLE_PASS="1", LOCAL_GROUPS=f"{local_groups}u", SL=f"{sl}u", TP=f"{min(16, ctx.t)}u")
     main, abv = projs[ps["in_proj_qkv"][0]], projs[ps["in_proj_a"][0]]
     preconvolved = not commit and main.name in ctx.preconvolved
     if preconvolved:
@@ -1231,7 +1233,16 @@ def _verify_select(ctx: _Ctx, op: Op) -> None:
     gamma = int(op.attrs["gamma"])
     if gamma > ctx.layout.gamma_max or gamma + 1 > ctx.layout.t_max:
         raise ValueError(f"verify_select: gamma {gamma} exceeds the layout (gamma_max {ctx.layout.gamma_max}, t_max {ctx.layout.t_max})")
-    k = ctx.kernel("spec_ops", _spec_ops(ctx), "verify_select", {})
+    lookup = op.inputs[2] if len(op.inputs) > 2 else None
+    lk = op.attrs.get("lookup")
+    macros = {}
+    if lookup is not None:
+        lk = dict(lk or {})
+        macros = dict(LOOKUP="1", LOOKUP_NMIN=f"{int(lk.get('nmin', 2))}u", LOOKUP_NMAX=f"{int(lk.get('nmax', 4))}u",
+                      LOOKUP_ROWS="16u", LOOKUP_Q=f"{float(lk.get('q', 0.6))}f", LOOKUP_Q2=f"{float(lk.get('q2', 0.45))}f",
+                      LOOKUP_MIN_SURVIVAL=f"{float(lk.get('min_survival', 0.0))}f",
+                      LOOKUP_BASE=f"{int(lk.get('base', gamma))}u")
+    k = ctx.kernel("spec_ops", _spec_ops(ctx), "verify_select", macros)
     cost = op.attrs.get("cost") if conf is not None else None
     fixed = op.attrs.get("fixed")
     if fixed is not None:
@@ -1240,22 +1251,46 @@ def _verify_select(ctx: _Ctx, op: Op) -> None:
         mode, thr = 1, float(op.attrs.get("threshold", 0.0))
     else:
         mode, thr = 0, (float(op.attrs.get("threshold", 0.0)) if conf is not None else 0.0)
+    # the lookup extension: bit 0 = append when it pays (cost rule) / always (fixed), bit 1 = after a wholly accepted block
+    # lift the block's survival (opt-in: measured code +0..4 %, but doc4k -5 % / doc16k -2 % vs bit 0; spec_policy_ab.py)
+    ext_enable = (1 | (2 if (lk or {}).get('prev_full', False) else 0)) if lookup is not None else 0
     prm = ctx.params("verify_select", kernels.select_params(gamma, thr, ctx.t, mode=mode, cost=cost, log_cap=kernels.ACCEPT_LOG_CAP,
-                                                            ctx_cap=ctx.ctx_cap_target, lm=bool(op.attrs.get("lm"))))
+                                                            ctx_cap=ctx.ctx_cap_target, lm=bool(op.attrs.get("lm")), ext_enable=ext_enable))
     ctx.program.buffers.setdefault(CONF_LOG, BufferSpec(kernels.ACCEPT_LOG_CAP * kernels.CONF_LOG_WIDTH * 4, None, "arena"))
     cb = ctx.buf(conf) if conf is not None else (ctx.scratch("verify_select.conf", gamma * 4), 0)
-    ctx.add(k, [(0, *ctx.buf(drafts)), (1, *cb), (2, ctx.program.step_state, 0), (3, prm, 0), (4, CONF_LOG, 0)], (1, 1, 1), (32, 1, 1), op.kind,
-            writes=[2, 4])
+    bindings = [(0, *ctx.buf(drafts)), (1, *cb), (2, ctx.program.step_state, 0), (3, prm, 0), (4, CONF_LOG, 0)]
+    if lookup is not None:
+        bindings.append((5, *ctx.buf(lookup)))
+    ctx.add(k, bindings, (1, 1, 1), (32, 1, 1), op.kind, writes=[2, 4])
 
 
 def _accept_scan(ctx: _Ctx, op: Op) -> None:
-    token, = op.inputs
-    k = ctx.kernel("spec_ops", _spec_ops(ctx), "accept_scan", kernels.eos_macros(ctx.eos))
+    token = op.inputs[0]
+    hist = op.inputs[1] if len(op.inputs) > 1 else None
+    macros = dict(kernels.eos_macros(ctx.eos))
+    if hist is not None:
+        macros.update(HIST="1", HIST_CAP=f"{ctx.shape(hist)[0]}u")
+    k = ctx.kernel("spec_ops", _spec_ops(ctx), "accept_scan", macros)
     prm = ctx.params("accept_scan", kernels.accept_params(ctx.ring_capacity, ctx.eos, kernels.ACCEPT_LOG_CAP, ctx_cap=ctx.ctx_cap,
                                                           lm=bool(op.attrs.get("lm"))))
     ctx.program.buffers.setdefault(ACCEPT_LOG, BufferSpec(kernels.ACCEPT_LOG_CAP * 4, None, "arena"))
-    ctx.add(k, [(0, *ctx.buf(token)), (1, ctx.program.step_state, 0), (2, ctx.program.ring, 0), (3, prm, 0), (4, ACCEPT_LOG, 0)],
-            (1, 1, 1), (32, 1, 1), op.kind, writes=[1, 2, 4])
+    bindings = [(0, *ctx.buf(token)), (1, ctx.program.step_state, 0), (2, ctx.program.ring, 0), (3, prm, 0), (4, ACCEPT_LOG, 0)]
+    if hist is not None:
+        bindings.append((5, *ctx.buf(hist)))
+    ctx.add(k, bindings, (1, 1, 1), (32, 1, 1), op.kind, writes=[1, 2, 4] + ([5] if hist is not None else []))
+
+
+def _ngram_lookup(ctx: _Ctx, op: Op) -> None:
+    """The context lookup (spec campaign): one threadgroup scans the committed-token history for the latest earlier
+    occurrence of the context's suffix (with the drafter's block appended) and reports its continuation."""
+    hist, drafts = op.inputs
+    out = op.outputs[0]
+    gamma = int(op.attrs["gamma"])
+    cap = ctx.shape(hist)[0]
+    k = ctx.kernel("spec_ops", _spec_ops(ctx), "ngram_lookup", {})
+    prm = ctx.params("ngram_lookup", struct.pack("<IIII", gamma, cap, 0, 0))
+    ctx.add(k, [(0, *ctx.buf(hist)), (1, *ctx.buf(drafts)), (2, *ctx.buf(out)), (3, prm, 0)], (1, 1, 1), (1024, 1, 1), op.kind,
+            writes=[2])
 
 
 def _moe_route(ctx: _Ctx, op: Op) -> None:
@@ -1328,7 +1363,7 @@ HANDLERS = {"embed": _embed, "rmsnorm_stat": _rmsnorm_stat, "norm_apply": _norm_
             "gqa_decode": _gqa, "gqa_merge": _gqa_merge, "gdn_mixer": _gdn, "gdn_commit": _gdn, "gdn_norm": _gdn_norm, "argmax": _argmax,
             "sample": _sample,
             "tap_concat": _tap_concat, "draft_attn": _draft_attn, "confidence": _confidence, "verify_select": _verify_select,
-            "accept_scan": _accept_scan}
+            "accept_scan": _accept_scan, "ngram_lookup": _ngram_lookup}
 
 
 @dispatch("emit")
@@ -1485,7 +1520,9 @@ def lower_round(g: Graph, model: Model, drafter: Any, token: Value, profile: Pro
 
     acc = g.value("accepted", (1,), DType.U32)
     lm = bool(getattr(drafter, "lm_drafter", False))          # an LM drafter: the scan's bookkeeping differs (design §5.8)
-    g.op("accept_scan", [token], [acc], domain=BlockDomain("span", 1), klass=OpClass.SERIAL, **({"lm": True} if lm else {}))
+    hist = drafter.history_value(g) if hasattr(drafter, "history_value") else None
+    g.op("accept_scan", [token] + ([hist] if hist is not None else []), [acc], domain=BlockDomain("span", 1), klass=OpClass.SERIAL,
+         **({"lm": True} if lm else {}))
     for op in list(g.ops):
         ck = op.attrs.get("commit_kind")
         if ck:
@@ -1505,7 +1542,8 @@ def lower_round(g: Graph, model: Model, drafter: Any, token: Value, profile: Pro
 def compile_program(model: Model, pack: PackFile, profile: Profile, *, t: Optional[int] = None, eos: Union[int, Sequence[int]] = -1, ring_capacity: int = 4096,
                     layout: Optional[StepStateLayout] = None, tg: int = 384, passes=DEFAULT_PASSES, dynamic_t: bool = False,
                     tuner: Any = None, drafter: Any = None, drafter_pack: Optional[PackFile] = None, verify: str = "cost",
-                    verify_threshold: Optional[float] = None, verify_length: Optional[int] = None, barriers: str = "minimal",
+                    verify_threshold: Optional[float] = None, verify_length: Optional[int] = None,
+                    verify_cost: Optional[Sequence[float]] = None, barriers: str = "minimal",
                     attention: Optional[str] = None, accelerator: Optional[str] = None, prefill: bool = False, commute_norm: bool = True,
                     gdn_mixer_fusion: bool = True) -> Program:
     """Lower ``model``, run the ``passes`` and emit its step program (see :func:`emit_program`). With a ``drafter``
@@ -1539,7 +1577,17 @@ def compile_program(model: Model, pack: PackFile, profile: Profile, *, t: Option
         if verify_length is None or not 0 <= verify_length <= drafter.gamma:
             raise ValueError(f"compile_program: verify='fixed' needs verify_length in 0..{drafter.gamma}")
         fixed = int(verify_length)
+    if verify == "cost" and verify_cost is None and getattr(drafter, "lookup", None) is not None:
+        raise ValueError("compile_program: the lookup extension with the cost rule needs a measured verify_cost table")
     cost = verify_costs(profile, pack, drafter.gamma, t or layout.t_max, accelerator) if verify == "cost" else None
+    if verify == "cost" and verify_cost is not None:
+        # a measured whole-round cost per verify length (l = 0 … γ drafts, relative units; spec_cost_table.py)
+        n = min(drafter.gamma, (t or layout.t_max) - 1) + 1
+        if getattr(drafter, "lookup", None) is not None:
+            n = min(t or layout.t_max, 16)           # the lookup extends the verify past the block: l = 0 … 15
+        if len(verify_cost) < n or any(not c > 0 for c in verify_cost[:n]):
+            raise ValueError(f"compile_program: verify_cost needs {n} positive entries (l = 0 … {n - 1})")
+        cost = [float(c) / float(verify_cost[0]) for c in verify_cost[:n]]
     if cost is None and fixed is None and verify_threshold is None:
         verify_threshold = FALLBACK_THRESHOLD           # no cost table (or the threshold rule asked for without a threshold)
     lower_round(g, model, drafter, token, profile, cost=cost, threshold=verify_threshold, fixed=fixed)

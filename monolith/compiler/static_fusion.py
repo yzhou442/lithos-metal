@@ -209,6 +209,13 @@ def normalize(p,sgs,mode="coop",groups=None, *, tn=16, split=False,
                               'gqa_decode_mma','gqa_merge'):
             raise ValueError(f'unsupported experimental task: {k.function}')
         if k.function=='gemm_tile':
+            # A sixteen-row verification program emits TM16 tiles predicated up to T_HI=16; the native/staged
+            # tiles and the compact partial bound follow it. Eight-row programs keep TM8 / T_HI=8 exactly.
+            emitted_tm=int(str(k.macros.get('TM','8')).rstrip('u'))
+            if emitted_tm>16 and mode in ('native','staged'):
+                raise ValueError('native/staged task tiles support at most sixteen token rows')
+            native_tm='16' if emitted_tm==16 else '8'
+            rows_hi=int(str(k.macros.get('T_HI','16')).rstrip('u')) if emitted_tm==16 else 8
             if post_norm_once is not None:k.macros['POST_NORM_ONCE']=str(int(post_norm_once))
             if post_norm_loads!=16 and k.macros.get('POST_NORM')=='1':
                 start=k.source.index('    for (uint b = q; b < POST_NORM_PARTS; b += 64u)')
@@ -248,11 +255,11 @@ def normalize(p,sgs,mode="coop",groups=None, *, tn=16, split=False,
                 if mode=='native':
                     if staged_tk is None:raise ValueError('native tuning requires an explicit reduction tile')
                     k.macros['STATIC_NATIVE_TENSOR']='1'
-                    k.macros.update(TM='8',TN=f'{tn}u',TK=f'{staged_tk}u',SCALE_CACHE='0')
+                    k.macros.update(TM=native_tm,TN=f'{tn}u',TK=f'{staged_tk}u',SCALE_CACHE='0')
                 elif mode=='staged':
                     if staged_tk is not None:
                         if tn not in (16,32) and not (nvfp4_layout=='tile' and tn in (64,128)):raise ValueError('unsupported staged output tile')
-                        k.macros.update(TM='8',TN=f'{tn}u',TK=f'{staged_tk}u',SCALE_CACHE='0')
+                        k.macros.update(TM=native_tm,TN=f'{tn}u',TK=f'{staged_tk}u',SCALE_CACHE='0')
                     k.source=k.source.replace('tensor<device bfloat,', 'tensor<threadgroup bfloat,')
                     k.source=k.source.replace('tA_t tA(xp, dextents<int, 2>(int(K), int(TM)));',f'threadgroup bfloat activations[{sgs}][TK * TM];')
                     k.source=k.source.replace('auto sA = tA.slice<int(TK), int(TM)>(int(kp * TK), 0);', f"""for (uint ai=lane; ai<TK*TM; ai+=32u)
@@ -328,12 +335,12 @@ def normalize(p,sgs,mode="coop",groups=None, *, tn=16, split=False,
                     # The cooperative accumulator still has sixteen token rows.
                     # Keep lower predicates (e.g. injected rows > 1) mutually
                     # exclusive with their shader variant.
-                    k.macros.update(T_HI='8u', COMPACT_PARTIALS='1')
+                    k.macros.update(T_HI=f'{rows_hi}u', COMPACT_PARTIALS='1')
                     # Cooperative MMA pads to sixteen rows, but only the first
                     # eight are live. POST_NORM's one scalar per lane covers
                     # exactly those rows at a native-producer boundary.
-                    k.source=k.source.replace('#if TM > 8\n#error POST_NORM requires a short tile',
-                        f'#if TM > {tm} || T_HI > 8\n#error POST_NORM requires at most eight active rows')
+                    k.source=k.source.replace('#if TM > 16\n#error POST_NORM covers at most sixteen token rows',
+                        f'#if TM > {max(tm, int(native_tm))} || T_HI > 16\n#error POST_NORM covers at most sixteen active rows')
                     if tm==32 and mode=='coop':
                         # Only the first eight token rows are live, including
                         # when the matrix descriptor pads its height to 32.

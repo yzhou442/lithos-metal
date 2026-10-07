@@ -27,3 +27,7 @@ class Backend(MetalBackend):
         if recipes and any(r.get('target') for r in recipes.values() if isinstance(r, dict)):
             return 512
         return None
+
+    def serving_verify_costs(self):
+        from .serving import verify_costs
+        return verify_costs()

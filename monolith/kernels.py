@@ -751,17 +751,19 @@ CONF_LOG_WIDTH = 16
 
 
 def select_params(gamma: int, threshold: float, t_max: int, mode: int = 0, cost: Optional[Sequence[float]] = None, log_cap: int = 0,
-                  ctx_cap: int = 0, lm: bool = False) -> bytes:
+                  ctx_cap: int = 0, lm: bool = False, ext_enable: int = 1) -> bytes:
     """The ``SelectParams`` record: mode 0 = the confident-prefix rule (``threshold``), 1 = the cost-aware rule with
     ``cost[l]`` = the relative cost of a (1 + l)-token target pass for l = 0 … γ (≤ 16 entries; cost[0] = 1),
-    2 = a fixed verify length (``threshold`` = L). ``log_cap`` > 0 logs the block's confidences per step; ``ctx_cap``
+    2 = a fixed verify length (``threshold`` = L). ``ext_enable`` (programs with the context lookup): bit 0 = append the
+    lookup's continuation (cost rule: when it pays; fixed: when the block's survival reaches LOOKUP_MIN_SURVIVAL), bit 1 =
+    also (fixed: only) after a wholly accepted block. ``log_cap`` > 0 logs the block's confidences per step; ``ctx_cap``
     > 0 (the target's KV rows) clamps L so the verify rows stay inside the caches. ``lm``: an LM drafter (design §5.8):
     the select records the drafter's context length as the position it ingested plus the chain's γ rows."""
     c = list(cost or [])
     if mode == 1 and (len(c) < 1 or len(c) > 16 or abs(c[0] - 1.0) > 1e-6 or any(x <= 0 for x in c)):
         raise ValueError("select_params: the cost rule needs 1..16 positive costs relative to cost[0] = 1")
     c = c + [1.0] * (16 - len(c))
-    return struct.pack("<IfII16fIIII", gamma, threshold, t_max, mode, *c, log_cap, ctx_cap, 1 if lm else 0, 0)
+    return struct.pack("<IfII16fIIII", gamma, threshold, t_max, mode, *c, log_cap, ctx_cap, 1 if lm else 0, int(ext_enable))
 
 
 ACCEPT_LOG_CAP = 65536

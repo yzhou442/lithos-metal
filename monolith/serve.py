@@ -381,6 +381,11 @@ def parse_args(argv=None):
     draft.add_argument("--no-draft", action='store_true', help="Disable automatic DSpark speculative decoding")
     parser.add_argument("--draft-kind", choices=['dspark'], default='dspark')
     parser.add_argument("--draft-block-size", type=int, help="Draft proposals per round (default: up to seven, plus one target anchor)")
+    parser.add_argument("--verify-rule", choices=['fixed', 'cost'], default='fixed',
+                        help="fixed: verify the whole block; cost: per-round verify length from the confidence chain and the chip's "
+                             "measured round-cost table (blocks above 7 / the lookup extension pay a 9-16-row step)")
+    parser.add_argument("--draft-lookup", action='store_true',
+                        help="Extend a whole-block verify with the context-lookup continuation (prompt lookup) into rows 9-16")
     parser.add_argument("--pack", help="Local pack-cache directory (default: $XDG_CACHE_HOME/lithos-metal/packs; reuses legacy cache); existing packs also accepted")
     parser.add_argument("--draft-pack", help="Optional separate draft cache or existing draft pack")
     parser.add_argument("--draft-quantization", choices=['auto', 'none', 'nvfp4'], default='auto',

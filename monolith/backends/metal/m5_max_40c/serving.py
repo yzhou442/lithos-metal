@@ -21,7 +21,7 @@ def recipes(model, drafter, quantization):
         return {}
     if tuple(getattr(draft, k, None) for k in fields) != (5120, 17408, 5, 32, 8, 128, 248320):
         return {}
-    if (draft.block_size != 7 or draft.target_layer_ids != [5, 19, 33, 47, 61]
+    if (not 1 <= draft.block_size <= 15 or draft.target_layer_ids != [5, 19, 33, 47, 61]
             or draft.markov_rank != 256 or draft.target_hidden != 5120):
         return {}
     shape = tuple(getattr(target, k, None) for k in ('linear_num_key_heads', 'linear_num_value_heads',
@@ -44,4 +44,14 @@ def recipes(model, drafter, quantization):
     for key in ('4096', '8192', '16384'):
         selected[key] = copy.deepcopy(selected['32768'])
         selected[key]['target'] = contexts[key]['target']
+    # The recipes were measured at block 7 (verify 8 rows); blocks 8-15 compile the same recipes at the sixteen-row
+    # bound (TM16 tiles, T_HI 16, single-pass GDN at T <= 16: static_fusion / emit), with every per-row result equal.
     return selected
+
+
+def verify_costs():
+    """Measured full-round GPU ms per verify length l = 0 … 15 (l = 0 as l = 1) for the sixteen-row programs, per
+    context tier: ``b15`` = block 15 drafts; ``b7lk`` = block 7 drafts + the context-lookup extension in rows 9-16.
+    The cost-aware verify rule (``verify='cost'``) uses them relative to l = 0 (tools/bench/spec_cost_table.py)."""
+    path = Path(__file__).parent / 'recipes' / 'dspark' / 'verify-cost.json'
+    return json.loads(path.read_text()) if path.exists() else {}
