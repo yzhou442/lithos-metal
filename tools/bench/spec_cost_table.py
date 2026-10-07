@@ -1,4 +1,4 @@
-"""Measured cost(T) of the DSpark round under the exact serving configuration (spec campaign, M5 Max).
+"""Measured cost(T) of the DSpark round under the exact serving configuration.
 
 Builds the serving assets like ``lithos-metal serve`` (``serving.setup.prepare`` + the recipe-selected
 ``load_session``), prefills a real prompt, snapshots StepState and the recurrent states, then replays single rounds
@@ -9,7 +9,10 @@ round (verification + accept/commit + next draft + select) and, once, the accept
 Optionally attributes the verification span to kernel functions with per-dispatch timestamps (re-encoded, so the
 absolute numbers carry encoder gaps; use the shares and the T-scaling, not the totals).
 
-    gpu_run --agent spec -- python tools/bench/spec_cost_table.py --repo . --block 15 --ls 1,3,7,11,15 --out x.json
+    python tools/bench/spec_cost_table.py --block 15 --ls 1,3,7,11,15 [--draft path/to/dspark-head] --out cost.json
+
+Run nothing else on the GPU meanwhile; the output's per-L full-round medians are the format of
+monolith/backends/metal/<backend>/recipes/dspark/verify-cost.json.
 """
 import argparse
 import gc
@@ -21,7 +24,8 @@ import time
 from pathlib import Path
 
 ap = argparse.ArgumentParser()
-ap.add_argument('--repo', required=True)
+ap.add_argument('--repo', default=str(Path(__file__).resolve().parents[2]),
+                help='lithos-metal checkout to import (default: the one containing this script)')
 ap.add_argument('--model', default='nvidia/Qwen3.8-27B-NVFP4')
 ap.add_argument('--draft', default=None)
 ap.add_argument('--block', type=int, default=None, help='serving block (drafts per round); default the serve default')

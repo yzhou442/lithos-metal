@@ -1,8 +1,8 @@
 """CPU-only compile of the serving decode program (no Metal device, no dispatch): build the exact serve-time
 Program for a head / block / recipe choice and report its dispatches per kernel function, or the compile error.
-A fake device stands in for the M5 Max so iterating on compiler/recipe changes never takes the GPU lock.
+A fake device stands in for the M5 Max so iterating on compiler/recipe changes never needs the GPU.
 
-    python tools/bench/spec_compile_check.py --repo . --block 15 [--target-recipe-key 128] [--dump ops.txt]
+    python tools/bench/spec_compile_check.py --block 15 [--target-recipe-key 128] [--dump ops.txt]
 """
 import argparse
 import collections
@@ -15,7 +15,8 @@ import traceback
 from pathlib import Path
 
 ap = argparse.ArgumentParser()
-ap.add_argument('--repo', required=True)
+ap.add_argument('--repo', default=str(Path(__file__).resolve().parents[2]),
+                help='lithos-metal checkout to import (default: the one containing this script)')
 ap.add_argument('--model', default='nvidia/Qwen3.8-27B-NVFP4')
 ap.add_argument('--draft', default=None)
 ap.add_argument('--block', type=int, default=None)

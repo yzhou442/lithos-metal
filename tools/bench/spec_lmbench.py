@@ -1,24 +1,29 @@
-"""[spec campaign copy of ~/lmopt/bin/lmbench.py: identical prompts/metrics; --session-kw entries override the serving
-options instead of being added beside them (verify rule, STS, drafter options), and every repetition records the
-per-round accepted / committed / verify-length / confidence logs.]
-End-to-end lithos-metal benchmark with the exact `lithos-metal serve` configuration (serving.setup.prepare + the
-recipe-selected load_session), greedy, fixed-length (EOS ignored), plus a token-identity check against a baseline.
+"""End-to-end lithos-metal benchmark under the exact `lithos-metal serve` configuration (serving.setup.prepare + the
+recipe-selected load_session): greedy, fixed-length generations (EOS ignored), plus a token-identity check against a
+baseline JSON written by an earlier run. `--session-kw` entries override the serving options (verify rule, STS,
+drafter options), and every repetition records the per-round accepted / committed / verify-length / confidence logs.
 
-usage (always through gpu_run):
-  gpu_run --agent NAME -- ~/lmopt/venv/bin/python ~/lmopt/bin/lmbench.py --repo ~/lmopt/wt/NAME \
-      --suite quick|full|long --out ~/lmopt/results/NAME/run1.json [--baseline ~/lmopt/results/baseline/full.json]
-      [--draft PATH_OR_HUB_ID | --no-draft] [--draft-block-size N] [--repeat 2]
+    python tools/bench/spec_lmbench.py --suite quick|full|long|prefill|agent --out run.json
+        [--repo path/to/lithos-metal] [--prompt-source path/to/fixed-checkout] [--baseline base.json]
+        [--draft path/to/dspark-head | --no-draft] [--draft-block-size N] [--repeat 3]
+        [--verify-rule fixed|cost] [--draft-lookup]
+
+`--repo` (default: the checkout containing this script) is the code that runs; `--prompt-source` (default: `--repo`)
+supplies the document and `agent` prompt text (tools/bench/spec_prompts.py), so pass one fixed checkout when comparing
+commits. Run nothing else on the GPU meanwhile.
 
 Metrics per prompt: prefill tok/s (prompt tokens / prefill wall), decode tok/s (generated tokens after the first /
 decode wall), tokens per round, mean accepted drafts, GPU ms per token. Summary = geometric means over the suite.
-`identical` = every generated token equals the baseline's for that prompt (greedy). A change that alters numerics
-must say so; the integration gate is identity on the quick+full suites unless a numerics change is agreed.
+`identical` = every generated token equals the baseline's for that prompt (greedy).
 """
 import argparse, json, math, os, sys, time
 from pathlib import Path
 
 ap = argparse.ArgumentParser()
-ap.add_argument('--repo', required=True, help='lithos-metal checkout to import (worktree)')
+ap.add_argument('--repo', default=str(Path(__file__).resolve().parents[2]),
+                help='lithos-metal checkout to import (default: the one containing this script)')
+ap.add_argument('--prompt-source', default=None,
+                help='checkout whose files supply the document/agent prompt text (default: --repo)')
 ap.add_argument('--suite', default='quick', choices=['quick', 'full', 'long', 'prefill', 'agent'])
 ap.add_argument('--out', required=True)
 ap.add_argument('--baseline')
@@ -50,48 +55,9 @@ from transformers import AutoTokenizer
 
 assert Path(monolith.__file__).resolve().is_relative_to(Path(a.repo).expanduser().resolve()), monolith.__file__
 
-DOC = Path(a.repo).expanduser() / 'docs' / 'design' / 'design.md'
-DOC2 = Path(a.repo).expanduser() / 'docs' / 'research' / 'apple-gpu-probes.md'
-SYS_WEB = ('You are a coding expert. Produce a complete, self-contained single HTML file with inline CSS and '
-           'JavaScript. Output only the code.')
-PROMPTS = {
-    'code': ([{'role': 'user', 'content': 'Write a Python function that parses an ISO-8601 timestamp without '
-              'using the datetime module. Include a docstring, input validation and unit tests.'}], 256),
-    'chat': ([{'role': 'user', 'content': 'Explain to a curious high-school student how attention works in a '
-              'transformer language model, with an everyday analogy.'}], 256),
-    'math': ([{'role': 'user', 'content': 'A train leaves at 9:40 travelling 84 km/h; a second train leaves the '
-              'same station at 10:05 at 102 km/h on a parallel track. When and where does the second catch up? '
-              'Solve step by step.'}], 256),
-    'web': ([{'role': 'system', 'content': SYS_WEB},
-             {'role': 'user', 'content': 'Build a pricing page with three tiers, a monthly/yearly toggle and a '
-              'feature comparison table.'}], 384),
-    'tool': ([{'role': 'user', 'content': 'Here is a shell session:\n$ ls src\nmain.rs lib.rs parser.rs\n$ cargo test\n'
-              'error[E0308]: mismatched types\n --> src/parser.rs:42:17\n   |\n42 |     let n: u32 = tok.len();\n'
-              '   |            ---   ^^^^^^^^^ expected `u32`, found `usize`\n\nExplain the error and give the fixed '
-              'line plus a short justification.'}], 192),
-}
-def doc_prompt(n_chars, ask, max_new):
-    text = (DOC.read_text() + '\n\n' + DOC2.read_text()) * 4
-    return ([{'role': 'user', 'content': text[:n_chars] + '\n\n' + ask}], max_new)
-# agentic, copy-heavy prompts (spec campaign): rewrite a file the prompt contains
-_BASE = Path('~/lmopt/base').expanduser()      # fixed source text (the base commit), whatever repo is measured
-_SETUP = (_BASE / 'monolith' / 'serving' / 'setup.py').read_text()
-_RECIPE = json.dumps(json.loads((_BASE / 'monolith' / 'backends' / 'metal' / 'm5_max_40c' / 'recipes' / 'dspark'
-                                / 'selected-nvfp4-endpoints.json').read_text())['128']['target'], indent=1)
-PROMPTS['edit'] = ([{'role': 'user', 'content': 'Here is a Python module:\n```python\n' + _SETUP + '```\nAdd a one-line docstring to '
-                     'every function and method that lacks one, change nothing else, and output the complete updated file.'}], 640)
-PROMPTS['json'] = ([{'role': 'user', 'content': 'Here is a JSON config:\n```json\n' + _RECIPE + '\n```\nChange every "workers" value '
-                     'of 160 to 192 and every "sgs" value of 4 to 8. Output the complete updated JSON only.'}], 512)
-SUITES = {
-    'agent': ['edit', 'json'],
-    'quick': ['code', 'chat', 'web'],
-    'full': ['code', 'chat', 'math', 'web', 'tool', 'doc4k'],
-    'long': ['doc4k', 'doc16k'],
-    'prefill': ['doc4k', 'doc16k', 'doc28k'],
-}
-LONG = {'doc4k': (14000, 'Summarize the key design decisions above in 8 bullet points.', 192),
-        'doc16k': (58000, 'List the five most important measured hardware facts above and why each matters.', 160),
-        'doc28k': (100000, 'Give a one-paragraph summary.', 32)}
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from spec_prompts import load_prompts
+PROMPTS, SUITES, LONG, doc_prompt = load_prompts(a.prompt_source or a.repo)
 
 class NS:  # argparse-like namespace for serving.setup.prepare
     pass

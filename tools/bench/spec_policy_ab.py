@@ -1,14 +1,16 @@
-"""Paired, interleaved A/B of verify policies inside ONE serve-config session (spec campaign).
+"""Paired, interleaved A/B of verify policies inside ONE serve-config session.
 
 One program carries every policy's ops (the drafter's block, the optional context lookup and the cost-aware
 select); a policy only rewrites the verify_select / confidence parameter records (mode, fixed L, cost table,
 lookup on/off, STS temperatures) before a generation. Each prompt runs reps x policies, the policy order rotating
 per rep, so slow drift of the machine (clocks, other load) hits every policy alike. Reports per policy and prompt
-the median decode tok/s, tokens/round, GPU ms/round, identity with the baseline, and per-rep ratios to the first
-policy; JSON keeps everything raw. GPU: through gpu_run.
+the median decode tok/s, tokens/round, GPU ms/round, identity with the baseline (optional), and per-rep ratios to
+the first policy; JSON keeps everything raw. Prompts are spec_lmbench's (tools/bench/spec_prompts.py). Run nothing
+else on the GPU meanwhile.
 
-    python tools/bench/spec_policy_ab.py --repo . --draft ~/lmopt/heads/e3j --lookup --suite full --reps 3 \
-        --policies '{"fixed7": {"mode": "fixed", "L": 7, "ext": false}, "cost_lk": {"mode": "cost", "ext": true}}' --out ab.json
+    python tools/bench/spec_policy_ab.py --draft path/to/dspark-head --lookup --suite full --reps 3 \
+        --policies '{"fixed7": {"mode": "fixed", "L": 7, "ext": false}, "cost_lk": {"mode": "cost", "ext": true}}' \
+        [--baseline spec_lmbench_full.json] --out ab.json
 """
 import argparse
 import json
@@ -21,7 +23,10 @@ import time
 from pathlib import Path
 
 ap = argparse.ArgumentParser()
-ap.add_argument('--repo', required=True)
+ap.add_argument('--repo', default=str(Path(__file__).resolve().parents[2]),
+                help='lithos-metal checkout to import (default: the one containing this script)')
+ap.add_argument('--prompt-source', default=None,
+                help='checkout whose files supply the document/agent prompt text (default: --repo)')
 ap.add_argument('--model', default='nvidia/Qwen3.8-27B-NVFP4')
 ap.add_argument('--draft', default=None)
 ap.add_argument('--block', type=int, default=None)
@@ -31,7 +36,7 @@ ap.add_argument('--suite', default='full')
 ap.add_argument('--only', default=None)
 ap.add_argument('--reps', type=int, default=3)
 ap.add_argument('--policies', required=True, help='JSON {name: {mode: fixed|cost, L, ext, sts: [..] | "file", cost: [16 ms] | null}}')
-ap.add_argument('--baseline', default=os.path.expanduser('~/lmopt/results/baseline/full.json'))
+ap.add_argument('--baseline', default=None, help='spec_lmbench JSON whose greedy tokens are the identity reference')
 ap.add_argument('--out', required=True)
 a = ap.parse_args()
 repo = Path(a.repo).expanduser().resolve()
@@ -41,11 +46,10 @@ from monolith.serving.setup import prepare
 from monolith.generate import load_session
 from transformers import AutoTokenizer
 
-# the prompt set of spec_lmbench (same text, same token ids)
-src = (repo / 'tools' / 'bench' / 'spec_lmbench.py').read_text()
-ns_ = {'Path': Path, 'json': json, 'a': argparse.Namespace(repo=str(repo))}
-exec(src[src.index('DOC = '):src.index('class NS')], ns_)
-PROMPTS, SUITES, LONG, doc_prompt = ns_['PROMPTS'], ns_['SUITES'], ns_['LONG'], ns_['doc_prompt']
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from spec_prompts import load_prompts  # noqa: E402
+
+PROMPTS, SUITES, LONG, doc_prompt = load_prompts(a.prompt_source or repo)
 policies = json.loads(a.policies)
 
 

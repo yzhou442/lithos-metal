@@ -26,4 +26,4 @@ DRAFT_ATTN = register_op(OpDef("draft_attn", OpClass.MAP, "heads").bind("*", Ker
 CONFIDENCE = register_op(OpDef("confidence", OpClass.MAP, "rows").bind("*", KernelBinding("confidence")))
 VERIFY_SELECT = register_op(OpDef("verify_select", OpClass.SERIAL, "span").bind("*", KernelBinding("verify_select")))
 ACCEPT_SCAN = register_op(OpDef("accept_scan", OpClass.SERIAL, "span").bind("*", KernelBinding("accept_scan")))
-NGRAM_LOOKUP = register_op(OpDef("ngram_lookup", OpClass.SERIAL, "span").bind("*", KernelBinding("ngram_lookup")))   # spec campaign: context lookup
+NGRAM_LOOKUP = register_op(OpDef("ngram_lookup", OpClass.SERIAL, "span").bind("*", KernelBinding("ngram_lookup")))   # context lookup (prompt lookup / copy drafting)

@@ -1,11 +1,11 @@
-"""Frequency-ranked draft vocabulary for an FR-Spec style draft head (spec campaign; CPU only).
+"""Frequency-ranked draft vocabulary for an FR-Spec style draft head (CPU only).
 
 Counts target-tokenizer tokens over a text corpus (JSONL lines {"role", "t"}; assistant text weighted
 ``--assistant-weight``), always keeps the special/control tokens, and writes the ranked token ids plus the
-coverage of reference generations (spec_lmbench / lmbench JSONs: the fraction of generated tokens inside the
+coverage of reference generations (spec_lmbench JSONs: the fraction of generated tokens inside the
 top-K set, per prompt and overall) for K in --ks.
 
-    python tools/bench/spec_vocab_rank.py --corpus fr_corpus.jsonl --refs baseline/full.json --out vocab_rank.json
+    python tools/bench/spec_vocab_rank.py --corpus fr_corpus.jsonl --refs spec_lmbench_full.json --out vocab_rank.json
 """
 import argparse
 import collections

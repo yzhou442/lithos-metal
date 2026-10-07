@@ -155,7 +155,7 @@ class DSparkDrafter(Drafter):
         # default; LITHOS_DRAFT_VOCAB sets it for benches that build sessions through the serving setup.
         import os
         self.vocab_subset = vocab_subset if vocab_subset is not None else (os.environ.get('LITHOS_DRAFT_VOCAB') or None)
-        # context lookup (spec campaign): extend a whole-block verify with the continuation of the latest earlier
+        # context lookup: extend a whole-block verify with the continuation of the latest earlier
         # occurrence of the context's suffix (prompt lookup) into the verify rows past the block; {} = defaults
         self.lookup = None if lookup is None else dict(lookup)
         if attention not in (None, 'v1', 'mma', 'auto'):

@@ -1281,7 +1281,7 @@ def _accept_scan(ctx: _Ctx, op: Op) -> None:
 
 
 def _ngram_lookup(ctx: _Ctx, op: Op) -> None:
-    """The context lookup (spec campaign): one threadgroup scans the committed-token history for the latest earlier
+    """The context lookup: one threadgroup scans the committed-token history for the latest earlier
     occurrence of the context's suffix (with the drafter's block appended) and reports its continuation."""
     hist, drafts = op.inputs
     out = op.outputs[0]

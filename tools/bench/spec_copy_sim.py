@@ -1,4 +1,4 @@
-"""Offline estimate of copy (prompt-lookup / n-gram) drafting on logged greedy generations (spec campaign).
+"""Offline estimate of copy (prompt-lookup / n-gram) drafting on logged greedy generations.
 
 For a spec_lmbench JSON (tokens + per-round committed counts), replays the rounds and asks, at each round's start,
 what an n-gram copy proposer would have offered: the longest suffix (>= --min-match tokens, <= --max-ngram) of
@@ -14,25 +14,22 @@ import sys
 from pathlib import Path
 
 ap = argparse.ArgumentParser()
-ap.add_argument('--repo', required=True)
+ap.add_argument('--prompt-source', default=str(Path(__file__).resolve().parents[2]),
+                help='checkout that supplied the run\'s prompt text (spec_lmbench --prompt-source; default: this checkout)')
+ap.add_argument('--model', default='nvidia/Qwen3.8-27B-NVFP4', help='tokenizer of the run\'s target')
 ap.add_argument('--run', required=True)
 ap.add_argument('--min-match', type=int, default=3)
 ap.add_argument('--max-ngram', type=int, default=8)
 ap.add_argument('--block', type=int, default=15)
 a = ap.parse_args()
-repo = Path(a.repo).expanduser().resolve()
-sys.path.insert(0, str(repo))
-sys.argv = [sys.argv[0]]
 os.environ.setdefault('HF_HUB_OFFLINE', '1')
-from transformers import AutoTokenizer
-import importlib.util
-spec = importlib.util.spec_from_file_location('lmb_prompts', str(repo / 'tools' / 'bench' / 'spec_lmbench.py'))
-src = (repo / 'tools' / 'bench' / 'spec_lmbench.py').read_text()
-start = src.index('DOC = ')
-end = src.index('class NS')
-ns = {'Path': Path, '__file__': str(repo / 'tools/bench/spec_lmbench.py')}
-exec(src[start:end].replace("Path(a.repo).expanduser()", "Path(%r)" % str(repo)), ns)
-tok = AutoTokenizer.from_pretrained('nvidia/Qwen3.8-27B-NVFP4')
+from transformers import AutoTokenizer  # noqa: E402
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from spec_prompts import load_prompts  # noqa: E402
+
+PROMPTS, _, LONG, doc_prompt = load_prompts(a.prompt_source)
+tok = AutoTokenizer.from_pretrained(a.model)
 doc = json.load(open(a.run))
 
 
@@ -49,10 +46,10 @@ def proposal(hist, block):
 
 tot = {}
 for name, r in doc['prompts'].items():
-    if name in ns['LONG']:
-        msgs, _ = ns['doc_prompt'](*ns['LONG'][name])
+    if name in LONG:
+        msgs, _ = doc_prompt(*LONG[name])
     else:
-        msgs, _ = ns['PROMPTS'][name]
+        msgs, _ = PROMPTS[name]
     ids = list(tok.apply_chat_template(msgs, tokenize=True, return_dict=False, add_generation_prompt=True, enable_thinking=False))
     out = r['tokens']
     pos = 1                       # the first token comes from prefill

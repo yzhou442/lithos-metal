@@ -1,4 +1,4 @@
-"""Offline verify-length policy simulation from logged rounds (spec campaign).
+"""Offline verify-length policy simulation from logged rounds.
 
 Input: a spec_lmbench JSON produced with a long fixed verify (e.g. block 15, L = 15) — every round's accepted count
 and the block's confidences — plus a measured round-cost table (spec_cost_table JSON: full round ms per L).

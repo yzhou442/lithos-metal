@@ -1,13 +1,13 @@
-"""Fit per-position STS temperatures for a DSpark head under the exact serve config (spec campaign).
+"""Fit per-position STS temperatures for a DSpark head under the exact serve config.
 
 Runs the serve-config session (``serving.setup.prepare`` + recipe options) with the whole block verified (fixed L =
-block) over a calibration prompt set that is disjoint from lmbench's, collects every round's confidences and
+block) over a calibration prompt set that is disjoint from spec_lmbench's, collects every round's confidences and
 accepted count, and fits τ_k per position k on the *conditional* events (draft k accepted given drafts < k were):
 the confidence head predicts c_k = P(accept k | accepted < k) and the cost rule multiplies them into survival
 probabilities. Writes ``{"temperatures": [...], ...stats}`` for ``load_session(sts_path=...)`` /
-``drafter_options={"sts": [...]}``. GPU: run through gpu_run.
+``drafter_options={"sts": [...]}``. Run nothing else on the GPU meanwhile.
 
-    python tools/bench/spec_sts_fit.py --repo . --draft ~/lmopt/heads/g3 --block 15 --out sts_g3_b15.json
+    python tools/bench/spec_sts_fit.py --draft path/to/dspark-head --block 15 --out sts_b15.json
 """
 import argparse
 import json
@@ -20,7 +20,8 @@ from pathlib import Path
 import numpy as np
 
 ap = argparse.ArgumentParser()
-ap.add_argument('--repo', required=True)
+ap.add_argument('--repo', default=str(Path(__file__).resolve().parents[2]),
+                help='lithos-metal checkout to import (default: the one containing this script)')
 ap.add_argument('--model', default='nvidia/Qwen3.8-27B-NVFP4')
 ap.add_argument('--draft', default=None)
 ap.add_argument('--block', type=int, default=15)

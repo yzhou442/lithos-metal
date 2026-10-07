@@ -1,5 +1,5 @@
 {
- "_note": "Full-round GPU ms per verify length l = 0..15 (index l; l = 0 copies l = 1), M5 Max 40c, serve recipes at the 16-row bound, published head, spec_cost_table.py medians of 5, linear between measured L in {1,4,7,8,11,15}. Re-measured 2026-10-07 on opt/integ (kernels 1f6ee6e/e326092 recipes + spec 16-row programs); previous tables: spec 2026-10-06 on opt/spec.",
+ "_note": "Full-round GPU ms per verify length l = 0..15 (index l; l = 0 copies l = 1), M5 Max 40c, serve recipes at the 16-row bound, published head, spec_cost_table.py medians of 5, linear between measured L in {1,4,7,8,11,15}. Measured 2026-10-07 with this tree's verify-pass recipes and 16-row programs.",
  "b15": {
   "128": [
    41.445,

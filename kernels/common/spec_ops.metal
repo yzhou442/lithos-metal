@@ -311,7 +311,7 @@ kernel void accept_scan(device const int* token [[buffer(0)]], device StepState*
   if (p.ctx_cap && st->position >= p.ctx_cap) { st->error = 2u; st->done = 1u; }     // the context is full
 }
 
-// ngram_lookup: the context-lookup proposal for the next verify (spec campaign; prompt lookup / copy drafting).
+// ngram_lookup: the context-lookup proposal for the next verify (prompt lookup / copy drafting).
 // S = hist[0 .. position] (every committed token; hist[position] = the anchor) ++ the drafter's block d_0 … d_{γ-1}.
 // Over every earlier end index j < |S| - 1 it measures how many trailing tokens of S match the tokens ending at j
 // (up to LOOKUP_NMAX), keeps the longest match (the most recent on ties) and writes out[0] = its length (0 when
