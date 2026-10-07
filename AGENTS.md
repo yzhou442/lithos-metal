@@ -38,8 +38,9 @@ This is the section Codex follows when reviewing pull requests. Flag these, in p
    updated in the same change, and every kernel/host reader uses the layout's offsets rather than literals.
 5. **No device- or machine-specific paths.** No absolute paths, user names, host names or local checkpoint
    locations in code, tests, docs or tool defaults; chip-specific values live in the backend profiles and recipes
-   under `monolith/backends/metal/<chip>/`, selected through the registry. Model names appear only under
-   `monolith/models/<name>/` (`tools/ci/hygiene.py`).
+   under `monolith/backends/metal/<chip>/`, selected through the registry. Engine code names models only under
+   `monolith/models/<name>/` (`tools/ci/hygiene.py`); tools and docs may name checkpoints in examples but should not
+   hard-wire one as a default.
 6. **Defaults and compatibility.** New serving options must keep the previous behaviour by default unless the PR
    states otherwise with measurements; recipe JSON changes must keep older keys readable. Performance claims need
    a paired A/B table (same machine, alternating runs, several repetitions).
