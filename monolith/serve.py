@@ -555,6 +555,8 @@ def create_app(backend, model_name, api_key=None, *, keep_alive=math.inf):
     @app.post('/api/chat', dependencies=[Depends(authorize)])
     def ollama_chat(body: dict = Depends(json_body)):
         keep_alive = None if body.get('keep_alive') in (None, '') else keep_alive_seconds(body['keep_alive'])
+        if not isinstance(body.get('messages', []), (list, type(None))):
+            raise APIError('messages must be an array', param='messages')
         if body.get('messages'):
             return dispatch(convert(body, lambda body: ollama_request(body, model_name)), 'ollama',
                             keep_alive=keep_alive, wait=True)

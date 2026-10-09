@@ -127,7 +127,7 @@ def test_latest_is_the_same_model(served):
     {'format': 'json'}, {'format': {'type': 'object'}}, {'think': True}, {'think': 'high'}, {'logprobs': True},
     {'options': {'repeat_penalty': 1.1}}, {'options': {'min_p': 0.05}}, {'options': {'num_predict': 0}}, {'options': 'fast'},
     {'messages': [{'role': 'user', 'content': 'Describe this', 'images': ['aGk=']}]}, {'keep_alive': 'soon'},
-    {'truncate': True}, {'shift': True},
+    {'truncate': True}, {'shift': True}, {'messages': {}}, {'messages': ''}, {'messages': 0},
 ])
 def test_rejects_what_it_cannot_honor(fields):
     def unexpected(*_args, **_options):
