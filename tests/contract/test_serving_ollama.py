@@ -325,3 +325,19 @@ def test_an_expiry_during_a_request_unloads_after_it():
         time.sleep(.1)                                                        # the expiry thread is waiting for the model
         assert model.loaded
     wait_for(lambda: not model.loaded)
+
+
+def test_a_request_after_a_probe_sets_the_period():
+    model = Model()
+    model.loaded = False
+    def load():
+        time.sleep(.2)
+        model.loaded = True
+        model.events.append('load')
+    model.load = load
+    client = TestClient(create_app(model, 'local'))
+    client.head('/api/chat')
+    time.sleep(.05)                                                           # loading; the request queues behind it
+    assert client.post('/api/chat', json=chat(stream=False, keep_alive=0)).status_code == 200
+    wait_for(lambda: not model.loaded)                                        # not held for the probe's minute
+    assert model.events == ['load', 'generate', 'unload']

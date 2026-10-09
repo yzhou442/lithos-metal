@@ -280,16 +280,21 @@ class KeepAlive:
 
     def preload(self):
         if not getattr(self.backend, 'loaded', True) and not self.busy:
-            threading.Thread(target=self._background, args=(self.backend.load, True), daemon=True).start()
+            threading.Thread(target=self._background, args=(self._preload,), daemon=True).start()
 
-    def _background(self, action, restart=False, wait=False):
+    def _preload(self):
+        try:
+            self.backend.load()
+        finally:
+            # A probe that no request follows still ends in an unload. Set while owning the model, so a request
+            # that runs next sets the period after it.
+            self.touch(max(self.recent, self.PROBE_HOLD))
+
+    def _background(self, action, wait=False):
         try:
             self.run(action, wait=wait)
         except Exception:
             logging.getLogger(__name__).exception('Background model load or unload failed')
-        if restart:
-            # A probe that no request follows still ends in an unload.
-            self.touch(max(self.recent, self.PROBE_HOLD))
 
     def _expire(self):
         while True:
