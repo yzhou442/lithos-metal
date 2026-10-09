@@ -173,3 +173,16 @@ def test_cli_prefill_chunk_is_a_size_an_exact_size_or_the_chips_exact_size():
     for value in ('auto', '0', '0-exact', 'exact', '-exact'):
         with pytest.raises(SystemExit):
             parse('--prefill-chunk-size', value)
+
+
+def test_warmup_runs_the_prompt_graph_once():
+    seen = []
+    backend = Backend.__new__(Backend)
+    backend.assets, backend.max_context = None, 4096
+    backend.select_session = lambda request, context: None
+    backend.session = SimpleNamespace(prepare=lambda: None)
+    backend.complete = lambda request, **kwargs: seen.append(len(request.messages[0].content.split()))
+    backend.warmup('test-model')
+    # two short requests on the resident decoder, then one longer than any prompt it keeps resident (512-row chunks)
+    assert seen[:2] == [1, 1] and len(seen) == 3 and seen[2] > 512
+    assert backend.last_metrics == {}

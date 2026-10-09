@@ -61,6 +61,11 @@ class Backend:
         # incremental text path that the first real streaming request uses.
         for _ in range(2):
             self.complete(request, on_text=lambda text: None)
+        # Short prompts run on the resident decoder. Run the prompt graph once as well, so the first long request
+        # does not wait for its allocations and their residency.
+        prompt = ChatRequest(model=model_name, messages=[Message(role='user', content=' '.join(['Hello'] * 700))],
+                             max_tokens=2)
+        self.complete(prompt, on_text=lambda text: None)
         self.last_metrics = {}
 
     def select_session(self, request, prompt_tokens):
