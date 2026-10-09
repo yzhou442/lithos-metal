@@ -341,3 +341,16 @@ def test_a_request_after_a_probe_sets_the_period():
     assert client.post('/api/chat', json=chat(stream=False, keep_alive=0)).status_code == 200
     wait_for(lambda: not model.loaded)                                        # not held for the probe's minute
     assert model.events == ['load', 'generate', 'unload']
+
+
+def test_a_load_restarts_the_period_before_an_expiry_waiting_for_the_model():
+    from monolith.serve import KeepAlive
+    model, lock = Model(), threading.Lock()
+    model.loaded = False
+    keeper = KeepAlive(model, lock)
+    with lock:                                                                # the load request owns the model
+        keeper.touch(0)                                                       # an older period expires meanwhile
+        time.sleep(.1)                                                        # its expiry waits for the model
+        keeper.load(60)
+    time.sleep(.2)
+    assert model.loaded and model.events == ['load']

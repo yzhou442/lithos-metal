@@ -279,16 +279,18 @@ class KeepAlive:
             self.lock.release()
 
     def preload(self):
+        # A probe that no request follows still ends in an unload.
         if not getattr(self.backend, 'loaded', True) and not self.busy:
-            threading.Thread(target=self._background, args=(self._preload,), daemon=True).start()
+            threading.Thread(target=self._background, args=(lambda: self.load(max(self.recent, self.PROBE_HOLD)),),
+                             daemon=True).start()
 
-    def _preload(self):
+    def load(self, seconds=None):
+        """Run while owning the model: load it and restart the period, so an expiry waiting for the model sees a
+        new epoch and a request that runs next sets the period after it."""
         try:
             self.backend.load()
         finally:
-            # A probe that no request follows still ends in an unload. Set while owning the model, so a request
-            # that runs next sets the period after it.
-            self.touch(max(self.recent, self.PROBE_HOLD))
+            self.touch(seconds)
 
     def _background(self, action, wait=False):
         try:
@@ -538,11 +540,11 @@ def create_app(backend, model_name, api_key=None, *, keep_alive=math.inf):
         unload = keep_alive == 0
         if hasattr(backend, 'unload'):
             try:
-                keeper.run(backend.unload if unload else backend.load)
+                keeper.run(backend.unload if unload else lambda: keeper.load(keep_alive))
             except Exception as exc:
                 logging.getLogger(__name__).exception('Model load failed')
                 raise APIError('Model load failed; see server logs', 500, 'load_failed') from exc
-        if not unload:
+        elif not unload:
             keeper.touch(keep_alive)
         return {'model': model_name, 'created_at': ollama_time(), 'message': {'role': 'assistant', 'content': ''},
                 'done_reason': 'unload' if unload else 'load', 'done': True}
