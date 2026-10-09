@@ -446,3 +446,15 @@ def test_a_probe_leaves_a_resident_model_and_its_period_alone():
     keeper.preload()
     time.sleep(.2)
     assert model.events == [] and keeper.deadline == deadline
+
+
+def test_a_probe_that_beats_a_pending_expiry_keeps_the_model():
+    from monolith.serve import KeepAlive
+    model, lock = Model(), threading.Lock()
+    keeper = KeepAlive(model, lock)
+    keeper.touch(30)
+    with keeper.condition:                                                    # the period ran out; its expiry
+        keeper.deadline, epoch = None, keeper.epoch                           # waits for the model
+    keeper.run(lambda: keeper._probe_load(keeper.epoch))                      # the probe gets the model first
+    keeper.run(lambda: keeper._unload(epoch))
+    assert model.loaded and keeper.deadline is not None
