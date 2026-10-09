@@ -111,7 +111,7 @@ or unloads it with `keep_alive: 0`; `GET /api/ps` lists the model while it is lo
 
 Each request supplies the conversation context. Responses does not implement `previous_response_id` or
 background jobs. Ollama requests get this server's defaults (greedy sampling, output until a stop or the context
-capacity), not a Modelfile's; its runtime options such as `num_ctx` do not apply, and sampling options without an
+capacity; `num_predict` only lowers that bound), not a Modelfile's; its runtime options such as `num_ctx` do not apply, and sampling options without an
 implementation here are accepted only at their neutral values. The adapters do not implement image/audio/document inputs, hosted tools, extended thinking,
 strict JSON-schema decoding, or grammar enforcement for custom tools. Unsupported fields receive
 capability-specific errors.

@@ -4,8 +4,9 @@ from __future__ import annotations
 import json
 import math
 import re
+import threading
 import uuid
-from typing import Literal
+from typing import ClassVar, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -399,7 +400,9 @@ def responses_request(body):
 
 
 class OllamaChatRequest(ChatRequest):
-    """Ollama's num_predict: absent or negative generates until a stop or the context capacity."""
+    """Ollama's num_predict bounds the output: absent, negative or beyond the context, generation ends at a stop or
+    the context capacity."""
+    within_context: ClassVar[bool] = True
 
     @property
     def token_limit(self):
@@ -417,7 +420,7 @@ OLLAMA_NEUTRAL_OPTIONS = {'min_p': 0, 'typical_p': 1, 'repeat_penalty': 1, 'pres
 
 def keep_alive_seconds(value):
     """Ollama's keep_alive: seconds (a number) or a Go duration such as "5m" or "1h30m". Zero unloads after the
-    request; a negative value keeps the model loaded (math.inf)."""
+    request; a negative value, or one longer than a timer can wait, keeps the model loaded (math.inf)."""
     try:
         if isinstance(value, bool) or not isinstance(value, (int, float, str)):
             raise ValueError
@@ -430,7 +433,7 @@ def keep_alive_seconds(value):
         seconds = (-1 if sign == '-' else 1) * sum(float(n) * DURATION_UNITS[u] for n, u in DURATION_PART.findall(parts))
     if math.isnan(seconds):
         raise APIError('keep_alive must be a duration such as "5m" or a number of seconds', param='keep_alive')
-    return math.inf if seconds < 0 else seconds
+    return math.inf if seconds < 0 or seconds >= threading.TIMEOUT_MAX else seconds
 
 
 def ollama_model(name, served):

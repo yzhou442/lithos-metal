@@ -227,7 +227,7 @@ def test_keep_alive_durations():
     assert keep_alive_seconds('5m') == 300 and keep_alive_seconds('1h30m') == 5400 and keep_alive_seconds('1.5s') == 1.5
     assert keep_alive_seconds('300ms') == pytest.approx(.3) and keep_alive_seconds(600) == 600
     assert keep_alive_seconds('0') == keep_alive_seconds(0) == 0
-    assert keep_alive_seconds(-1) == keep_alive_seconds('-1m') == math.inf
+    assert keep_alive_seconds(-1) == keep_alive_seconds('-1m') == keep_alive_seconds(10**10) == math.inf
     for value in ('soon', '5 m', 'm', '', 'nan', True, None, [1]):
         with pytest.raises(APIError):
             keep_alive_seconds(value)
@@ -274,6 +274,8 @@ def test_unlimited_output_stops_at_the_context_capacity():
     backend.tokenizer = SimpleNamespace(apply_chat_template=lambda *a, **kw: [1, 2, 3], decode=lambda *a, **kw: 'x')
     backend.complete(ollama_request(chat(stream=False)))
     assert session.generated == [6]                                           # 3 prompt + 6 new - 1 = capacity 8
+    backend.complete(ollama_request(chat(stream=False, options={'num_predict': 100})))
+    assert session.generated == [6, 6]
 
 
 def test_stop_strings_end_a_non_streaming_generation():
@@ -354,3 +356,12 @@ def test_a_load_restarts_the_period_before_an_expiry_waiting_for_the_model():
         keeper.load(60)
     time.sleep(.2)
     assert model.loaded and model.events == ['load']
+
+
+def test_an_unbounded_keep_alive_leaves_the_timer_working():
+    model = Model()
+    client = TestClient(create_app(model, 'local'))
+    client.post('/api/chat', json=chat(stream=False, keep_alive=10**10))
+    assert client.get('/api/ps').json()['models'][0]['expires_at'] is None
+    client.post('/api/chat', json=chat(stream=False, keep_alive=0))
+    wait_for(lambda: not model.loaded)

@@ -112,7 +112,10 @@ class Backend:
         except (ValueError, TemplateError) as exc:
             raise APIError(str(exc), param="messages") from exc
         # No limit (Ollama's default): until a stop or the context capacity.
-        limit = request.token_limit or max(1, self.max_context - len(ids) + 1)
+        room = max(1, self.max_context - len(ids) + 1)
+        limit = request.token_limit or room
+        if getattr(request, 'within_context', False):
+            limit = min(limit, room)
         if not ids or len(ids) + limit - 1 > self.max_context:
             raise APIError(f"Prompt ({len(ids)} tokens) plus output budget ({limit}) exceeds context capacity "
                            f"({self.max_context}); reduce messages or max_completion_tokens.",
