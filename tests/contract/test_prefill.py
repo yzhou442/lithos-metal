@@ -151,6 +151,10 @@ def test_exact_policy_reads_decoder_layouts_and_keeps_bf16_operands(monkeypatch)
     calls.clear()
     p = get_backend('m5_max_40c').optimize_prefill(program('fp8_e4m3', 10240, 5120), exact=True)
     assert calls == [('decoder', record)] and 'SPLIT_K' not in p.kernels[p.ops[0].kernel].macros
+    # FP8: one threadgroup per 32-row tile; its four SIMD groups share the decoded tile for four 32-token blocks
+    macros = p.kernels[p.ops[0].kernel].macros
+    assert (p.ops[0].grid, p.ops[0].threadgroup) == ((320, 4, 1), (128, 1, 1))
+    assert (macros['TN'], macros['STAGE_B'], macros['STAGE_SB'], macros['SHARE_PLANES']) == ('32u', '1', '4u', '0')
     calls.clear()
     record = None                                          # no verification graph: the private layout, as without exact
     get_backend('m5_max_40c').optimize_prefill(program('nvfp4', 34816, 5120), exact=True)
@@ -216,6 +220,17 @@ def test_decoder_projection_maps_the_file_a_verification_graph_derived(tmp_path,
     else:
         with pytest.raises(ValueError, match='NVFP4 operands'):
             decoder_projection(prompt, op, record)
+    # staged weights: the FP8 tile decoded into threadgroup memory once per threadgroup
+    del kernel.macros['SPLIT_K']
+    kernel.macros.update(STAGE_B='1', TN='32u')
+    kernel.source = source
+    op.bindings = [(0, 'w', 0), (2, 'xp', 0)]
+    if nvfp4:
+        with pytest.raises(ValueError, match='FP8 operands'):
+            decoder_projection(prompt, op, record)
+    else:
+        decoder_projection(prompt, op, record)
+        assert 'stage_b + (kt & 1u)' in kernel.source and kernel.source.count('threadgroup_barrier') == 1
 
 
 def _attention_pair(ch=2048):

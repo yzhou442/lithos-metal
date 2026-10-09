@@ -212,11 +212,15 @@ static inline uint narrow_scale_word(device const uint4* wb, uint ln, uint r, ui
 #define BLOCK_WORDS (R * 32u * UNIT_WORDS)
 #endif
 
+#ifndef STAGE_B
+#define STAGE_B 0                    // 1: STAGE_SB SIMD groups (one TM-token block each) share each row tile's decoded weights
+#endif                               // through threadgroup memory: the injected fill writes them, one barrier per K step
 #ifndef SPLIT_K
 #define SPLIT_K 0                    // 1: the injected fill (compiler/prefill.py) multiplies each 128-column tile as two 64-deep
 #endif                               // products, each right after decoding its half: matmul2d sums K in order, same results
 constexpr constant auto desc = matmul2d_descriptor(int(TM), int(TN), SPLIT_K ? 64 : int(TK), false, true, false, matmul2d_descriptor::mode::multiply_accumulate);
 using tA_t = tensor<device bfloat, dextents<int, 2>, tensor_inline>;
+using tB_s = tensor<threadgroup bfloat, dextents<int, 2>, tensor_inline>;
 
 kernel void gemm_tile(device const uint4* w [[buffer(0)]], device const float* row_scale [[buffer(1)]],
                       device bfloat* xp [[buffer(2)]],
@@ -242,7 +246,7 @@ kernel void gemm_tile(device const uint4* w [[buffer(0)]], device const float* r
                       device const StepState* st [[buffer(15)]],
 #endif
                       uint3 gid [[thread_position_in_grid]], uint lane [[thread_index_in_simdgroup]], uint sw [[threads_per_simdgroup]],
-#if SHARE_PLANES
+#if SHARE_PLANES || STAGE_B
                       uint3 planes [[threadgroups_per_grid]],
 #endif
                       uint3 group [[threadgroup_position_in_grid]]) {
@@ -250,6 +254,13 @@ kernel void gemm_tile(device const uint4* w [[buffer(0)]], device const float* r
 #if KSPLIT > 1
   const uint slice = sg % KSPLIT, sg_tile = sg / KSPLIT, n_tg = p.n_sg / KSPLIT;   // a threadgroup is the KSPLIT SIMD-groups of one tile
   threadgroup float part[KSPLIT - 1][PART_LANES][PART_CAP];                            // the partial tiles of slices 1 … KSPLIT-1
+#elif STAGE_B
+#if SHARE_PLANES || TB2 || POST_NORM
+#error "staged weights take one token block per SIMD group"
+#endif
+  threadgroup bfloat stage_b[2u * TN * TK];
+  const uint sgi = (gid.x / sw) % STAGE_SB;                              // this SIMD group's token block in the threadgroup
+  const uint sg_tile = group.x, n_tg = planes.x;                         // one row tile per threadgroup at a time
 #elif SHARE_PLANES
   uint sg_tile = sg, n_tg = p.n_sg;                                     // remapped below for a short step
 #else
@@ -267,6 +278,13 @@ kernel void gemm_tile(device const uint4* w [[buffer(0)]], device const float* r
 #endif
   // Each grid.y plane processes at most TM tokens. Predication above uses the
   // full step length; all following addressing and guards are local to this tile.
+#if STAGE_B
+  // grid.y covers STAGE_SB token blocks per threadgroup; a block past the step still decodes and meets the barriers
+  if (group.y * STAGE_SB * TM >= T_act) return;                         // uniform: the whole threadgroup is past the step
+  const uint token0 = (group.y * STAGE_SB + sgi) * TM;
+  const bool live = token0 < T_act;
+  T_act = live ? min(T_act - token0, uint(TM)) : 0u;
+#else
   uint plane = group.y;
 #if SHARE_PLANES
 #if KSPLIT > 1
@@ -294,6 +312,7 @@ kernel void gemm_tile(device const uint4* w [[buffer(0)]], device const float* r
 #else
   T_act = min(T_act - token0, uint(TM));
 #endif
+#endif
   xp += (ulong)token0 * K;
   const uint output_cols = (EPILOGUE == 2) ? p.n_rows / 2u : p.n_rows;
   y += (ulong)token0 * output_cols;
@@ -316,7 +335,11 @@ kernel void gemm_tile(device const uint4* w [[buffer(0)]], device const float* r
 #endif
   for (uint tile = p.tile0 + sg_tile; tile < p.tile0 + p.n_tiles; tile += n_tg) {
     auto bT = op.get_right_input_cooperative_tensor<bfloat, bfloat, float>();
+#if STAGE_B
+    auto cT = op.get_destination_cooperative_tensor<tA_t, tB_s, float>();
+#else
     auto cT = op.get_destination_cooperative_tensor<tA_t, decltype(bT), float>();
+#endif
     for (uint16_t i = 0; i < cT.get_capacity(); i++) cT[i] = 0.0f;
 #if TB2
 #if KSPLIT > 1 || POST_NORM
@@ -465,6 +488,11 @@ kernel void gemm_tile(device const uint4* w [[buffer(0)]], device const float* r
 #endif
 #if SPLIT_K
       (void)sA;                                                        // the fill ran both halves' products
+#elif STAGE_B
+      if (live) {
+        tB_s sBs(stage_b + (kt & 1u) * TN * TK, dextents<int, 2>(int(TK), int(TN)));
+        op.run(sA, sBs, cT);
+      }
 #elif EXP_MODE != 1
       op.run(sA, bT, cT);
 #if TB2

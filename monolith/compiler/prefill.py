@@ -34,11 +34,12 @@ def specialize_prompt(program):
     return program
 
 
-def projection_geometry(program, op, *, tm, tn, sgs, groups, token_blocks=1):
+def projection_geometry(program, op, *, tm, tn, sgs, groups, token_blocks=1, staged=False):
     """Retile an emitted matrix projection without changing its K layout.
 
     ``token_blocks`` = 2 multiplies every decoded weight tile with two ``tm``-token blocks (same products, half the
-    weight decoding)."""
+    weight decoding). ``staged``: a threadgroup's ``sgs`` SIMD groups take ``sgs`` token blocks of one row tile at a
+    time and share its decoded weights through threadgroup memory (decoder_projection's staged fill)."""
     old = program.kernels[op.kernel]
     if old.function != 'gemm_tile' or int(old.macros['TK'].rstrip('u')) != 128:
         raise ValueError('prefill projection tuning requires a 128-column matrix tile')
@@ -51,6 +52,10 @@ def projection_geometry(program, op, *, tm, tn, sgs, groups, token_blocks=1):
     kernel.macros.update(TM=str(tm), TN=f'{tn}u', KSPLIT='1u', SCALE_CACHE='0', SHARE_PLANES='1')
     if token_blocks == 2:
         kernel.macros['TB2'] = '1'
+    if staged:
+        if token_blocks != 1:
+            raise ValueError('staged weights take one token block per SIMD group')
+        kernel.macros.update(STAGE_B='1', STAGE_SB=f'{sgs}u', SHARE_PLANES='0')
     pn, off = next((n, o) for slot, n, o in op.bindings if slot == 4)
     data = bytearray(program.buffers[pn].init)
     n, _, _, rows, _, tile0, _, _ = struct.unpack_from('<IIIIfIII', data, off)
@@ -63,7 +68,8 @@ def projection_geometry(program, op, *, tm, tn, sgs, groups, token_blocks=1):
             kernel.macros['STATIC_GEMM_P_'+field] = f'{value}u'
     program.kernels[key] = kernel
     op.kernel = key
-    op.grid, op.threadgroup = (groups, (rows+tm*token_blocks-1)//(tm*token_blocks), 1), (sgs*32, 1, 1)
+    blocks = sgs if staged else token_blocks
+    op.grid, op.threadgroup = (groups, (rows+tm*blocks-1)//(tm*blocks), 1), (sgs*32, 1, 1)
     op.meta.update(tm=tm, tile=[tn, 128], geometry=f'prefill_{groups}x{sgs}')
 
 
@@ -210,6 +216,33 @@ DECODER_NVFP4_FILL_SPLIT = """
         }
       }
 """
+# STAGE_B: the threadgroup's SIMD groups decode the row tile's FP8 weights once into threadgroup memory ([row][slot],
+# the right operand's column order) and each multiplies its own token block by them; same products and K order.
+DECODER_FP8_FILL_STAGE = """
+      {
+        const ulong packed_tile = min(tile, p.tile0 + p.n_tiles - 1u);
+        const ulong ftile = packed_tile * TN / FILE_TN;
+        const uint slot0 = uint(packed_tile * TN % FILE_TN) / 8u;
+        const uint kpx = j * (32u / LPT) + q;
+        const ulong pg = (ftile / FILE_BLOCK * (K / 32u) + kpx * 4u + mq) * FILE_BLOCK + ftile % FILE_BLOCK;
+        threadgroup bfloat* dst = stage_b + (kt & 1u) * TN * TK;
+        for (uint s = sgi; s < NS_B; s += STAGE_SB) {
+#pragma clang loop unroll(full)
+          for (uint m = 0; m < 4u; m++) {
+            const uint lane_m = (lane & ~9u) | (m & 1u) | ((m >> 1) << 3);
+            const uint2 c2 = reinterpret_cast<device const uint2*>(w)[(pg * (FILE_TN / 8u) + slot0 + s) * 32u + lane_m];
+            const uint cw[2] = {c2.x, c2.y};
+#pragma clang loop unroll(full)
+            for (uint e = 0; e < 8u; e++) {
+              const uint code = (cw[e / 4u] >> ((e % 4u) * 8u)) & 255u;
+              dst[(c1b + 8u * s) * TK + c0b + 16u * (2u * m + e / 4u) + (e % 4u)] = bfloat(fp8_e4m3(code));
+            }
+          }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+      }
+"""
+
 
 def decoder_projection(program, op, record):
     """Read a verification graph's packed operands (decoder_layout) in this kernel's own reduction order.
@@ -240,6 +273,10 @@ def decoder_projection(program, op, record):
     if split and (not nvfp4 or kernel.macros.get('TB2') == '1'):
         raise ValueError('split products read NVFP4 operands for one token block')
     fill = DECODER_NVFP4_FILL_SPLIT if split else DECODER_NVFP4_FILL if nvfp4 else DECODER_FP8_FILL
+    if kernel.macros.get('STAGE_B') == '1':
+        if nvfp4 or split or kernel.macros.get('TB2') == '1':
+            raise ValueError('staged weights read FP8 operands for one token block per SIMD group')
+        fill = DECODER_FP8_FILL_STAGE
     kernel.source = kernel.source[:begin] + fill + kernel.source[end:]
     kernel.macros.update(FILE_TN=f"{record['tn']}u", FILE_BLOCK=f"{record['tile_block']}u")
     op.meta['prefill_packed_nvfp4' if nvfp4 else 'prefill_packed_fp8'] = True
