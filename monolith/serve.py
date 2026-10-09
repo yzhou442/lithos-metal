@@ -282,11 +282,11 @@ class KeepAlive:
             self.lock.release()
 
     def preload(self):
-        # Waits out a load or unload in progress; _probe_load stands down if a request ran meanwhile.
-        if not getattr(self.backend, 'loaded', True):
-            epoch = self.epoch
-            threading.Thread(target=self._background, args=(lambda: self._probe_load(epoch),), kwargs={'wait': True},
-                             daemon=True).start()
+        # Queue behind whatever owns the model (a request, a load or an unload in progress); residency is
+        # decided under the model lock.
+        epoch = self.epoch
+        threading.Thread(target=self._background, args=(lambda: self._probe_load(epoch),), kwargs={'wait': True},
+                         daemon=True).start()
 
     def unload(self):
         """Run while owning the model: unload it, and make a probe accepted earlier stand down."""
@@ -295,9 +295,9 @@ class KeepAlive:
             self.epoch, self.deadline, self.recent = self.epoch + 1, None, 0
 
     def _probe_load(self, epoch):
-        # A request that ran after the probe has loaded the model and set its own period. Otherwise a probe that
-        # no request follows still ends in an unload.
-        if self.epoch == epoch:
+        # A request that ran after the probe has loaded the model and set its own period, and a resident model
+        # keeps its period. Otherwise a probe that no request follows still ends in an unload.
+        if self.epoch == epoch and not getattr(self.backend, 'loaded', True):
             self.load(max(self.recent, self.PROBE_HOLD))
 
     def load(self, seconds=None):

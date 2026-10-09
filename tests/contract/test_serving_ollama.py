@@ -423,3 +423,26 @@ def test_a_probe_during_an_unload_loads_after_it():
         time.sleep(.1)
         assert not model.loaded
     wait_for(lambda: model.loaded)
+
+
+def test_a_probe_during_an_expiry_that_has_not_unloaded_yet_reloads():
+    from monolith.serve import KeepAlive
+    model, lock = Model(), threading.Lock()
+    keeper = KeepAlive(model, lock)
+    with lock:                                                                # the expiry owns the model
+        keeper.preload()                                                      # still resident when the probe arrives
+        time.sleep(.1)
+        model.unload()
+    wait_for(lambda: model.loaded)
+    assert model.events == ['unload', 'load']
+
+
+def test_a_probe_leaves_a_resident_model_and_its_period_alone():
+    from monolith.serve import KeepAlive
+    model, lock = Model(), threading.Lock()
+    keeper = KeepAlive(model, lock)
+    keeper.touch(30)
+    deadline = keeper.deadline
+    keeper.preload()
+    time.sleep(.2)
+    assert model.events == [] and keeper.deadline == deadline
