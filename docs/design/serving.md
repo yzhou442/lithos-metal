@@ -76,6 +76,9 @@ With a compatible fixed-verification recipe, short prompts and cached tails can 
 The limit is one chunk, capped at 128 tokens in exact mode. Longer prompts hand their final rows to the decoder
 before output streaming begins.
 
+Switching sessions (another recipe bucket or other sampling settings) hands the previous session's KV caches,
+states, scratch and identical weight mappings to the new one instead of allocating and clearing them again.
+
 Buffers stay in one Metal residency set while they are allocated, so switching between the prompt and decode
 programs does not declare them again per command buffer (`LITHOS_RESIDENCY_SET=0` restores the declarations).
 

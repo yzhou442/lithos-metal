@@ -77,11 +77,11 @@ class Backend:
         sessions = getattr(self, '_sessions', {})
         self._sessions = sessions
         prefix_cache = getattr(self.session, 'prefix_cache', None)
-        if self.session is not None:
-            if hasattr(self.session, '_pipelines'):
-                options.update(device=self.session.dev, pipeline_cache=self.session._pipelines)
-                self.session.release_engines()
-            sessions[self.sampling] = self.session
+        previous = self.session
+        if previous is not None:
+            if hasattr(previous, '_pipelines'):
+                options.update(device=previous.dev, pipeline_cache=previous._pipelines)
+            sessions[self.sampling] = previous
         self.session = sessions.pop(sampling, None)
         if self.session is None:
             self.session = load_session(self.model_dir, self.pack_dir, **options,
@@ -90,6 +90,11 @@ class Backend:
                 # exact chunks follow the 128-row chunking, its reusable prefixes included
                 prefix_cache_min_tokens=min(self.prefill_chunk_size, 128) if self.prefill_exact else self.prefill_chunk_size,
                 prefill_exact=self.prefill_exact)
+        if previous is not None and hasattr(previous, '_pipelines'):
+            # The new session reuses the previous one's state allocations; only the selected session keeps GPU buffers.
+            if hasattr(self.session, 'adopt_buffers'):
+                self.session.adopt_buffers(previous)
+            previous.release_engines()
         if prefix_cache is not None:
             self.session.prefix_cache = prefix_cache
         while len(sessions) > 8:

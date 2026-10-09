@@ -253,6 +253,36 @@ class Session:
         self.engines.clear()
         self._last_engine = None
 
+    def adopt_buffers(self, other: "Session") -> None:
+        """Take over another session's allocations of the same states, scratch and weight windows.
+
+        Sessions of one model differ in recipe or sampling, not in capacity, so same-named states have the same
+        sizes. Reusing them skips allocating and zero-filling several GB and their first residency. As reset() does
+        for a new request, every adopted state except the KV caches (rows are written before they are read) is
+        cleared. Call before ``other`` releases its engines; this session must not hold allocations yet."""
+        if self.buffers is not None or not other.buffers or not self._programs:
+            return
+        mine = {name: spec for prog in self._programs.values() for name, spec in prog.buffers.items()}
+        theirs = {name: spec for prog in other._programs.values() for name, spec in prog.buffers.items()}
+
+        def window(spec):
+            return (os.path.realpath(spec.file), spec.file_offset, spec.nbytes, spec.init) if spec.file else None
+        adopted = {}
+        for name, buf in other.buffers.items():
+            spec, old = mine.get(name), theirs.get(name)
+            if spec is None or old is None or spec.role != old.role:
+                continue
+            if spec.role in ('state', 'step_state', 'ring') and buf.nbytes == spec.nbytes:
+                if name not in self._kv_buffers:
+                    buf.fill(0)
+                adopted[name] = buf
+            elif spec.role == 'arena' and spec.init is None and buf.nbytes >= spec.nbytes:
+                adopted[name] = buf
+            elif spec.role == 'weights' and window(spec) is not None and window(spec) == window(old):
+                adopted[name] = buf
+        if adopted:
+            self.buffers = adopted
+
     def _engine(self, key, bound: int, *, dynamic: bool, prefill: bool = False):
         from .runtime import Engine
 
