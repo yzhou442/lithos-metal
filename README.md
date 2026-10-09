@@ -82,6 +82,7 @@ see the [model adapter design](docs/design/models.md) for supported structures a
 | M5 Pro, 20 GPU cores | Measured kernels and configurations for smaller models |
 | M3 Pro, 18 GPU cores | Probe-derived configuration |
 | M4 Pro, 16 or 20 GPU cores | Unmeasured native fallback |
+| M4 Max, 32 or 40 GPU cores | Unmeasured native fallback |
 | M5 Max, 32 GPU cores | Independent, unmeasured native fallback |
 
 Backend selection uses the chip name, GPU family, and core count. Unmeasured backends have no automatic

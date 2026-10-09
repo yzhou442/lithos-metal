@@ -18,7 +18,8 @@ from monolith.runtime.program import KernelSpec, OpSpec, Program
 
 @pytest.mark.parametrize('name,cores,family,backend', [
     ('Apple M3 Pro', 18, 9, 'm3_pro'), ('Apple M4 Pro', 16, 9, 'm4_pro'),
-    ('Apple M4 Pro', 20, 9, 'm4_pro'), ('Apple M5 Pro', 20, 10, 'm5_pro'),
+    ('Apple M4 Pro', 20, 9, 'm4_pro'), ('Apple M4 Max', 32, 9, 'm4_max'),
+    ('Apple M4 Max', 40, 9, 'm4_max'), ('Apple M5 Pro', 20, 10, 'm5_pro'),
     ('Apple M5 Max', 32, 10, 'm5_max_32c'), ('Apple M5 Max', 40, 10, 'm5_max_40c'),
 ])
 def test_exact_device_selection(name, cores, family, backend):
@@ -44,7 +45,7 @@ def test_max_variants_reject_each_others_config():
 
 def test_unmeasured_backends_have_no_borrowed_tuning():
     configs = load_configs()
-    for name in ('apple-m4-pro-16c', 'apple-m4-pro-20c', 'apple-m5-max-32c'):
+    for name in ('apple-m4-pro-16c', 'apple-m4-pro-20c', 'apple-m4-max-32c', 'apple-m4-max-40c', 'apple-m5-max-32c'):
         config = configs[name]
         assert config.validation == 'unmeasured'
         assert config.accelerator == 'off'
