@@ -14,6 +14,9 @@ from ....compiler.prefill import (projection_geometry, device_attention_tiles, p
 
 # 512-row matrix tiles over the verification graph's packed operands:
 # (output rows, SIMD groups, workers, token blocks per weight-tile fill).
+# SPLIT: shapes whose 128-column tiles are decoded and multiplied in two 64-column halves (same sums; measured
+# for the MLP input projection only: the FP8 projections and the two-block down projection are slower that way).
+SPLIT = {('nvfp4', 34816, 5120)}
 SHARED = {('nvfp4', 34816, 5120): (16, 16, 160, 1), ('nvfp4', 5120, 17408): (16, 16, 160, 2),
           ('fp8_e4m3', 10240, 5120): (16, 16, 80, 1), ('fp8_e4m3', 5120, 6144): (16, 16, 80, 1),
           ('fp8_e4m3', 6144, 5120): (16, 16, 40, 1), ('fp8_e4m3', 8192, 5120): (16, 16, 80, 1)}
@@ -111,6 +114,8 @@ def optimize(program, exact=False):
             shared = decoder_layout(program, op, tn, fp8_rows.get(next((n, o) for slot, n, o in op.bindings if slot == 0)))
         if shared:
             projection_geometry(program, op, tm=32, tn=tn, sgs=sgs, groups=groups, token_blocks=blocks)
+            if shape in SPLIT:
+                program.kernels[op.kernel].macros['SPLIT_K'] = '1'
             decoder_projection(program, op, shared)
         elif shape == ('bf16', 96, 5120) and op.meta['t_variant'] == 512 and not exact:
             # Reorder native BF16 only; FP8 projections stay eight-bit.

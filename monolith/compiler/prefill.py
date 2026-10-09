@@ -177,6 +177,39 @@ DECODER_NVFP4_FILL = """
       }
 """
 
+# SPLIT_K: the same NVFP4 decoding, one 64-column half at a time, each multiplied as soon as it is decoded. matmul2d
+# accumulates K in order, so two 64-deep products equal the 128-deep one bit for bit; the second half's loads and
+# decoding overlap the first product.
+DECODER_NVFP4_FILL_SPLIT = """
+      {
+        const ulong packed_tile = min(tile, p.tile0 + p.n_tiles - 1u);
+        const ulong ftile = packed_tile * TN / FILE_TN;
+        const uint slot0 = uint(packed_tile * TN % FILE_TN) / 8u;
+        const uint kpx = j * (32u / LPT) + q;
+        const uint fq = 2u * (kpx % 8u) + mq / 2u, fj = kpx / 8u;
+        const uint fkt = FILE_OUTER ? fq * (K / 1024u) + fj : fj * 16u + fq;
+        const ulong pg = (ftile / FILE_BLOCK * (K / 64u) + fkt) * FILE_BLOCK + ftile % FILE_BLOCK;
+#pragma clang loop unroll(full)
+        for (uint h = 0; h < 2u; h++) {
+          auto bH = op.get_right_input_cooperative_tensor<bfloat, bfloat, float>();
+#pragma clang loop unroll(full)
+          for (uint s = 0; s < NS_B; s++) {
+            const uint m = 2u * (mq % 2u) + h;
+            const uint lane_m = (lane & ~9u) | (m & 1u) | ((m >> 1) << 3);
+            const uint2 c2 = reinterpret_cast<device const uint2*>(w)[(pg * (FILE_TN / 8u) + slot0 + s) * 32u + lane_m];
+            float wv[32];
+            decode_word(uint4(c2.x, c2.y, 0u, 0u), wv);
+            uint sc = reinterpret_cast<device const uchar*>(w)[NVFP4_SCALE_BASE + (pg * FILE_TN + (slot0 + s) * 8u + c1b) * 4u + m];
+            const float scale = decode_scale(&sc, 0u);
+#pragma clang loop unroll(full)
+            for (uint e = 0; e < 16u; e++)
+              bH[uint16_t((((e / 4u) * NS_B + s) << 2) | (e % 4u))] = bfloat(wv[e] * scale);
+          }
+          auto sAh = tA.slice<64, int(TM)>(int(kpx * TK + h * 64u), 0);
+          op.run(sAh, bH, cT);
+        }
+      }
+"""
 
 def decoder_projection(program, op, record):
     """Read a verification graph's packed operands (decoder_layout) in this kernel's own reduction order.
@@ -203,7 +236,11 @@ def decoder_projection(program, op, record):
     op.bindings = [(slot, name, 0) if slot == 0 else (slot, n, offset) for slot, n, offset in op.bindings]
     begin = kernel.source.index('#pragma clang loop unroll(full)\n      for (uint s = 0; s < NS_B; s++)')
     end = kernel.source.index('#if EXP_MODE == 2\n      }', begin)
-    kernel.source = kernel.source[:begin] + (DECODER_NVFP4_FILL if nvfp4 else DECODER_FP8_FILL) + kernel.source[end:]
+    split = kernel.macros.get('SPLIT_K') == '1'
+    if split and (not nvfp4 or kernel.macros.get('TB2') == '1'):
+        raise ValueError('split products read NVFP4 operands for one token block')
+    fill = DECODER_NVFP4_FILL_SPLIT if split else DECODER_NVFP4_FILL if nvfp4 else DECODER_FP8_FILL
+    kernel.source = kernel.source[:begin] + fill + kernel.source[end:]
     kernel.macros.update(FILE_TN=f"{record['tn']}u", FILE_BLOCK=f"{record['tile_block']}u")
     op.meta['prefill_packed_nvfp4' if nvfp4 else 'prefill_packed_fp8'] = True
 

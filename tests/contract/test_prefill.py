@@ -142,10 +142,15 @@ def test_exact_policy_reads_decoder_layouts_and_keeps_bf16_operands(monkeypatch)
     assert calls == [('decoder', record)]
     assert (p.ops[0].grid, p.ops[0].threadgroup, p.kernels[p.ops[0].kernel].macros['TN']) == ((160, 16, 1), (512, 1, 1), '16u')
     assert 'TB2' not in p.kernels[p.ops[0].kernel].macros
+    assert p.kernels[p.ops[0].kernel].macros['SPLIT_K'] == '1'      # gate/up: each tile as two 64-column products
     calls.clear()
     p = get_backend('m5_max_40c').optimize_prefill(program('nvfp4', 5120, 17408), exact=True)
     assert calls == [('decoder', record)]                  # down: two 32-token blocks per decoded weight tile
     assert (p.ops[0].grid, p.kernels[p.ops[0].kernel].macros['TB2']) == ((160, 8, 1), '1')
+    assert 'SPLIT_K' not in p.kernels[p.ops[0].kernel].macros
+    calls.clear()
+    p = get_backend('m5_max_40c').optimize_prefill(program('fp8_e4m3', 10240, 5120), exact=True)
+    assert calls == [('decoder', record)] and 'SPLIT_K' not in p.kernels[p.ops[0].kernel].macros
     calls.clear()
     record = None                                          # no verification graph: the private layout, as without exact
     get_backend('m5_max_40c').optimize_prefill(program('nvfp4', 34816, 5120), exact=True)
@@ -200,6 +205,17 @@ def test_decoder_projection_maps_the_file_a_verification_graph_derived(tmp_path,
     kernel.macros['KSPLIT'] = '2u'
     with pytest.raises(ValueError, match='unsplit 128-column'):
         decoder_projection(prompt, op, record)
+    # split products: the same file reads, each 64-column half multiplied as soon as it is decoded (NVFP4 only)
+    kernel.macros['KSPLIT'] = '1u'
+    kernel.macros['SPLIT_K'] = '1'
+    kernel.source = source
+    op.bindings = [(0, 'w', 0), (2, 'xp', 0)]
+    if nvfp4:
+        decoder_projection(prompt, op, record)
+        assert kernel.source.count('op.run(sAh, bH, cT);') == 1 and 'original fill' not in kernel.source
+    else:
+        with pytest.raises(ValueError, match='NVFP4 operands'):
+            decoder_projection(prompt, op, record)
 
 
 def _attention_pair(ch=2048):

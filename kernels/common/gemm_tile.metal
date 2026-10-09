@@ -212,7 +212,10 @@ static inline uint narrow_scale_word(device const uint4* wb, uint ln, uint r, ui
 #define BLOCK_WORDS (R * 32u * UNIT_WORDS)
 #endif
 
-constexpr constant auto desc = matmul2d_descriptor(int(TM), int(TN), int(TK), false, true, false, matmul2d_descriptor::mode::multiply_accumulate);
+#ifndef SPLIT_K
+#define SPLIT_K 0                    // 1: the injected fill (compiler/prefill.py) multiplies each 128-column tile as two 64-deep
+#endif                               // products, each right after decoding its half: matmul2d sums K in order, same results
+constexpr constant auto desc = matmul2d_descriptor(int(TM), int(TN), SPLIT_K ? 64 : int(TK), false, true, false, matmul2d_descriptor::mode::multiply_accumulate);
 using tA_t = tensor<device bfloat, dextents<int, 2>, tensor_inline>;
 
 kernel void gemm_tile(device const uint4* w [[buffer(0)]], device const float* row_scale [[buffer(1)]],
@@ -460,7 +463,9 @@ kernel void gemm_tile(device const uint4* w [[buffer(0)]], device const float* r
 #else
       auto sA = tA.slice<int(TK), int(TM)>(int(kp * TK), 0);
 #endif
-#if EXP_MODE != 1
+#if SPLIT_K
+      (void)sA;                                                        // the fill ran both halves' products
+#elif EXP_MODE != 1
       op.run(sA, bT, cT);
 #if TB2
       if (T_all > TM) {
