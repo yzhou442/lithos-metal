@@ -29,6 +29,7 @@ class Backend:
     """One cached session; sampling changes rebuild its compiled programs, never duplicate model residency."""
 
     prefill_exact = False
+    last_active = 0.0                # monotonic time a generation last finished (keep_warm's window)
 
     def __init__(self, model_dir, pack_dir, max_context=4096, prefill_chunk_size=128, *, assets=None, prefill_exact=False):
         from transformers import AutoTokenizer
@@ -106,8 +107,40 @@ class Backend:
             sessions.pop(next(iter(sessions)))
         self.sampling = sampling
 
-    def complete(self, request, *, on_text=None, on_content=None, on_start=None, cancelled=None, on_progress=None):
+    def _gpu(self):
+        """The lock between generations and keep_warm's touches of the loaded programs."""
+        return self.__dict__.get('gpu_lock') or self.__dict__.setdefault('gpu_lock', threading.Lock())
+
+    def complete(self, request, **options):
         """on_progress(content, completion_tokens) pairs each content snapshot with the committed output count."""
+        with self._gpu():
+            try:
+                return self._complete(request, **options)
+            finally:
+                self.last_active = time.monotonic()
+
+    def keep_warm(self, seconds, interval=1.0):
+        """For ``seconds`` after each generation, touch the loaded programs every ``interval`` (Session.touch): a
+        request after a short pause then starts at once instead of ~0.2 s later. A request never waits behind more
+        than one touch (~15 ms of GPU time)."""
+        def loop():
+            while True:
+                time.sleep(interval)
+                if self.session is None or time.monotonic() - self.last_active >= seconds:
+                    continue
+                lock = self._gpu()
+                if not lock.acquire(blocking=False):
+                    continue
+                try:
+                    self.session.touch()
+                except Exception:
+                    logging.getLogger(__name__).exception('keep-warm touch failed; disabling it')
+                    return
+                finally:
+                    lock.release()
+        threading.Thread(target=loop, name='keep-warm', daemon=True).start()
+
+    def _complete(self, request, *, on_text=None, on_content=None, on_start=None, cancelled=None, on_progress=None):
         from jinja2 import TemplateError
 
         request_started = time.perf_counter()
@@ -433,6 +466,8 @@ def parse_args(argv=None):
                         help="Prompt tokens per prefill pass. N-exact reproduces the results of 128-token passes bit for bit; "
                              "auto-exact (default) uses the chip's measured size for the model that way, else 128")
     parser.add_argument("--no-warmup", action='store_true', help="Skip startup compilation/warmup; the first request pays this cost")
+    parser.add_argument("--keep-warm", type=float, default=120.0, metavar='SECONDS',
+                        help="Keep the GPU ready for this long after each request (a ~15 ms touch per second); 0 disables")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
     args = parser.parse_args(argv)
@@ -463,6 +498,8 @@ def main(argv=None):
     model_name = args.served_model_name or (assets.model_dir.name if Path(args.model).expanduser().exists() else args.model)
     if not args.no_warmup:
         backend.warmup(model_name)
+    if args.keep_warm > 0:
+        backend.keep_warm(args.keep_warm)
     app = create_app(backend, model_name, api_key)
     logging.getLogger(__name__).info('lithos-metal ready: http://%s:%s — model=%s; DSpark=%s; verification rows=%s',
                                    args.host, args.port, model_name, args.draft or 'disabled', assets.gamma + 1)

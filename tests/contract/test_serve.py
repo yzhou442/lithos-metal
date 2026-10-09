@@ -186,3 +186,42 @@ def test_warmup_runs_the_prompt_graph_once():
     # two short requests on the resident decoder, then one longer than any prompt it keeps resident (512-row chunks)
     assert seen[:2] == [1, 1] and len(seen) == 3 and seen[2] > 512
     assert backend.last_metrics == {}
+
+
+def test_keep_warm_touches_idle_programs_only_within_its_window(monkeypatch):
+    import monolith.serve as serve
+    touches, naps = [], []
+    backend = Backend.__new__(Backend)
+    backend.session = SimpleNamespace(touch=lambda: touches.append(True))
+    clock = {'now': 100.0}
+    monkeypatch.setattr(serve.time, 'monotonic', lambda: clock['now'])
+    steps = iter([
+        lambda: None,                                      # 1 s after the request: touch
+        lambda: backend._gpu().acquire(),                  # a generation holds the GPU: skip
+        lambda: (backend._gpu().release(), clock.update(now=150.0)),   # outside the window: skip
+    ])
+    def sleep(seconds):
+        naps.append(seconds)
+        step = next(steps, None)
+        if step is None:
+            raise SystemExit                               # end the daemon loop
+        step()
+    monkeypatch.setattr(serve.time, 'sleep', sleep)
+    started = []
+    monkeypatch.setattr(serve.threading, 'Thread', lambda target, **kwargs: SimpleNamespace(start=lambda: started.append(target)))
+    backend.last_active = 99.0
+    backend.keep_warm(30)
+    with pytest.raises(SystemExit):
+        started[0]()
+    assert touches == [True] and naps == [1.0] * 4
+    assert backend._gpu().acquire(blocking=False)
+
+
+def test_complete_records_activity_and_serializes_on_the_gpu_lock(monkeypatch):
+    import monolith.serve as serve
+    backend = Backend.__new__(Backend)
+    monkeypatch.setattr(serve.time, 'monotonic', lambda: 42.0)
+    held = []
+    backend._complete = lambda request, **options: held.append(not backend._gpu().acquire(blocking=False)) or 'done'
+    assert backend.complete(object()) == 'done' and held == [True]
+    assert backend.last_active == 42.0 and backend._gpu().acquire(blocking=False)

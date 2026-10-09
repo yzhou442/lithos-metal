@@ -247,6 +247,18 @@ class Session:
             op.bindings = [(slot, renames.get(n, n), off) for slot, n, off in op.bindings]
         return prog
 
+    def touch(self) -> None:
+        """Replay each loaded program once with StepState.done set: every kernel returns at its first instruction,
+        but the command buffer references the program's buffers. After about two idle seconds the first command
+        buffer of a large program otherwise waits ~0.2 s before it starts; a touch per second keeps that away. The
+        next request's reset() clears ``done``."""
+        for eng in list(self.engines.values()):
+            st = eng.buffers[eng.program.step_state]
+            state = eng.program.layout.unpack(st.read(0, eng.program.layout.size))
+            state['done'] = 1
+            st.write(eng.program.layout.pack(state), 0)
+            eng.run(1, steps_per_cb=1, in_flight=1)
+
     def _settle(self, *, raise_error=True) -> None:
         """Wait for a decoder mapped in the background; re-raise its failure for the request that needs it."""
         prefetch, self._prefetch = getattr(self, '_prefetch', None), None

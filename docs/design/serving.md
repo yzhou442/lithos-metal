@@ -82,6 +82,11 @@ states, scratch and identical weight mappings to the new one instead of allocati
 Buffers stay in one Metal residency set while they are allocated, so switching between the prompt and decode
 programs does not declare them again per command buffer (`LITHOS_RESIDENCY_SET=0` restores the declarations).
 
+After about two idle seconds, the first command buffer of a large program waits roughly 0.2 s before it starts.
+For `--keep-warm` seconds after each request (default 120, `0` disables), the server replays the loaded programs
+once a second with every kernel returning at its first instruction (about 15 ms of GPU time), so the next request
+starts at once.
+
 ## Prefix caching and memory ownership
 
 [Prefix checkpoints](../../monolith/runtime/prefix_cache.py) contain target and draft state for an exact
