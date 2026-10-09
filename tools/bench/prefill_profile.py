@@ -24,6 +24,8 @@ def main():
     parser.add_argument('--repeats', type=int, default=3)
     parser.add_argument('--counters', action='store_true')
     parser.add_argument('--original', action='store_true', help='Disable prefill compiler tuning and scratch reuse')
+    parser.add_argument('--exact', action='store_true', help='The served default: chunks with the 128-row results')
+    parser.add_argument('--rows', type=int, default=None, help='Tokens in the profiled pass (default: --chunk)')
     parser.add_argument('--out', required=True)
     args = parser.parse_args()
     from monolith.serve import parse_args
@@ -34,10 +36,11 @@ def main():
     assets = prepare(parse_args(['--model', args.model, '--local-files-only',
                                 '--max-context', str(max(32768, max(args.positions)+args.chunk+8))]))
     _, options = assets.options(max(args.positions) + args.chunk)
-    options['prefill_attention'] = args.attention
+    if args.attention != 'auto' or not args.exact:
+        options['prefill_attention'] = args.attention
     session = load_session(str(assets.model_dir), str(assets.pack_dir), **options,
                            prefill_chunk_size=args.chunk, autotune=False, eos=-1,
-                           prefill_optimizations=not args.original)
+                           prefill_optimizations=not args.original, prefill_exact=args.exact)
     print('Compiling prefill', args.chunk, args.attention, flush=True)
     engine = session.prefill_engine()
     program = engine.program
@@ -56,8 +59,9 @@ def main():
         def reset():
             session.reset(preserve_kv=True)
             state = engine.state()
-            state.update(position=position, t_this_step=args.chunk,
-                         pending_tokens=[9707] * args.chunk, prefill_left=2, stop_at=0)
+            rows = args.rows or args.chunk
+            state.update(position=position, t_this_step=rows,
+                         pending_tokens=[9707] * rows, prefill_left=2, stop_at=0)
             engine.buffers[program.step_state].write(program.layout.pack(state), 0)
         samples=[]
         for rep in range(args.repeats+1):
