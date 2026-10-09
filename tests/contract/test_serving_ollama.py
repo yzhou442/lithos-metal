@@ -497,3 +497,29 @@ def test_total_duration_includes_the_queue():
     first.join(5)
     second.join(5)
     assert queued[0]['total_duration'] >= 250_000_000
+
+
+def test_a_probe_that_sees_an_overdue_deadline_restarts_the_period():
+    from monolith.serve import KeepAlive
+    model, lock = Model(), threading.Lock()
+    keeper = KeepAlive(model, lock)
+    keeper.touch(30)
+    with keeper.condition:
+        keeper.deadline, epoch = time.monotonic() - 1, keeper.epoch          # overdue, not yet seen by the expiry
+    keeper.run(lambda: keeper._probe_load(keeper.epoch))
+    keeper.run(lambda: keeper._unload(epoch))
+    assert model.loaded and keeper.deadline > time.monotonic()
+
+
+def test_probes_queue_one_worker():
+    from monolith.serve import KeepAlive
+    model, lock = Model(), threading.Lock()
+    model.loaded = False
+    keeper = KeepAlive(model, lock)
+    before = threading.active_count()
+    with lock:                                                                # a long request owns the model
+        for _ in range(50):
+            keeper.preload()
+        assert threading.active_count() - before <= 1
+    wait_for(lambda: model.loaded)
+    assert model.events == ['load']

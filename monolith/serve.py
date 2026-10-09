@@ -253,6 +253,7 @@ class KeepAlive:
     def __init__(self, backend, lock, seconds=math.inf):
         self.backend, self.lock, self.default = backend, lock, seconds
         self.deadline, self.recent, self.busy, self.epoch = None, seconds, False, 0
+        self.probing, self.probe_epoch = False, 0
         self.condition = threading.Condition()
         if hasattr(backend, 'unload'):
             threading.Thread(target=self._expire, name='keep-alive', daemon=True).start()
@@ -282,11 +283,19 @@ class KeepAlive:
             self.lock.release()
 
     def preload(self):
-        # Queue behind whatever owns the model (a request, a load or an unload in progress); residency is
-        # decided under the model lock.
-        epoch = self.epoch
-        threading.Thread(target=self._background, args=(lambda: self._probe_load(epoch),), kwargs={'wait': True},
-                         daemon=True).start()
+        # One worker queues behind whatever owns the model (a request, a load or an unload in progress) for any
+        # number of probes, and decides residency under the model lock for the latest of them.
+        with self.condition:
+            self.probe_epoch = self.epoch
+            if self.probing:
+                return
+            self.probing = True
+        threading.Thread(target=self._background, args=(self._probe,), kwargs={'wait': True}, daemon=True).start()
+
+    def _probe(self):
+        with self.condition:
+            self.probing, epoch = False, self.probe_epoch
+        self._probe_load(epoch)
 
     def unload(self):
         """Run while owning the model: unload it. A probe accepted before stands down; one accepted while the
@@ -303,7 +312,7 @@ class KeepAlive:
             return
         if not getattr(self.backend, 'loaded', True):
             self.load(max(self.recent, self.PROBE_HOLD))
-        elif self.deadline is None and not math.isinf(self.recent):
+        elif (self.deadline is None or self.deadline <= time.monotonic()) and not math.isinf(self.recent):
             self.touch(max(self.recent, self.PROBE_HOLD))
 
     def load(self, seconds=None):
