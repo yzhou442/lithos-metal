@@ -458,3 +458,42 @@ def test_a_probe_that_beats_a_pending_expiry_keeps_the_model():
     keeper.run(lambda: keeper._probe_load(keeper.epoch))                      # the probe gets the model first
     keeper.run(lambda: keeper._unload(epoch))
     assert model.loaded and keeper.deadline is not None
+
+
+def test_a_probe_during_an_explicit_unload_loads_after_it():
+    from monolith.serve import KeepAlive
+    model, lock, entered, release = Model(), threading.Lock(), threading.Event(), threading.Event()
+    keeper = KeepAlive(model, lock)
+    def slow_unload():
+        entered.set()
+        assert release.wait(5)
+        Model.unload(model)
+    model.unload = slow_unload
+    worker = threading.Thread(target=lambda: keeper.run(keeper.unload))
+    worker.start()
+    assert entered.wait(5)
+    keeper.preload()                                                          # arrives while the unload runs
+    release.set()
+    worker.join(5)
+    wait_for(lambda: model.loaded)
+
+
+def test_total_duration_includes_the_queue():
+    entered, release = threading.Event(), threading.Event()
+    def complete(request, **_):
+        if not entered.is_set():
+            entered.set()
+            assert release.wait(5)
+        return 'ok', 'stop', 1, 1
+    client = TestClient(create_app(SimpleNamespace(complete=complete, last_metrics={}), 'local'))
+    first = threading.Thread(target=lambda: client.post('/api/chat', json=chat(stream=False)))
+    first.start()
+    assert entered.wait(5)
+    queued = []
+    second = threading.Thread(target=lambda: queued.append(client.post('/api/chat', json=chat(stream=False)).json()))
+    second.start()
+    time.sleep(.3)
+    release.set()
+    first.join(5)
+    second.join(5)
+    assert queued[0]['total_duration'] >= 250_000_000

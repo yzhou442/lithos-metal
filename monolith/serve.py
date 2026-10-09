@@ -289,10 +289,11 @@ class KeepAlive:
                          daemon=True).start()
 
     def unload(self):
-        """Run while owning the model: unload it, and make a probe accepted earlier stand down."""
-        self.backend.unload()
+        """Run while owning the model: unload it. A probe accepted before stands down; one accepted while the
+        unload runs loads the model again after it."""
         with self.condition:
             self.epoch, self.deadline, self.recent = self.epoch + 1, None, 0
+        self.backend.unload()
 
     def _probe_load(self, epoch):
         # A request that ran after the probe has loaded the model and set its own period. A resident model keeps
@@ -394,9 +395,11 @@ def create_app(backend, model_name, api_key=None, *, keep_alive=math.inf):
 
     def dispatch(request, protocol, custom=(), *, keep_alive=None, wait=False):
         validate_model(request)
+        arrived = time.perf_counter()                   # Ollama's total_duration includes the queue
         if not acquire(wait):
             raise APIError("The model is busy; retry after the current request finishes", 429, "model_busy")
         wire = WireResponse(protocol, model_name, custom, request.stream_usage if request.stream else None)
+        wire.started = arrived
         if request.stream:
             return stream(request, wire, keep_alive)
         try:
