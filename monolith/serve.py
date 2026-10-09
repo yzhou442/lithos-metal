@@ -282,10 +282,15 @@ class KeepAlive:
             self.lock.release()
 
     def preload(self):
-        # A probe that no request follows still ends in an unload.
         if not getattr(self.backend, 'loaded', True) and not self.busy:
-            threading.Thread(target=self._background, args=(lambda: self.load(max(self.recent, self.PROBE_HOLD)),),
-                             daemon=True).start()
+            epoch = self.epoch
+            threading.Thread(target=self._background, args=(lambda: self._probe_load(epoch),), daemon=True).start()
+
+    def _probe_load(self, epoch):
+        # A request that ran after the probe has loaded the model and set its own period. Otherwise a probe that
+        # no request follows still ends in an unload.
+        if self.epoch == epoch:
+            self.load(max(self.recent, self.PROBE_HOLD))
 
     def load(self, seconds=None):
         """Run while owning the model: load it and restart the period, so an expiry waiting for the model sees a

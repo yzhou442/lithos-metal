@@ -125,6 +125,7 @@ def test_latest_is_the_same_model(served):
     {'format': 'json'}, {'format': {'type': 'object'}}, {'think': True}, {'think': 'high'}, {'logprobs': True},
     {'options': {'repeat_penalty': 1.1}}, {'options': {'min_p': 0.05}}, {'options': {'num_predict': 0}}, {'options': 'fast'},
     {'messages': [{'role': 'user', 'content': 'Describe this', 'images': ['aGk=']}]}, {'keep_alive': 'soon'},
+    {'truncate': True}, {'shift': True},
 ])
 def test_rejects_what_it_cannot_honor(fields):
     def unexpected(*_args, **_options):
@@ -365,3 +366,15 @@ def test_an_unbounded_keep_alive_leaves_the_timer_working():
     assert client.get('/api/ps').json()['models'][0]['expires_at'] is None
     client.post('/api/chat', json=chat(stream=False, keep_alive=0))
     wait_for(lambda: not model.loaded)
+
+
+def test_a_probe_overtaken_by_a_request_does_nothing():
+    from monolith.serve import KeepAlive
+    model, lock = Model(), threading.Lock()
+    model.loaded = False
+    keeper = KeepAlive(model, lock)
+    epoch = keeper.epoch                                                      # the probe was accepted
+    keeper.touch(0)                                                           # a keep_alive 0 request ran first
+    keeper.run(lambda: keeper._probe_load(epoch))
+    assert not model.loaded and model.events == []
+    assert ollama_request(chat(truncate=False, shift=False)).messages

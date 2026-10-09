@@ -449,6 +449,9 @@ def ollama_request(body, served=''):
         raise APIError('Thinking is unavailable on this serving path; set think=false', param='think')
     if body.get('logprobs'):
         raise APIError('logprobs are not supported', param='logprobs')
+    for name in ('truncate', 'shift'):
+        if body.get(name):
+            raise APIError(f'{name} is not supported: the conversation must fit the context; set {name}=false', param=name)
     options = body.get('options') or {}
     for name, neutral in OLLAMA_NEUTRAL_OPTIONS.items():
         if options.get(name, neutral) != neutral:
