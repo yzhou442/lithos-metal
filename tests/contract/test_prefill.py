@@ -234,6 +234,7 @@ def test_projection_geometry_two_token_blocks_halve_the_token_planes():
     p = program()
     projection_geometry(p, p.ops[0], tm=32, tn=16, sgs=16, groups=160, token_blocks=2)
     assert (p.ops[0].grid, p.kernels[p.ops[0].kernel].macros['TB2']) == ((160, 8, 1), '1')
+    assert p.kernels[p.ops[0].kernel].macros['SHARE_PLANES'] == '1'       # short chunks use the idle planes
     p = program()
     projection_geometry(p, p.ops[0], tm=32, tn=16, sgs=16, groups=160)
     assert p.ops[0].grid == (160, 16, 1) and 'TB2' not in p.kernels[p.ops[0].kernel].macros

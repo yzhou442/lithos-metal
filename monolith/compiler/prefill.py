@@ -47,7 +47,8 @@ def projection_geometry(program, op, *, tm, tn, sgs, groups, token_blocks=1):
     key = op.kernel + f'.prefill.{tm}.{tn}.{sgs}.{groups}' + ('.tb2' if token_blocks == 2 else '')
     kernel = copy.deepcopy(old)
     oldtn = int(kernel.macros['TN'].rstrip('u'))
-    kernel.macros.update(TM=str(tm), TN=f'{tn}u', KSPLIT='1u', SCALE_CACHE='0')
+    # SHARE_PLANES: a chunk shorter than the program's rows spreads its tiles over the idle token planes.
+    kernel.macros.update(TM=str(tm), TN=f'{tn}u', KSPLIT='1u', SCALE_CACHE='0', SHARE_PLANES='1')
     if token_blocks == 2:
         kernel.macros['TB2'] = '1'
     pn, off = next((n, o) for slot, n, o in op.bindings if slot == 4)

@@ -43,6 +43,9 @@ using namespace mpp::tensor_ops;
 #ifndef TB2
 #define TB2 0                        // 1: each SIMD group multiplies its decoded weight tile with two TM-token blocks
 #endif
+#ifndef SHARE_PLANES
+#define SHARE_PLANES 0               // 1: grid.y planes beyond a short step's tokens take over tiles of the planes with tokens
+#endif
 #ifndef STEP_STATE
 #define STEP_STATE 0                 // 1: the row count comes from StepState (buffer 15) and the dispatch is a per-T variant
 #endif
@@ -236,11 +239,16 @@ kernel void gemm_tile(device const uint4* w [[buffer(0)]], device const float* r
                       device const StepState* st [[buffer(15)]],
 #endif
                       uint3 gid [[thread_position_in_grid]], uint lane [[thread_index_in_simdgroup]], uint sw [[threads_per_simdgroup]],
+#if SHARE_PLANES
+                      uint3 planes [[threadgroups_per_grid]],
+#endif
                       uint3 group [[threadgroup_position_in_grid]]) {
   const uint sg = gid.x / sw;
 #if KSPLIT > 1
   const uint slice = sg % KSPLIT, sg_tile = sg / KSPLIT, n_tg = p.n_sg / KSPLIT;   // a threadgroup is the KSPLIT SIMD-groups of one tile
   threadgroup float part[KSPLIT - 1][PART_LANES][PART_CAP];                            // the partial tiles of slices 1 … KSPLIT-1
+#elif SHARE_PLANES
+  uint sg_tile = sg, n_tg = p.n_sg;                                     // remapped below for a short step
 #else
   const uint sg_tile = sg, n_tg = p.n_sg;
 #endif
@@ -256,7 +264,25 @@ kernel void gemm_tile(device const uint4* w [[buffer(0)]], device const float* r
 #endif
   // Each grid.y plane processes at most TM tokens. Predication above uses the
   // full step length; all following addressing and guards are local to this tile.
-  uint token0 = group.y * TM * (TB2 ? 2u : 1u);
+  uint plane = group.y;
+#if SHARE_PLANES
+#if KSPLIT > 1
+#error "shared planes need an unsplit reduction"
+#endif
+  {
+    // A short step leaves planes idle: spread each active plane's tiles over replicas of it. A tile's products,
+    // order and epilogue are unchanged; a step that fills every plane keeps the one-plane-per-group mapping.
+    const uint active = (T_act + TM * (TB2 ? 2u : 1u) - 1u) / (TM * (TB2 ? 2u : 1u));
+    if (active < planes.y) {
+      const uint replicas = planes.y / active;
+      if (group.y >= active * replicas) return;
+      plane = group.y % active;
+      sg_tile += (group.y / active) * n_tg;
+      n_tg *= replicas;
+    }
+  }
+#endif
+  uint token0 = plane * TM * (TB2 ? 2u : 1u);
   if (token0 >= T_act) return;
 #if TB2
   // Two token blocks share every weight-tile fill; the second block's epilogue reuses the first's code.
