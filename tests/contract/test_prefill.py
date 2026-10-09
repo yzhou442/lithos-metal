@@ -257,3 +257,16 @@ def test_projection_geometry_two_token_blocks_halve_the_token_planes():
     p = program()
     with pytest.raises(ValueError, match='one or two token blocks'):
         projection_geometry(p, p.ops[0], tm=32, tn=16, sgs=16, groups=160, token_blocks=3)
+
+
+def test_prompt_gdn_recurrence_sums_four_columns_in_one_butterfly():
+    from monolith.backends.metal.m5_max_40c.prefill import optimize
+    params = struct.pack('<III', 48, 16, 512) + bytes(68)
+    def program(sl):
+        kernel = KernelSpec('', 'gdn_mixer', {'PREPARED': '1', 'DK': '128u', 'DV': '128u', 'SL': sl})
+        op = OpSpec('mix', [(9, 'params', 0)], (1, 1, 1), (32, 1, 1), name='gdn_mixer')
+        return Program({'mix': kernel}, {'params': BufferSpec(80, params, 'params')}, [op])
+    p = optimize(program('4u'))
+    assert p.kernels[p.ops[0].kernel].macros['TREE_REDUCE'] == '1' and p.kernels[p.ops[0].kernel].macros['TP'] == '512u'
+    p = optimize(program('8u'))
+    assert 'TREE_REDUCE' not in p.kernels[p.ops[0].kernel].macros

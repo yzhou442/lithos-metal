@@ -100,6 +100,9 @@ def optimize(program, exact=False):
                 key = op.kernel+f'.prefill.tp{rows}'
                 private = copy.deepcopy(k)
                 private.macros['TP'] = f'{rows}u'
+                if private.macros.get('SL', '').rstrip('u') == '4':
+                    # four columns' lane sums in one transposed butterfly, summed as simd_sum sums them
+                    private.macros['TREE_REDUCE'] = '1'
                 program.kernels[key] = private
                 op.kernel = key
             continue
