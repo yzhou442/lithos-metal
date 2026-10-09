@@ -378,3 +378,22 @@ def test_a_probe_overtaken_by_a_request_does_nothing():
     keeper.run(lambda: keeper._probe_load(epoch))
     assert not model.loaded and model.events == []
     assert ollama_request(chat(truncate=False, shift=False)).messages
+
+
+def test_an_explicit_unload_overtakes_a_pending_probe():
+    from monolith.serve import KeepAlive
+    model, lock = Model(), threading.Lock()
+    keeper = KeepAlive(model, lock)
+    epoch = keeper.epoch                                                      # a probe was accepted
+    keeper.run(keeper.unload)                                                 # then keep_alive 0 without messages
+    keeper.run(lambda: keeper._probe_load(epoch))
+    assert not model.loaded and model.events == ['unload']
+
+
+def test_ollama_accepts_any_number_of_stop_strings():
+    stops = [f'<{i}>' for i in range(6)]
+    assert ollama_request(chat(options={'stop': stops})).stop == stops
+    client, _ = make_client()
+    body = {'model': 'local', 'messages': [{'role': 'user', 'content': 'hi'}], 'stop': stops}
+    assert client.post('/v1/chat/completions', json=body).status_code == 400  # Chat Completions keeps four
+    assert client.post('/api/chat', json=chat(stream=False, options={'stop': ['']})).status_code == 400

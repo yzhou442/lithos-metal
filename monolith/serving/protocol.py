@@ -72,6 +72,7 @@ class ToolDefinition(BaseModel):
 
 class ChatRequest(BaseModel):
     model_config = ConfigDict(extra='forbid', strict=True, allow_inf_nan=False)
+    MAX_STOPS: ClassVar[int | None] = 4
     model: str
     messages: list[Message] = Field(min_length=1)
     max_tokens: int | None = Field(default=None, ge=1)
@@ -98,8 +99,10 @@ class ChatRequest(BaseModel):
         if self.max_tokens is not None and self.max_completion_tokens is not None:
             raise ValueError('Pass only one of max_tokens and max_completion_tokens')
         stops = [self.stop] if isinstance(self.stop, str) else self.stop or []
-        if len(stops) > 4 or any(not s for s in stops):
-            raise ValueError('stop must contain at most four nonempty strings')
+        if any(not s for s in stops):
+            raise ValueError('stop strings must be nonempty')
+        if self.MAX_STOPS is not None and len(stops) > self.MAX_STOPS:
+            raise ValueError('stop must contain at most four strings')
         if self.response_format and self.response_format != {'type': 'text'}:
             raise ValueError('Constrained JSON output is not supported')
         if self.reasoning_effort not in (None, 'none'):
@@ -403,6 +406,7 @@ class OllamaChatRequest(ChatRequest):
     """Ollama's num_predict bounds the output: absent, negative or beyond the context, generation ends at a stop or
     the context capacity."""
     within_context: ClassVar[bool] = True
+    MAX_STOPS: ClassVar[int | None] = None                 # Ollama does not limit stop sequences
 
     @property
     def token_limit(self):

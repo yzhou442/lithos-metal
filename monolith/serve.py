@@ -286,6 +286,12 @@ class KeepAlive:
             epoch = self.epoch
             threading.Thread(target=self._background, args=(lambda: self._probe_load(epoch),), daemon=True).start()
 
+    def unload(self):
+        """Run while owning the model: unload it, and make a probe accepted earlier stand down."""
+        self.backend.unload()
+        with self.condition:
+            self.epoch, self.deadline = self.epoch + 1, None
+
     def _probe_load(self, epoch):
         # A request that ran after the probe has loaded the model and set its own period. Otherwise a probe that
         # no request follows still ends in an unload.
@@ -548,7 +554,7 @@ def create_app(backend, model_name, api_key=None, *, keep_alive=math.inf):
         unload = keep_alive == 0
         if hasattr(backend, 'unload'):
             try:
-                keeper.run(backend.unload if unload else lambda: keeper.load(keep_alive))
+                keeper.run(keeper.unload if unload else lambda: keeper.load(keep_alive))
             except Exception as exc:
                 logging.getLogger(__name__).exception('Model load failed')
                 raise APIError('Model load failed; see server logs', 500, 'load_failed') from exc
