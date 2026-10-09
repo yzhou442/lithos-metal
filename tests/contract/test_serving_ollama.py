@@ -84,6 +84,15 @@ def test_voxt_request():
                                             {'role': 'user', 'content': 'helo world'}]
 
 
+def test_body_is_json_without_a_content_type():
+    client, seen = make_client()
+    response = client.post('/api/chat', content=json.dumps(chat(stream=False)), headers={'Content-Type': ''})
+    assert response.status_code == 200 and response.json()['message']['content'] == 'Hello world.'
+    for body in ('{"model": ', '[1]'):
+        response = client.post('/api/chat', content=body)
+        assert response.status_code == 400 and isinstance(response.json()['error'], str)
+
+
 def test_streams_ndjson_by_default():
     client, _ = make_client()
     chunks = lines(client.post('/api/chat', json=chat()))
@@ -276,3 +285,32 @@ def test_stop_strings_end_a_non_streaming_generation():
     backend.tokenizer = SimpleNamespace(apply_chat_template=lambda *a, **kw: [1, 2, 3], decode=decode)
     content, finish, _, completion = backend.complete(ollama_request(chat(stream=False, options={'stop': ['\n\n']})))
     assert (content, finish, completion) == ('Hello world', 'stop', 3)                # not 62 tokens of context
+
+
+def test_an_expiry_that_loses_the_race_to_a_request_keeps_the_model():
+    from monolith.serve import KeepAlive
+    model, lock = Model(), threading.Lock()
+    keeper = KeepAlive(model, lock)
+    epoch = keeper.epoch                                                      # the expiry thread read this deadline
+    keeper.touch(60)                                                          # a request finished and restarted it
+    keeper.run(lambda: keeper._unload(epoch))
+    assert model.loaded
+    keeper.run(lambda: keeper._unload(keeper.epoch))
+    assert not model.loaded
+
+
+def test_load_without_warmup_starts_the_default_session(monkeypatch):
+    from monolith import generate
+    calls = []
+    def load_session(*args, **kwargs):
+        calls.append(kwargs)
+        return Session()
+    monkeypatch.setattr(generate, 'load_session', load_session)
+    backend = Backend.__new__(Backend)
+    backend.model_dir, backend.pack_dir, backend.max_context = 'model', 'pack', 64
+    backend.prefill_chunk_size, backend.prefill_exact = 128, False
+    backend.session, backend.sampling = None, None
+    backend.tokenizer = SimpleNamespace(apply_chat_template=lambda *a, **kw: [1, 2])
+    assert not backend.loaded
+    backend.load()
+    assert backend.loaded and backend.session.generated == [1] and calls[0]['temperature'] == 0

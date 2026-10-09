@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import gc
+import json
 import math
 import queue
 import logging
@@ -216,12 +217,14 @@ class Backend:
         logging.getLogger(__name__).info('Unloaded the model')
 
     def load(self):
-        """Map the most recent session again by generating one token for a short prompt."""
-        if self.session is None or self.loaded:
+        """Map the most recent session again, or the default one, by generating one token for a short prompt."""
+        if self.loaded:
             return
         started = time.perf_counter()
         ids = self.tokenizer.apply_chat_template([{'role': 'user', 'content': 'Hello'}], tokenize=True,
                                                  return_dict=False, add_generation_prompt=True, enable_thinking=False)
+        if self.session is None:                         # --no-warmup
+            self.select_session(ChatRequest(model='', messages=[Message(role='user', content='Hello')]), len(ids))
         self.session.generate(ids, 1)
         logging.getLogger(__name__).info('Loaded the model in %.2f s', time.perf_counter() - started)
 
@@ -246,7 +249,7 @@ class KeepAlive:
 
     def __init__(self, backend, lock, seconds=math.inf):
         self.backend, self.lock, self.default = backend, lock, seconds
-        self.deadline, self.recent, self.busy = None, seconds, False
+        self.deadline, self.recent, self.busy, self.epoch = None, seconds, False, 0
         self.condition = threading.Condition()
         if hasattr(backend, 'unload'):
             threading.Thread(target=self._expire, name='keep-alive', daemon=True).start()
@@ -256,7 +259,7 @@ class KeepAlive:
         """Restart the idle period: the finished request's keep_alive, else the server's."""
         seconds = self.default if seconds is None else seconds
         with self.condition:
-            self.recent = seconds
+            self.recent, self.epoch = seconds, self.epoch + 1
             self.deadline = None if math.isinf(seconds) else time.monotonic() + seconds
             self.condition.notify()
 
@@ -283,7 +286,7 @@ class KeepAlive:
         try:
             self.run(action, wait=False)
         except Exception:
-            logging.getLogger(__name__).exception('Model %s failed', action.__name__)
+            logging.getLogger(__name__).exception('Background model load or unload failed')
         if restart:
             # A probe that no request follows still ends in an unload.
             self.touch(max(self.recent, self.PROBE_HOLD))
@@ -293,10 +296,15 @@ class KeepAlive:
             with self.condition:
                 while self.deadline is None or self.deadline > time.monotonic():
                     self.condition.wait(None if self.deadline is None else self.deadline - time.monotonic())
-                self.deadline = None
+                self.deadline, epoch = None, self.epoch
             # A request in progress restarts the period when it finishes.
             if self.backend.loaded:
-                self._background(self.backend.unload)
+                self._background(lambda: self._unload(epoch))
+
+    def _unload(self, epoch):
+        # The period may have restarted between the deadline and this thread taking the model lock.
+        if self.epoch == epoch:
+            self.backend.unload()
 
 
 def create_app(backend, model_name, api_key=None, *, keep_alive=math.inf):
@@ -352,8 +360,8 @@ def create_app(backend, model_name, api_key=None, *, keep_alive=math.inf):
         return lock.acquire(blocking=False) or ((wait or keeper.busy) and lock.acquire(timeout=-1 if wait else 120))
 
     def release(keep_alive):
+        keeper.touch(keep_alive)                         # while the request still owns the model
         lock.release()
-        keeper.touch(keep_alive)
 
     def dispatch(request, protocol, custom=(), *, keep_alive=None, wait=False):
         validate_model(request)
@@ -492,6 +500,16 @@ def create_app(backend, model_name, api_key=None, *, keep_alive=math.inf):
         request, custom = convert(body, responses_request)
         return dispatch(request, 'responses', custom)
 
+    async def json_body(request: Request):
+        # Ollama reads any request body as JSON; its documented curl calls send no Content-Type.
+        try:
+            body = json.loads(await request.body() or b'{}')
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            raise APIError(f'Invalid JSON body: {exc}') from exc
+        if not isinstance(body, dict):
+            raise APIError('The request body must be a JSON object')
+        return body
+
     def ollama_entry(**fields):
         return {'name': model_name, 'model': model_name, 'modified_at': ollama_time(created), 'size': 0,
                 'digest': '', 'details': {}, **fields}
@@ -503,7 +521,7 @@ def create_app(backend, model_name, api_key=None, *, keep_alive=math.inf):
         return Response()
 
     @app.post('/api/chat', dependencies=[Depends(authorize)])
-    def ollama_chat(body: dict):
+    def ollama_chat(body: dict = Depends(json_body)):
         keep_alive = None if body.get('keep_alive') in (None, '') else keep_alive_seconds(body['keep_alive'])
         if body.get('messages'):
             return dispatch(convert(body, lambda body: ollama_request(body, model_name)), 'ollama',
