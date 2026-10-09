@@ -22,6 +22,7 @@ CODE_SUFFIXES = {".py", ".mm", ".m", ".cpp", ".cc", ".h", ".hpp", ".metal", ".tx
 IMPORT_RE = re.compile(r"^\s*(import\s+mirage\b|from\s+mirage\b)", re.MULTILINE)
 FORBIDDEN_IDENT = re.compile(r"(mpk|mirage)", re.IGNORECASE)
 MODEL_TOKENS = ("qwen", "llama", "deepseek", "gemma", "kimi", "mistral", "gpt", "phi", "yi_", "glm", "minimax")
+NOT_MODELS = ("ollama",)              # serving APIs whose names contain a model token
 SKIP_DIRS = {".git", ".venv", "build", "node_modules", "__pycache__", ".pytest_cache", "third_party"}
 
 
@@ -75,6 +76,8 @@ def check_model_names(root: Path) -> List[str]:
             if tok.type == tokenize.STRING and (tok.string.endswith('"""') or tok.string.endswith("'''")):
                 continue                      # docstrings may cite checkpoints and other engines; code may not
             low = tok.string.lower()
+            for name in NOT_MODELS:
+                low = low.replace(name, "")
             hit = next((t for t in MODEL_TOKENS if t in low), None)
             if hit:
                 out.append(f"{rel}:{tok.start[0]}: {tok.string[:40]!r} names a model ({hit}) outside monolith/models/")

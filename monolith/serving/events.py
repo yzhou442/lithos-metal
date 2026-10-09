@@ -1,4 +1,5 @@
-"""Wire responses and SSE lifecycle events for local agent clients."""
+"""Wire responses and SSE lifecycle events for local agent clients (NDJSON for Ollama)."""
+from datetime import datetime, timezone
 import json
 import time
 import uuid
@@ -11,6 +12,16 @@ def sse(data, event=None):
         data if isinstance(data, str) else json.dumps(data, ensure_ascii=False)) + '\n\n'
 
 
+def ndjson(data):
+    return json.dumps(data, ensure_ascii=False) + '\n'
+
+
+def ollama_time(seconds=None):
+    """RFC 3339 UTC, as Ollama reports created_at / expires_at."""
+    moment = datetime.now(timezone.utc) if seconds is None else datetime.fromtimestamp(seconds, timezone.utc)
+    return moment.isoformat().replace('+00:00', 'Z')
+
+
 class WireResponse:
     def __init__(self, protocol, model, custom=(), usage=None):
         self.protocol, self.model, self.custom = protocol, model, custom
@@ -19,7 +30,7 @@ class WireResponse:
         self.usage = usage if protocol == 'chat' else None
         self.output_tokens = 0
         self.reported_tokens = None
-        self.id = {'chat': 'chatcmpl-', 'messages': 'msg_', 'responses': 'resp_'}[protocol] + uuid.uuid4().hex
+        self.id = {'chat': 'chatcmpl-', 'messages': 'msg_', 'responses': 'resp_', 'ollama': ''}[protocol] + uuid.uuid4().hex
         self.item_id = 'msg_' + uuid.uuid4().hex
         self.created = int(time.time())
         self.sequence = 0
@@ -27,6 +38,8 @@ class WireResponse:
         self.text = ''
         self.text_started = False
         self.tool_calls = []
+        self.started = time.perf_counter()
+        self.metrics = {}                  # the backend's timings for this request (Ollama's durations)
 
     def event(self, kind, **data):
         if self.protocol == 'responses':
@@ -60,7 +73,21 @@ class WireResponse:
         return {'type': 'message', 'id': self.item_id, 'role': 'assistant', 'status': status,
                 'content': [{'type': 'output_text', 'text': text, 'annotations': []}]}
 
+    def ollama_chunk(self, message, **fields):
+        return ndjson({'model': self.model, 'created_at': ollama_time(),
+                       'message': {'role': 'assistant', **message}, **fields})
+
+    def ollama_stats(self, prompt_tokens, completion_tokens):
+        ns = lambda ms: int(max(0.0, ms or 0.0) * 1e6)
+        prefill_ms = self.metrics.get('prefill_wall_ms', 0.0)
+        return {'total_duration': int((time.perf_counter() - self.started) * 1e9),
+                'load_duration': ns(self.metrics.get('setup_ms')), 'prompt_eval_count': prompt_tokens,
+                'prompt_eval_duration': ns(prefill_ms), 'eval_count': completion_tokens,
+                'eval_duration': ns(self.metrics.get('wall_ms', 0.0) - prefill_ms)}
+
     def start(self):
+        if self.protocol == 'ollama':
+            return
         if self.protocol == 'chat':
             yield self.chat_chunk({'role': 'assistant', 'content': ''})
         elif self.protocol == 'messages':
@@ -76,6 +103,8 @@ class WireResponse:
             return
         if self.protocol == 'chat':
             yield self.chat_chunk({'content': text})
+        elif self.protocol == 'ollama':
+            yield self.ollama_chunk({'content': text}, done=False)
         elif self.protocol == 'messages':
             if not self.text_started:
                 yield self.event('content_block_start', index=0, content_block={'type': 'text', 'text': ''})
@@ -112,6 +141,14 @@ class WireResponse:
     def body(self, message, finish, prompt_tokens, completion_tokens):
         calls = message.get('tool_calls', [])
         text = message.get('content') or ''
+        if self.protocol == 'ollama':
+            reply = {'role': 'assistant', 'content': text}
+            if calls:
+                reply['tool_calls'] = [{'function': {'name': c['function']['name'],
+                                                     'arguments': json.loads(c['function']['arguments'])}} for c in calls]
+            return {'model': self.model, 'created_at': ollama_time(), 'message': reply, 'done': True,
+                    'done_reason': 'length' if finish == 'length' else 'stop',
+                    **self.ollama_stats(prompt_tokens, completion_tokens)}
         if self.protocol == 'chat':
             return {'id': self.id, 'object': 'chat.completion', 'created': self.created, 'model': self.model,
                     'choices': [{'index': 0, 'message': message, 'finish_reason': finish, 'logprobs': None}],
@@ -166,6 +203,10 @@ class WireResponse:
             if include_usage:
                 yield sse({k: v for k, v in {**body, 'object': 'chat.completion.chunk', 'choices': []}.items()})
             yield sse('[DONE]')
+        elif self.protocol == 'ollama':
+            if body['message'].get('tool_calls'):
+                yield self.ollama_chunk({'content': '', 'tool_calls': body['message']['tool_calls']}, done=False)
+            yield ndjson({**body, 'message': {'role': 'assistant', 'content': ''}})
         elif self.protocol == 'messages':
             if self.text_started:
                 yield self.event('content_block_stop', index=0)
@@ -194,6 +235,8 @@ class WireResponse:
             yield self.event('response.' + body['status'], response=body)
 
     def error(self, message, code):
+        if self.protocol == 'ollama':
+            return ndjson({'error': message})
         if self.protocol == 'chat':
             return sse({'error': {'message': message, 'type': 'server_error', 'code': code}})
         if self.protocol == 'messages':

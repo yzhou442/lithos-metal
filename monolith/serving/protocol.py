@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 import uuid
 from typing import Literal
@@ -395,3 +396,77 @@ def responses_request(body):
         temperature=body.get('temperature', 0.0), top_p=body.get('top_p', 1.0), top_k=body.get('top_k', 0),
         stream=body.get('stream', False), reasoning_effort=body.get('reasoning', {}).get('effort'))
     return request, custom
+
+
+class OllamaChatRequest(ChatRequest):
+    """Ollama's num_predict: absent or negative generates until a stop or the context capacity."""
+
+    @property
+    def token_limit(self):
+        return self.max_completion_tokens or self.max_tokens
+
+
+DURATION = re.compile(r'([+-]?)((?:(?:\d+\.?\d*|\.\d+)(?:ns|us|µs|ms|s|m|h))+)')
+DURATION_PART = re.compile(r'(\d+\.?\d*|\.\d+)(ns|us|µs|ms|s|m|h)')
+DURATION_UNITS = {'ns': 1e-9, 'us': 1e-6, 'µs': 1e-6, 'ms': 1e-3, 's': 1, 'm': 60, 'h': 3600}
+# Sampling options without an implementation here, accepted at their neutral values. Ollama's runtime options
+# (num_ctx, num_thread, num_gpu, ...) configure its own loader and are ignored.
+OLLAMA_NEUTRAL_OPTIONS = {'min_p': 0, 'typical_p': 1, 'repeat_penalty': 1, 'presence_penalty': 0,
+                          'frequency_penalty': 0, 'mirostat': 0, 'tfs_z': 1}
+
+
+def keep_alive_seconds(value):
+    """Ollama's keep_alive: seconds (a number) or a Go duration such as "5m" or "1h30m". Zero unloads after the
+    request; a negative value keeps the model loaded (math.inf)."""
+    try:
+        if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+            raise ValueError
+        seconds = float(value)
+    except ValueError:
+        match = DURATION.fullmatch(value.strip()) if isinstance(value, str) else None
+        if match is None:
+            raise APIError('keep_alive must be a duration such as "5m" or a number of seconds', param='keep_alive') from None
+        sign, parts = match.groups()
+        seconds = (-1 if sign == '-' else 1) * sum(float(n) * DURATION_UNITS[u] for n, u in DURATION_PART.findall(parts))
+    if math.isnan(seconds):
+        raise APIError('keep_alive must be a duration such as "5m" or a number of seconds', param='keep_alive')
+    return math.inf if seconds < 0 else seconds
+
+
+def ollama_request(body):
+    """Ollama /api/chat -> ChatRequest. Defaults are this server's (greedy), not a Modelfile's."""
+    if body.get('format') not in (None, ''):
+        raise APIError('Constrained JSON output (format) is not supported', param='format')
+    if body.get('think') not in (None, False):
+        raise APIError('Thinking is unavailable on this serving path; set think=false', param='think')
+    if body.get('logprobs'):
+        raise APIError('logprobs are not supported', param='logprobs')
+    options = body.get('options') or {}
+    for name, neutral in OLLAMA_NEUTRAL_OPTIONS.items():
+        if options.get(name, neutral) != neutral:
+            raise APIError(f'options.{name} is not supported; omit it or use {neutral}', param=f'options.{name}')
+    messages, pending = [], []
+    for message in body['messages']:
+        if message.get('images'):
+            raise APIError('Only text content is supported; image inputs are unavailable', param='messages')
+        item = {'role': message['role'], 'content': message.get('content')}
+        if message.get('tool_calls'):
+            item['tool_calls'], pending = [], []
+            for i, call in enumerate(message['tool_calls']):
+                arguments = call['function'].get('arguments', {})
+                pending.append(call.get('id') or f'call_{len(messages)}_{i}')
+                item['tool_calls'].append({'id': pending[-1], 'type': 'function', 'function': {
+                    'name': call['function']['name'],
+                    'arguments': arguments if isinstance(arguments, str) else json.dumps(arguments)}})
+        elif message['role'] == 'tool':
+            # Ollama results name the tool, not a call ID: pair them with the preceding calls in order.
+            item['tool_call_id'] = message.get('tool_call_id') or (pending.pop(0) if pending else f'call_{len(messages)}')
+            if message.get('tool_name'):
+                item['name'] = message['tool_name']
+        messages.append(item)
+    predict, seed = options.get('num_predict'), options.get('seed', 0)
+    negative = lambda value: isinstance(value, (int, float)) and not isinstance(value, bool) and value < 0
+    return OllamaChatRequest(model=body['model'].removesuffix(':latest'), messages=messages, tools=body.get('tools'),
+        max_tokens=None if negative(predict) else predict, temperature=options.get('temperature', 0.0),
+        top_p=options.get('top_p', 1.0), top_k=options.get('top_k', 0), seed=0 if negative(seed) else seed,
+        stop=options.get('stop'), stream=True if body.get('stream') is None else body['stream'])

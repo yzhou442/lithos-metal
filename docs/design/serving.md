@@ -37,7 +37,8 @@ are accepted. Deferring warmup moves that cost to requests. Only one session's G
 resident, while bounded CPU program and pipeline caches can survive session replacement.
 
 `GET /health` reports process liveness after startup. `GET /v1/models` returns the served alias.
-One generation executes at a time; overlapping requests receive HTTP 429.
+One generation executes at a time; overlapping requests receive HTTP 429, except Ollama chat requests, which
+wait for the running one as Ollama queues them.
 
 ## Request execution
 
@@ -84,6 +85,21 @@ Immutable weight mappings can be shared across compatible programs. Scratch and 
 records are not persistent prefix state. Prefill and decode can use different weight layouts, so a prefix
 hit does not guarantee that all preparation or layout-transition work disappears.
 
+## Idle unloading
+
+`--keep-alive DURATION` (`5m`, `1h30m`, or seconds; `0` after every request; default: never) releases the
+model's GPU allocations once no request has run for that long: the weight mappings, model and draft state, and
+scratch. Compiled programs, Metal pipelines, and prefix checkpoints stay in host memory, so the next request maps
+the weights again without compiling and still reuses a cached system prompt. An Ollama request's `keep_alive`
+sets the period that follows it, as in Ollama.
+
+Weights are file mappings. Between requests macOS can reclaim their pages even while the model is loaded;
+unloading frees the context-sized state and scratch and drops the mappings. A reload whose weights left the file
+cache reads them from disk on the first request. Clients that probe with `HEAD /api/chat` before a request
+start that reload early: an unloaded model loads in the background and, if no request follows, unloads after
+the longer of the last keep-alive period and one minute. An Ollama request without messages loads the model,
+or unloads it with `keep_alive: 0`; `GET /api/ps` lists the model while it is loaded.
+
 ## Protocol contracts
 
 | Adapter | Contract |
@@ -91,9 +107,12 @@ hit does not guarantee that all preparation or layout-transition work disappears
 | Chat Completions | Text, function tools and results, sampling, stop strings, and SSE |
 | Responses | Stateless request/response adaptation; supported client-executed custom tools |
 | Anthropic Messages | Text and tool-use adaptation, streaming, and token counting |
+| Ollama chat | `/api/chat` text and tools, NDJSON streaming, `keep_alive`; `/api/tags` and `/api/ps` |
 
 Each request supplies the conversation context. Responses does not implement `previous_response_id` or
-background jobs. The adapters do not implement image/audio/document inputs, hosted tools, extended thinking,
+background jobs. Ollama requests get this server's defaults (greedy sampling, output until a stop or the context
+capacity), not a Modelfile's; its runtime options such as `num_ctx` do not apply, and sampling options without an
+implementation here are accepted only at their neutral values. The adapters do not implement image/audio/document inputs, hosted tools, extended thinking,
 strict JSON-schema decoding, or grammar enforcement for custom tools. Unsupported fields receive
 capability-specific errors.
 
