@@ -81,7 +81,7 @@ def test_template_sampling_context_and_stop(monkeypatch, eos):
 
     def load(*args, **kwargs):
         calls.append(kwargs)
-        return SimpleNamespace(eos=eos, generate=lambda ids, n: SimpleNamespace(tokens=tokens[:n]))
+        return SimpleNamespace(eos=eos, generate=lambda ids, n, **_: SimpleNamespace(tokens=tokens[:n]))
 
     def decode(ids, **kwargs):
         decoded.append(ids)

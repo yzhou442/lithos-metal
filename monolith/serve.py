@@ -22,7 +22,7 @@ from pydantic import ValidationError
 from . import __version__
 
 from .serving.protocol import (APIError, ChatRequest, Message, TextPart, anthropic_request, keep_alive_seconds,
-                               ollama_request, responses_request, parse_completion, streaming_text)
+                               ollama_model, ollama_request, responses_request, parse_completion, streaming_text)
 from .serving.events import WireResponse, ollama_time
 from .serving.tool_stream import tool_prefixes
 
@@ -123,6 +123,7 @@ class Backend:
         try:
             started = time.perf_counter()
             stopped = False
+            stops = [request.stop] if isinstance(request.stop, str) else request.stop or []
             def publish(tokens):
                 nonlocal first_text_ms, stopped
                 if on_text or on_content or on_progress:
@@ -136,11 +137,12 @@ class Backend:
                         on_content(content)
                     if on_progress:
                         on_progress(content, min(len(tokens), limit))
-                    stops = [request.stop] if isinstance(request.stop, str) else request.stop or []
-                    if stops:
-                        raw = self.tokenizer.decode(tokens, skip_special_tokens=True, clean_up_tokenization_spaces=False)
-                        stopped = any(stop in raw for stop in stops)
-            options = dict(on_tokens=publish, cancelled=lambda: stopped or bool(cancelled and cancelled())) if on_text or on_content or on_progress else {}
+                if stops:
+                    raw = self.tokenizer.decode(tokens, skip_special_tokens=True, clean_up_tokenization_spaces=False)
+                    stopped = any(stop in raw for stop in stops)
+            # A stop string ends decoding on every path, not only while streaming.
+            options = (dict(on_tokens=publish, cancelled=lambda: stopped or bool(cancelled and cancelled()))
+                       if on_text or on_content or on_progress or stops else {})
             if getattr(self.session, 'prefix_cache', None) is not None:
                 stable = set()
                 if messages:
@@ -178,6 +180,7 @@ class Backend:
                 state_reset_ms=getattr(generation, 'state_reset_ms', 0.0),
                 checkpoint_ms=getattr(generation, 'checkpoint_ms', 0.0),
                 setup_ms=getattr(generation, 'setup_ms', 0.0), first_text_ms=first_text_ms,
+                decode_wall_ms=getattr(generation, 'decode_wall_ms', 0.0),
                 cached_prompt_tokens=getattr(generation, 'cached_prompt_tokens', 0),
                 prefill_encode_ms=sum(t['encode_ms'] for t in getattr(generation, 'prefill_timings', [])),
                 prefill_commit_ms=sum(t['commit_ms'] for t in getattr(generation, 'prefill_timings', [])),
@@ -489,7 +492,7 @@ def create_app(backend, model_name, api_key=None, *, keep_alive=math.inf):
         request, custom = convert(body, responses_request)
         return dispatch(request, 'responses', custom)
 
-    def ollama_model(**fields):
+    def ollama_entry(**fields):
         return {'name': model_name, 'model': model_name, 'modified_at': ollama_time(created), 'size': 0,
                 'digest': '', 'details': {}, **fields}
 
@@ -503,9 +506,10 @@ def create_app(backend, model_name, api_key=None, *, keep_alive=math.inf):
     def ollama_chat(body: dict):
         keep_alive = None if body.get('keep_alive') in (None, '') else keep_alive_seconds(body['keep_alive'])
         if body.get('messages'):
-            return dispatch(convert(body, ollama_request), 'ollama', keep_alive=keep_alive, wait=True)
+            return dispatch(convert(body, lambda body: ollama_request(body, model_name)), 'ollama',
+                            keep_alive=keep_alive, wait=True)
         # No messages: load the model, or unload it with keep_alive 0.
-        if str(body.get('model', '')).removesuffix(':latest') != model_name:
+        if ollama_model(str(body.get('model', '')), model_name) != model_name:
             raise APIError(f"Unknown model; use {model_name!r}", 404, "model_not_found", "model")
         unload = keep_alive == 0
         if hasattr(backend, 'unload'):
@@ -521,13 +525,13 @@ def create_app(backend, model_name, api_key=None, *, keep_alive=math.inf):
 
     @app.get('/api/tags', dependencies=[Depends(authorize)])
     def ollama_tags():
-        return {'models': [ollama_model()]}
+        return {'models': [ollama_entry()]}
 
     @app.get('/api/ps', dependencies=[Depends(authorize)])
     def ollama_ps():
         if not getattr(backend, 'loaded', True):
             return {'models': []}
-        return {'models': [ollama_model(size_vram=getattr(backend, 'resident_bytes', 0), expires_at=keeper.expires_at())]}
+        return {'models': [ollama_entry(size_vram=getattr(backend, 'resident_bytes', 0), expires_at=keeper.expires_at())]}
 
     return app
 

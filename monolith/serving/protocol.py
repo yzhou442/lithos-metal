@@ -433,7 +433,12 @@ def keep_alive_seconds(value):
     return math.inf if seconds < 0 else seconds
 
 
-def ollama_request(body):
+def ollama_model(name, served):
+    """Ollama names NAME and NAME:latest the same model."""
+    return served if name.removesuffix(':latest') == served.removesuffix(':latest') else name
+
+
+def ollama_request(body, served=''):
     """Ollama /api/chat -> ChatRequest. Defaults are this server's (greedy), not a Modelfile's."""
     if body.get('format') not in (None, ''):
         raise APIError('Constrained JSON output (format) is not supported', param='format')
@@ -466,7 +471,7 @@ def ollama_request(body):
         messages.append(item)
     predict, seed = options.get('num_predict'), options.get('seed', 0)
     negative = lambda value: isinstance(value, (int, float)) and not isinstance(value, bool) and value < 0
-    return OllamaChatRequest(model=body['model'].removesuffix(':latest'), messages=messages, tools=body.get('tools'),
+    return OllamaChatRequest(model=ollama_model(body['model'], served), messages=messages, tools=body.get('tools'),
         max_tokens=None if negative(predict) else predict, temperature=options.get('temperature', 0.0),
         top_p=options.get('top_p', 1.0), top_k=options.get('top_k', 0), seed=0 if negative(seed) else seed,
         stop=options.get('stop'), stream=True if body.get('stream') is None else body['stream'])

@@ -83,7 +83,7 @@ class WireResponse:
         return {'total_duration': int((time.perf_counter() - self.started) * 1e9),
                 'load_duration': ns(self.metrics.get('setup_ms')), 'prompt_eval_count': prompt_tokens,
                 'prompt_eval_duration': ns(prefill_ms), 'eval_count': completion_tokens,
-                'eval_duration': ns(self.metrics.get('wall_ms', 0.0) - prefill_ms)}
+                'eval_duration': ns(self.metrics.get('decode_wall_ms'))}
 
     def start(self):
         if self.protocol == 'ollama':

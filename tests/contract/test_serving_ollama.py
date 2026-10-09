@@ -23,13 +23,14 @@ def chat(**fields):
                                            {'role': 'user', 'content': 'helo world'}], **fields}
 
 
-def make_client(text='Hello world.'):
+def make_client(text='Hello world.', served='local'):
     seen = []
     def complete(request, **_):
         seen.append(request)
         return text, 'stop', 12, 3
-    backend = SimpleNamespace(complete=complete, last_metrics={'prefill_wall_ms': 20.0, 'wall_ms': 50.0, 'setup_ms': 5.0})
-    return TestClient(create_app(backend, 'local')), seen
+    backend = SimpleNamespace(complete=complete, last_metrics={'prefill_wall_ms': 20.0, 'wall_ms': 60.0, 'setup_ms': 5.0,
+                                                               'decode_wall_ms': 30.0})
+    return TestClient(create_app(backend, served)), seen
 
 
 def lines(response):
@@ -94,12 +95,21 @@ def test_streams_ndjson_by_default():
 def test_options():
     request = ollama_request(chat(model='local:latest', options={
         'temperature': 0.7, 'top_p': 0.9, 'top_k': 20, 'seed': 7, 'stop': ['\n\n'], 'num_ctx': 8192, 'num_thread': 8,
-        'repeat_penalty': 1, 'presence_penalty': 0}))
+        'repeat_penalty': 1, 'presence_penalty': 0}), 'local')
     assert (request.model, request.temperature, request.top_p, request.top_k, request.seed, request.stop) == (
         'local', 0.7, 0.9, 20, 7, ['\n\n'])
     assert request.stream and request.token_limit is None                     # Ollama's defaults: stream, no limit
     assert ollama_request(chat(options={'num_predict': -2, 'seed': -1})).token_limit is None
     assert ollama_request(chat(options={'seed': -1})).seed == 0
+
+
+@pytest.mark.parametrize('served', ['local', 'local:latest'])
+def test_latest_is_the_same_model(served):
+    client, seen = make_client(served=served)
+    for name in ('local', 'local:latest'):
+        assert client.post('/api/chat', json=chat(model=name, stream=False)).status_code == 200
+        assert seen[-1].model == served
+    assert client.get('/api/tags').json()['models'][0]['name'] == served
 
 
 @pytest.mark.parametrize('fields', [
@@ -225,10 +235,15 @@ class Session:
     def release_engines(self):
         self.engines.clear()
 
-    def generate(self, ids, n):
+    def generate(self, ids, n, on_tokens=None, cancelled=None, **_):
         self.generated.append(n)
         self.engines[0] = object()
-        return SimpleNamespace(tokens=[10] * n)
+        tokens = []
+        while len(tokens) < n and not (cancelled and cancelled()):
+            tokens.append(10 + len(tokens))                                   # one token per round
+            if on_tokens:
+                on_tokens(list(tokens))
+        return SimpleNamespace(tokens=tokens)
 
 
 def test_backend_unload_keeps_programs_and_load_maps_the_current_session():
@@ -250,3 +265,14 @@ def test_unlimited_output_stops_at_the_context_capacity():
     backend.tokenizer = SimpleNamespace(apply_chat_template=lambda *a, **kw: [1, 2, 3], decode=lambda *a, **kw: 'x')
     backend.complete(ollama_request(chat(stream=False)))
     assert session.generated == [6]                                           # 3 prompt + 6 new - 1 = capacity 8
+
+
+def test_stop_strings_end_a_non_streaming_generation():
+    session = Session()
+    session.eos = 99
+    backend = Backend.__new__(Backend)
+    backend.max_context, backend.session, backend.sampling = 64, session, (0.0, 1.0, 0, 0, None)
+    decode = lambda ids, **kw: ''.join({10: 'Hello', 11: ' world', 12: '\n\n', 13: 'More'}.get(i, '!') for i in ids)
+    backend.tokenizer = SimpleNamespace(apply_chat_template=lambda *a, **kw: [1, 2, 3], decode=decode)
+    content, finish, _, completion = backend.complete(ollama_request(chat(stream=False, options={'stop': ['\n\n']})))
+    assert (content, finish, completion) == ('Hello world', 'stop', 3)                # not 62 tokens of context
