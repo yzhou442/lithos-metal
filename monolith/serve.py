@@ -282,9 +282,9 @@ class KeepAlive:
         if not getattr(self.backend, 'loaded', True) and not self.busy:
             threading.Thread(target=self._background, args=(self.backend.load, True), daemon=True).start()
 
-    def _background(self, action, restart=False):
+    def _background(self, action, restart=False, wait=False):
         try:
-            self.run(action, wait=False)
+            self.run(action, wait=wait)
         except Exception:
             logging.getLogger(__name__).exception('Background model load or unload failed')
         if restart:
@@ -297,9 +297,10 @@ class KeepAlive:
                 while self.deadline is None or self.deadline > time.monotonic():
                     self.condition.wait(None if self.deadline is None else self.deadline - time.monotonic())
                 self.deadline, epoch = None, self.epoch
-            # A request in progress restarts the period when it finishes.
+            # Wait out a request in progress: it restarts the period before releasing the model, and a period
+            # that ends at once (keep_alive 0) has no later deadline to retry from.
             if self.backend.loaded:
-                self._background(lambda: self._unload(epoch))
+                self._background(lambda: self._unload(epoch), wait=True)
 
     def _unload(self, epoch):
         # The period may have restarted between the deadline and this thread taking the model lock.

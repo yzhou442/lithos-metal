@@ -314,3 +314,14 @@ def test_load_without_warmup_starts_the_default_session(monkeypatch):
     assert not backend.loaded
     backend.load()
     assert backend.loaded and backend.session.generated == [1] and calls[0]['temperature'] == 0
+
+
+def test_an_expiry_during_a_request_unloads_after_it():
+    from monolith.serve import KeepAlive
+    model, lock = Model(), threading.Lock()
+    keeper = KeepAlive(model, lock)
+    with lock:                                                                # a keep_alive 0 request finishing
+        keeper.touch(0)
+        time.sleep(.1)                                                        # the expiry thread is waiting for the model
+        assert model.loaded
+    wait_for(lambda: not model.loaded)
