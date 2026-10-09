@@ -464,7 +464,8 @@ def ollama_request(body, served=''):
     for message in body['messages']:
         if message.get('images'):
             raise APIError('Only text content is supported; image inputs are unavailable', param='messages')
-        item = {'role': message['role'], 'content': message.get('content')}
+        role = message['role'].lower() if isinstance(message['role'], str) else message['role']   # as Ollama parses it
+        item = {'role': role, 'content': message.get('content')}
         if message.get('tool_calls'):
             item['tool_calls'], pending = [], []
             for i, call in enumerate(message['tool_calls']):
@@ -473,7 +474,7 @@ def ollama_request(body, served=''):
                 item['tool_calls'].append({'id': pending[-1], 'type': 'function', 'function': {
                     'name': call['function']['name'],
                     'arguments': arguments if isinstance(arguments, str) else json.dumps(arguments)}})
-        elif message['role'] == 'tool':
+        elif role == 'tool':
             # Ollama results name the tool, not a call ID: pair them with the preceding calls in order.
             item['tool_call_id'] = message.get('tool_call_id') or (pending.pop(0) if pending else f'call_{len(messages)}')
             if message.get('tool_name'):

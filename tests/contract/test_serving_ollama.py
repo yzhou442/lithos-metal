@@ -110,6 +110,8 @@ def test_options():
     assert request.stream and request.token_limit is None                     # Ollama's defaults: stream, no limit
     assert ollama_request(chat(options={'num_predict': -2, 'seed': -1})).token_limit is None
     assert ollama_request(chat(options={'seed': -1})).seed == 0
+    upper = ollama_request(chat(messages=[{'role': 'SYSTEM', 'content': 'a'}, {'role': 'User', 'content': 'b'}]))
+    assert [m.role for m in upper.messages] == ['system', 'user']
 
 
 @pytest.mark.parametrize('served', ['local', 'local:latest'])
