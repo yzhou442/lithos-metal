@@ -140,13 +140,19 @@ def test_exact_policy_reads_decoder_layouts_and_keeps_bf16_operands(monkeypatch)
                                         'weights': BufferSpec(64, role='weights')}, [op])
     p = get_backend('m5_max_40c').optimize_prefill(program('nvfp4', 34816, 5120), exact=True)
     assert calls == [('decoder', record)]
-    assert (p.ops[0].grid, p.ops[0].threadgroup, p.kernels[p.ops[0].kernel].macros['TN']) == ((80, 16, 1), (256, 1, 1), '32u')
+    assert (p.ops[0].grid, p.ops[0].threadgroup, p.kernels[p.ops[0].kernel].macros['TN']) == ((160, 16, 1), (512, 1, 1), '16u')
+    assert 'TB2' not in p.kernels[p.ops[0].kernel].macros
+    calls.clear()
+    p = get_backend('m5_max_40c').optimize_prefill(program('nvfp4', 5120, 17408), exact=True)
+    assert calls == [('decoder', record)]                  # down: two 32-token blocks per decoded weight tile
+    assert (p.ops[0].grid, p.kernels[p.ops[0].kernel].macros['TB2']) == ((160, 8, 1), '1')
+    calls.clear()
     record = None                                          # no verification graph: the private layout, as without exact
     get_backend('m5_max_40c').optimize_prefill(program('nvfp4', 34816, 5120), exact=True)
     get_backend('m5_max_40c').optimize_prefill(program('nvfp4', 34816, 5120))
     original = program('bf16', 96, 5120)
     assert get_backend('m5_max_40c').optimize_prefill(copy.deepcopy(original), exact=True).to_json() == original.to_json()
-    assert calls == [('decoder', {'tn': 32}), 'private', 'private']
+    assert calls == ['private', 'private']
 
 
 @pytest.mark.parametrize('fmt', ['nvfp4', 'fp8_e4m3'])
@@ -194,3 +200,43 @@ def test_decoder_projection_maps_the_file_a_verification_graph_derived(tmp_path,
     kernel.macros['KSPLIT'] = '2u'
     with pytest.raises(ValueError, match='unsplit 128-column'):
         decoder_projection(prompt, op, record)
+
+
+def _attention_pair(ch=2048):
+    macros = {'STEP_STATE': '1', 'CH': f'{ch}u', 'D': '256u'}
+    shared = [(1, 'k', 0), (2, 'v', 0), (9, 'params', 0), (15, 'state', 0)]
+    kernels = {'prep': KernelSpec('a prepared_q + t*p.in_stride+p.q_off+h*D+lane*DL b', 'gqa_prepare_mma', dict(macros)),
+               'core': KernelSpec('head\n// Matrix-accelerator attention: staged', 'gqa_decode_mma', dict(macros))}
+    return Program(kernels, {}, [OpSpec('prep', [(10, 'q', 0)] + shared, (1, 1, 1), (32, 1, 1)),
+                                 OpSpec('core', [(0, 'q', 0)] + shared, (1, 1, 1), (32, 1, 1))])
+
+
+def test_prefill_attention_splits_score_tiles_into_softmax_blocks():
+    from monolith.compiler.prefill import device_attention_tiles
+    p = device_attention_tiles(_attention_pair(), qm=16, kn=128, ks=32)
+    core = p.kernels['core']
+    assert {k: core.macros[k] for k in ('QM', 'KN', 'KS')} == {'QM': '16', 'KN': '128', 'KS': '32'}
+    assert p.ops[1].meta['prefill_device_tiles'] == [16, 128, 32]
+    assert 'staged' not in core.source and '#define KS KN' in core.source       # KS defaults to whole score tiles
+    assert device_attention_tiles(_attention_pair(), kn=128).kernels['core'].macros['KS'] == '128'
+    for kw in (dict(kn=128, ks=48), dict(kn=128, ks=16), dict(qm=64, kn=128, ks=32)):
+        with pytest.raises(ValueError, match='threadgroup scratch'):
+            device_attention_tiles(_attention_pair(), **kw)
+
+
+def test_projection_geometry_two_token_blocks_halve_the_token_planes():
+    from monolith.compiler.prefill import projection_geometry
+    params = struct.pack('<IIIIfIII', 5120, 160, 960, 512, 1., 0, 320, 0)
+    kernel = KernelSpec('', 'gemm_tile', {'TK': '128u', 'TN': '32u', 'TM': '32', 'T_SRC': '0'})
+    def program():
+        op = OpSpec('gemm', [(4, 'params', 0)], (80, 16, 1), (256, 1, 1), meta={'format': 'nvfp4', 'n': 5120})
+        return Program({'gemm': copy.deepcopy(kernel)}, {'params': BufferSpec(32, params, 'params')}, [op])
+    p = program()
+    projection_geometry(p, p.ops[0], tm=32, tn=16, sgs=16, groups=160, token_blocks=2)
+    assert (p.ops[0].grid, p.kernels[p.ops[0].kernel].macros['TB2']) == ((160, 8, 1), '1')
+    p = program()
+    projection_geometry(p, p.ops[0], tm=32, tn=16, sgs=16, groups=160)
+    assert p.ops[0].grid == (160, 16, 1) and 'TB2' not in p.kernels[p.ops[0].kernel].macros
+    p = program()
+    with pytest.raises(ValueError, match='one or two token blocks'):
+        projection_geometry(p, p.ops[0], tm=32, tn=16, sgs=16, groups=160, token_blocks=3)

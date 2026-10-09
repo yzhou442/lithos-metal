@@ -34,15 +34,22 @@ def specialize_prompt(program):
     return program
 
 
-def projection_geometry(program, op, *, tm, tn, sgs, groups):
-    """Retile an emitted matrix projection without changing its K layout."""
+def projection_geometry(program, op, *, tm, tn, sgs, groups, token_blocks=1):
+    """Retile an emitted matrix projection without changing its K layout.
+
+    ``token_blocks`` = 2 multiplies every decoded weight tile with two ``tm``-token blocks (same products, half the
+    weight decoding)."""
     old = program.kernels[op.kernel]
     if old.function != 'gemm_tile' or int(old.macros['TK'].rstrip('u')) != 128:
         raise ValueError('prefill projection tuning requires a 128-column matrix tile')
-    key = op.kernel + f'.prefill.{tm}.{tn}.{sgs}.{groups}'
+    if token_blocks not in (1, 2):
+        raise ValueError('a SIMD group multiplies one or two token blocks per weight-tile fill')
+    key = op.kernel + f'.prefill.{tm}.{tn}.{sgs}.{groups}' + ('.tb2' if token_blocks == 2 else '')
     kernel = copy.deepcopy(old)
     oldtn = int(kernel.macros['TN'].rstrip('u'))
     kernel.macros.update(TM=str(tm), TN=f'{tn}u', KSPLIT='1u', SCALE_CACHE='0')
+    if token_blocks == 2:
+        kernel.macros['TB2'] = '1'
     pn, off = next((n, o) for slot, n, o in op.bindings if slot == 4)
     data = bytearray(program.buffers[pn].init)
     n, _, _, rows, _, tile0, _, _ = struct.unpack_from('<IIIIfIII', data, off)
@@ -55,7 +62,7 @@ def projection_geometry(program, op, *, tm, tn, sgs, groups):
             kernel.macros['STATIC_GEMM_P_'+field] = f'{value}u'
     program.kernels[key] = kernel
     op.kernel = key
-    op.grid, op.threadgroup = (groups, (rows+tm-1)//tm, 1), (sgs*32, 1, 1)
+    op.grid, op.threadgroup = (groups, (rows+tm*token_blocks-1)//(tm*token_blocks), 1), (sgs*32, 1, 1)
     op.meta.update(tm=tm, tile=[tn, 128], geometry=f'prefill_{groups}x{sgs}')
 
 
@@ -363,15 +370,19 @@ def shared_gdn_preparation(program, op, *, sgs=2):
     op.grid, op.threadgroup = ((rows*(2*hk+hv)+sgs-1)//sgs, 1, 1), (32*sgs, 1, 1)
 
 
-def device_attention_tiles(program, *, qm=32, kn=128):
+def device_attention_tiles(program, *, qm=32, kn=128, ks=None):
     """Use larger prompt attention tiles after separate Q/K normalization.
 
     Compact Q by KV head so a matrix view can span both tokens and replicated
     query heads. KV stays in the original cache; barriers between preparation,
     attention and merge provide the visibility required by device tensor reads.
     This transformation applies only to isolated, prepared target attention.
+    ``ks`` splits each ``kn``-key score tile into blocks with their own softmax
+    and value product: the results of ``ks``-key tiles with fewer barriers.
     """
-    if qm <= 0 or kn <= 0 or qm*kn*6+qm*16 > 32768 or kn%32:
+    ks = ks or kn
+    if (qm <= 0 or kn <= 0 or ks <= 0 or kn % ks or ks % 32
+            or qm*kn*6+qm*8*(kn//ks)+qm*8 > 32768):
         raise ValueError('prefill attention tile exceeds threadgroup scratch')
     cores = [op for op in program.ops if program.kernels[op.kernel].function == 'gqa_decode_mma']
     preparations = [op for op in program.ops if program.kernels[op.kernel].function == 'gqa_prepare_mma']
@@ -403,8 +414,8 @@ def device_attention_tiles(program, *, qm=32, kn=128):
             k.source=k.source.replace(old,'prepared_q + ((h/(p.heads/p.kv_heads))*p.rows_max+t*(p.heads/p.kv_heads)+h%(p.heads/p.kv_heads))*D+lane*DL')
         elif k.function=='gqa_decode_mma':
             k.source=k.source[:k.source.index('// Matrix-accelerator attention:')]+template('gqa_prefill.metal')+'\n#endif\n'
-            k.macros.update(QM=str(qm),KN=str(kn))
-            op.meta['prefill_device_tiles']=[qm,kn]
+            k.macros.update(QM=str(qm),KN=str(kn),KS=str(ks))
+            op.meta['prefill_device_tiles']=[qm,kn,ks]
         if k.function in ('gqa_prepare_mma','gqa_decode_mma'):
             for macro in k.macros:
                 if macro.startswith('STATIC_GQA_P_'):
