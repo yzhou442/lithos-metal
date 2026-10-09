@@ -429,6 +429,8 @@ def keep_alive_seconds(value):
         if isinstance(value, bool) or not isinstance(value, (int, float, str)):
             raise ValueError
         seconds = float(value)
+    except OverflowError:                                  # an integer beyond float range
+        return math.inf
     except ValueError:
         match = DURATION.fullmatch(value.strip()) if isinstance(value, str) else None
         if match is None:

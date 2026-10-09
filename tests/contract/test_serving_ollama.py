@@ -231,6 +231,7 @@ def test_keep_alive_durations():
     assert keep_alive_seconds('300ms') == pytest.approx(.3) and keep_alive_seconds(600) == 600
     assert keep_alive_seconds('0') == keep_alive_seconds(0) == 0
     assert keep_alive_seconds(-1) == keep_alive_seconds('-1m') == keep_alive_seconds(10**10) == math.inf
+    assert keep_alive_seconds(10**400) == keep_alive_seconds(-10**400) == math.inf
     for value in ('soon', '5 m', 'm', '', 'nan', True, None, [1]):
         with pytest.raises(APIError):
             keep_alive_seconds(value)
@@ -399,3 +400,26 @@ def test_ollama_accepts_any_number_of_stop_strings():
     body = {'model': 'local', 'messages': [{'role': 'user', 'content': 'hi'}], 'stop': stops}
     assert client.post('/v1/chat/completions', json=body).status_code == 400  # Chat Completions keeps four
     assert client.post('/api/chat', json=chat(stream=False, options={'stop': ['']})).status_code == 400
+
+
+def test_a_probe_after_an_explicit_unload_holds_only_the_probe_minute():
+    from monolith.serve import KeepAlive
+    model, lock = Model(), threading.Lock()
+    keeper = KeepAlive(model, lock)                                           # server default: never unload
+    keeper.run(keeper.unload)
+    keeper.preload()
+    wait_for(lambda: model.loaded)
+    wait_for(lambda: keeper.deadline is not None)
+    assert keeper.deadline - time.monotonic() <= KeepAlive.PROBE_HOLD
+
+
+def test_a_probe_during_an_unload_loads_after_it():
+    from monolith.serve import KeepAlive
+    model, lock = Model(), threading.Lock()
+    keeper = KeepAlive(model, lock)
+    with lock:                                                                # an expiry is unloading
+        model.unload()
+        keeper.preload()
+        time.sleep(.1)
+        assert not model.loaded
+    wait_for(lambda: model.loaded)
