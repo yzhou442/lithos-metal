@@ -7,14 +7,17 @@ CONFIG_PATHS = {
     "apple-m3-pro-18c": ROOT / "m3_pro/config.json",
     "apple-m4-pro-16c": ROOT / "m4_pro/config-16c.json",
     "apple-m4-pro-20c": ROOT / "m4_pro/config-20c.json",
+    "apple-m4-max-32c": ROOT / "m4_max/config-32c.json",
+    "apple-m4-max-40c": ROOT / "m4_max/config-40c.json",
     "apple-m5-pro-20c": ROOT / "m5_pro/config.json",
     "apple-m5-max-32c": ROOT / "m5_max_32c/config.json",
     "apple-m5-max-40c": ROOT / "m5_max_40c/config.json",
 }
-BACKENDS = frozenset(("common", "m3_pro", "m4_pro", "m5_pro", "m5_max_32c", "m5_max_40c"))
+BACKENDS = frozenset(("common", "m3_pro", "m4_pro", "m4_max", "m5_pro", "m5_max_32c", "m5_max_40c"))
 DEVICES = {
     "m3_pro": ("Apple M3 Pro", "Apple9", (18,)),
     "m4_pro": ("Apple M4 Pro", "Apple9", (16, 20)),
+    "m4_max": ("Apple M4 Max", "Apple9", (32, 40)),
     "m5_pro": ("Apple M5 Pro", "Apple10", (20,)),
     "m5_max_32c": ("Apple M5 Max", "Apple10", (32,)),
     "m5_max_40c": ("Apple M5 Max", "Apple10", (40,)),

@@ -31,7 +31,7 @@ def test_large_projection_policy_is_chip_and_shape_specific(monkeypatch):
     op = OpSpec('gemm', [(4, 'params', 0)], (80, 16, 1), (384, 1, 1),
                 meta={'format': 'nvfp4', 'n': 34816, 'k': 5120, 't_variant': 512})
     original = Program({'gemm': k}, {'params': BufferSpec(32, params, 'params')}, [op])
-    for backend in ('common', 'm4_pro', 'm5_pro', 'm5_max_32c'):
+    for backend in ('common', 'm4_pro', 'm4_max', 'm5_pro', 'm5_max_32c'):
         p = copy.deepcopy(original)
         assert get_backend(backend).optimize_prefill(p).to_json() == original.to_json()
     p = get_backend('m5_max_40c').optimize_prefill(copy.deepcopy(original))
