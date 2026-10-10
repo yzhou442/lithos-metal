@@ -189,9 +189,11 @@ def test_affine_4bit_projections_take_two_token_blocks_per_weight_tile(exact):
     assert (p.ops[0].grid, p.ops[0].threadgroup) == ((320, 16, 1), (128, 1, 1))      # 16 planes of two 16-row blocks
     assert (macros['TM'], macros['TN'], macros['TB2'], macros['KSPLIT']) == ('16', '32u', '1', '1u')
     assert struct.unpack_from('<II', p.buffers['params'].init, 4) == (160, 1280)    # row tiles, SIMD groups
+    p = backend.optimize_prefill(program(34816, 5120), exact=exact)
+    assert (p.ops[0].grid, p.kernels[p.ops[0].kernel].macros['TB2']) == ((320, 16, 1), '1')
     p = backend.optimize_prefill(program(6144, 5120), exact=exact)
     assert (p.ops[0].grid, p.ops[0].threadgroup) == ((80, 8, 1), (512, 1, 1))
-    for shape in ((34816, 5120), (6144, 5120, 128)):            # the MLP input projection; a 128-row graph
+    for shape in ((8192, 5120), (6144, 5120, 128)):             # a shape not measured; a 128-row graph
         original = program(*shape)
         assert backend.optimize_prefill(copy.deepcopy(original), exact=exact).to_json() == original.to_json()
 
