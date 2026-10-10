@@ -37,7 +37,8 @@ are accepted. Deferring warmup moves that cost to requests. Only one session's G
 resident, while bounded CPU program and pipeline caches can survive session replacement.
 
 `GET /health` reports process liveness after startup. `GET /v1/models` returns the served alias.
-One generation executes at a time; overlapping requests receive HTTP 429.
+One generation executes at a time; overlapping requests receive HTTP 429, except Ollama chat requests, which
+wait for the running one as Ollama queues them.
 
 ## Request execution
 
@@ -70,6 +71,39 @@ With a compatible fixed-verification recipe, short prompts and cached tails can 
 The limit is one chunk, capped at 128 tokens in exact mode. Longer prompts hand their final rows to the decoder
 before output streaming begins.
 
+## Idle release
+
+`--model-ttl SECONDS` sets an idle TTL that returns the model's memory to the system when the server is idle; without it
+the model stays loaded.
+The period runs on the monotonic clock from the completion of the last request, while no other request is
+pending; any request that arrives restarts it. A request counts as pending from its arrival, before it waits
+for the GPU, through prefill, decode and streaming, until it completes, fails or is cancelled.
+
+The model is `ready`, `unloading`, `unloaded`, `loading` or `failed` (`GET /health` reports it as `model` when
+the option is set or an Ollama request started the lifecycle). Loads and unloads run under the lock that every GPU submission holds, so an unload never
+overlaps a generation or its command buffers. The unload releases every session's allocations: target and draft
+weight mappings, KV caches, GDN convolution and recurrent states, StepState, scratch, indirect command buffers,
+runners and their residency, and the in-memory prefix checkpoints. The tokenizer, the HTTP server, compiled CPU
+programs and executable pipelines stay, so the next request maps the weights again from the local packs without
+compiling; the pack files' pages can still be in the OS file cache, which makes that load faster than one after
+memory pressure evicted them. No weights or states are copied to the CPU or written anywhere.
+
+The next request selects its session and loads it before prefill. The load is part of that request, so an
+overlapping HTTP request is answered as during a generation (429, or a wait for an Ollama chat request);
+in-process callers that wait for the GPU (`Backend.complete`) share one load and its result. A request that
+arrives during an unload waits for it and loads the model again. A failed load leaves the model `failed` and
+reports HTTP 503 `model_load_failed` (an error event on a stream), and the next request tries again. After a load
+the prompt is prefilled again: the released prefix checkpoints were host copies of GPU state.
+
+An Ollama request's `keep_alive` (seconds or a duration such as `5m`; `0` releases the model once no request is
+pending, a negative value never) sets the period that follows that request, as in Ollama; requests without one
+restore the server's period. Without `--model-ttl`, the first Ollama request with a finite `keep_alive`, or a
+load or unload request, starts the lifecycle with a period of never. An Ollama chat request without messages
+loads the model, or releases it with `keep_alive: 0`, and `GET /api/ps` lists the model while it is loaded with
+the time of its release. Clients that probe with `HEAD /api/chat` before a request start a reload early: once
+the GPU is free, an unloaded model loads in the background and, if no request follows, is released after the
+longer of the current period and one minute.
+
 ## Prefix caching and memory ownership
 
 [Prefix checkpoints](../../monolith/runtime/prefix_cache.py) contain target and draft state for an exact
@@ -91,11 +125,14 @@ hit does not guarantee that all preparation or layout-transition work disappears
 | Chat Completions | Text, function tools and results, sampling, stop strings, and SSE |
 | Responses | Stateless request/response adaptation; supported client-executed custom tools |
 | Anthropic Messages | Text and tool-use adaptation, streaming, and token counting |
+| Ollama chat | `/api/chat` text and tools, NDJSON streaming, `keep_alive`; `/api/tags` and `/api/ps` |
 
 Each request supplies the conversation context. Responses does not implement `previous_response_id` or
-background jobs. The adapters do not implement image/audio/document inputs, hosted tools, extended thinking,
-strict JSON-schema decoding, or grammar enforcement for custom tools. Unsupported fields receive
-capability-specific errors.
+background jobs. Ollama requests get this server's defaults (greedy sampling, output until a stop or the context
+capacity; `num_predict` only lowers that bound), not a Modelfile's; its runtime options such as `num_ctx` do not
+apply, and sampling options without an implementation here are accepted only at their neutral values. The
+adapters do not implement image/audio/document inputs, hosted tools, extended thinking, strict JSON-schema
+decoding, or grammar enforcement for custom tools. Unsupported fields receive capability-specific errors.
 
 Tool execution belongs to the client, which retains its own permission model. The server validates generated
 tool names and argument structure before treating them as a completed tool call.

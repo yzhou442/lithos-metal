@@ -1,9 +1,13 @@
-"""lithos-metal text/tool server: Chat Completions, Responses and Anthropic Messages."""
+"""lithos-metal text/tool server: Chat Completions, Responses, Anthropic Messages and Ollama chat."""
 
 from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
+import gc
+import json
+import math
 import queue
 import logging
 import os
@@ -12,16 +16,17 @@ import threading
 import time
 from pathlib import Path
 
-from fastapi import Depends, FastAPI, Request
+from fastapi import Depends, FastAPI, Request, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import ValidationError
 
 from . import __version__
 
-from .serving.protocol import (APIError, ChatRequest, Message, TextPart, anthropic_request,
-                               responses_request, parse_completion, streaming_text)
-from .serving.events import WireResponse
+from .serving.protocol import (APIError, ChatRequest, Message, TextPart, anthropic_request, keep_alive_seconds,
+                               ollama_model, ollama_request, responses_request, parse_completion, streaming_text)
+from .serving.events import WireResponse, ollama_time
+from .serving.lifecycle import IdleRelease, ModelLoadError, ModelState
 from .serving.tool_stream import tool_prefixes
 
 
@@ -29,6 +34,7 @@ class Backend:
     """One cached session; sampling changes rebuild its compiled programs, never duplicate model residency."""
 
     prefill_exact = False
+    lifecycle = None                 # IdleRelease: unload after an idle period (--model-ttl)
 
     def __init__(self, model_dir, pack_dir, max_context=4096, prefill_chunk_size=128, *, assets=None, prefill_exact=False):
         from transformers import AutoTokenizer
@@ -96,8 +102,67 @@ class Backend:
             sessions.pop(next(iter(sessions)))
         self.sampling = sampling
 
-    def complete(self, request, *, on_text=None, on_content=None, on_start=None, cancelled=None, on_progress=None):
-        """on_progress(content, completion_tokens) pairs each content snapshot with the committed output count."""
+    def _gpu(self):
+        """The lock between generations and the model's loads and unloads."""
+        return self.__dict__.get('gpu_lock') or self.__dict__.setdefault('gpu_lock', threading.Lock())
+
+    def complete(self, request, arrived=None, **options):
+        """on_progress(content, completion_tokens) pairs each content snapshot with the committed output count.
+        ``arrived``: the lifecycle registration a caller made when it accepted the request (IdleRelease.request);
+        without one the request registers here."""
+        lifecycle = self.lifecycle
+        registered = (lifecycle.request() if lifecycle is not None and arrived is None
+                      else contextlib.nullcontext(arrived or 0))
+        with registered as arrived:
+            with self._gpu():
+                self._arrived = arrived
+                return self._complete(request, **options)
+
+    def enable_idle_release(self, seconds):
+        """Unload the model after ``seconds`` without requests; the next request loads it again."""
+        state = ModelState.READY if self.loaded else ModelState.UNLOADED
+        self.lifecycle = IdleRelease(self._gpu(), self.unload, seconds, state=state).start()
+        return self.lifecycle
+
+    @property
+    def loaded(self):
+        return bool(getattr(self.session, 'engines', None))
+
+    @property
+    def resident_bytes(self):
+        buffers = tuple((getattr(self.session, 'buffers', None) or {}).values())
+        return sum({id(b): b.nbytes for b in buffers}.values()) if self.loaded else 0
+
+    def load(self, request=None, prompt_tokens=0):
+        """Select the request's session and map its weights, states and scratch again (Session.load). Without a
+        request (a load request or a probe): the most recent session, else the default one."""
+        if request is not None or self.session is None:
+            self.select_session(request or ChatRequest(model='', messages=[Message(role='user', content='Hello')]),
+                                prompt_tokens)
+        self.session.load()
+
+    def unload(self):
+        """Release every session's GPU allocations (target and draft weights, KV and recurrent states, scratch,
+        the programs' command resources) and the prefix snapshots. The tokenizer, compiled programs and executable
+        pipelines stay, so a load maps the weights again from the local packs without compiling. Runs with the
+        GPU lock held: no command buffer is in flight."""
+        import weakref
+
+        released = self.resident_bytes
+        sessions = [s for s in (self.session, *getattr(self, '_sessions', {}).values()) if s is not None]
+        engines = [weakref.ref(e) for s in sessions for e in getattr(s, 'engines', {}).values()]
+        for session in sessions:
+            session.release_engines()
+        cache = getattr(self.session, 'prefix_cache', None)
+        if cache is not None:
+            cache.clear()
+        gc.collect()
+        alive = sum(ref() is not None for ref in engines)
+        if alive:
+            logging.getLogger(__name__).warning('%d released engines are still referenced', alive)
+        logging.getLogger(__name__).info('Released %.2f GB of model allocations', released / 1e9)
+
+    def _complete(self, request, *, on_text=None, on_content=None, on_start=None, cancelled=None, on_progress=None):
         from jinja2 import TemplateError
 
         request_started = time.perf_counter()
@@ -108,7 +173,11 @@ class Backend:
                                                      enable_thinking=False, **({'tools': tools} if tools else {}))
         except (ValueError, TemplateError) as exc:
             raise APIError(str(exc), param="messages") from exc
-        limit = request.token_limit
+        # No limit (Ollama's default): until a stop or the context capacity.
+        room = max(1, self.max_context - len(ids) + 1)
+        limit = request.token_limit or room
+        if getattr(request, 'within_context', False):
+            limit = min(limit, room)
         if not ids or len(ids) + limit - 1 > self.max_context:
             raise APIError(f"Prompt ({len(ids)} tokens) plus output budget ({limit}) exceeds context capacity "
                            f"({self.max_context}); reduce messages or max_completion_tokens.",
@@ -116,10 +185,23 @@ class Backend:
         if on_start:
             on_start(len(ids))
         assets = getattr(self, 'assets', None)
-        self.select_session(request, len(ids))
+        lifecycle = self.lifecycle
+        load_ms = 0.0               # loading a released model or selecting a session (generate() resets setup_ms)
+        if lifecycle is not None and lifecycle.state is not ModelState.READY:
+            load_started = time.perf_counter()
+            try:
+                lifecycle.ensure_loaded(getattr(self, '_arrived', 0), lambda: self.load(request, len(ids)))
+            except ModelLoadError as exc:
+                raise APIError(f'{exc}; retry the request', 503, 'model_load_failed') from exc
+            load_ms = (time.perf_counter() - load_started) * 1000
+        else:
+            select_started = time.perf_counter()
+            self.select_session(request, len(ids))            # a new recipe or sampling variant can compile here
+            load_ms = (time.perf_counter() - select_started) * 1000
         try:
             started = time.perf_counter()
             stopped = False
+            stops = [request.stop] if isinstance(request.stop, str) else request.stop or []
             def publish(tokens):
                 nonlocal first_text_ms, stopped
                 if on_text or on_content or on_progress:
@@ -133,11 +215,12 @@ class Backend:
                         on_content(content)
                     if on_progress:
                         on_progress(content, min(len(tokens), limit))
-                    stops = [request.stop] if isinstance(request.stop, str) else request.stop or []
-                    if stops:
-                        raw = self.tokenizer.decode(tokens, skip_special_tokens=True, clean_up_tokenization_spaces=False)
-                        stopped = any(stop in raw for stop in stops)
-            options = dict(on_tokens=publish, cancelled=lambda: stopped or bool(cancelled and cancelled())) if on_text or on_content or on_progress else {}
+                if stops:
+                    raw = self.tokenizer.decode(tokens, skip_special_tokens=True, clean_up_tokenization_spaces=False)
+                    stopped = any(stop in raw for stop in stops)
+            # A stop string ends decoding on every path, not only while streaming.
+            options = (dict(on_tokens=publish, cancelled=lambda: stopped or bool(cancelled and cancelled()))
+                       if on_text or on_content or on_progress or stops else {})
             if getattr(self.session, 'prefix_cache', None) is not None:
                 stable = set()
                 if messages:
@@ -174,7 +257,8 @@ class Backend:
                 prefill_wall_ms=getattr(generation, 'prefill_wall_ms', 0.0),
                 state_reset_ms=getattr(generation, 'state_reset_ms', 0.0),
                 checkpoint_ms=getattr(generation, 'checkpoint_ms', 0.0),
-                setup_ms=getattr(generation, 'setup_ms', 0.0), first_text_ms=first_text_ms,
+                setup_ms=getattr(generation, 'setup_ms', 0.0), load_ms=load_ms, first_text_ms=first_text_ms,
+                decode_wall_ms=getattr(generation, 'decode_wall_ms', 0.0),
                 cached_prompt_tokens=getattr(generation, 'cached_prompt_tokens', 0),
                 prefill_encode_ms=sum(t['encode_ms'] for t in getattr(generation, 'prefill_timings', [])),
                 prefill_commit_ms=sum(t['commit_ms'] for t in getattr(generation, 'prefill_timings', [])),
@@ -208,14 +292,17 @@ class Backend:
 def create_app(backend, model_name, api_key=None):
     app = FastAPI(title="lithos-metal", version=__version__)
     lock = threading.Lock()
+    lifecycle_lock = threading.Lock()
     created = int(time.time())
 
     @app.exception_handler(APIError)
     async def api_error(request, exc):
-        kind = {401: "authentication_error", 429: "rate_limit_error", 500: "server_error"}.get(
+        kind = {401: "authentication_error", 429: "rate_limit_error", 500: "server_error", 503: "server_error"}.get(
             exc.status, "invalid_request_error")
         if request.url.path.startswith('/v1/messages'):
             return JSONResponse(status_code=exc.status, content={'type': 'error', 'error': {'type': kind, 'message': exc.message}})
+        if request.url.path.startswith('/api/'):
+            return JSONResponse(status_code=exc.status, content={'error': exc.message})
         return JSONResponse(status_code=exc.status, content={"error": {
             "message": exc.message, "type": kind, "param": exc.param, "code": exc.code}})
 
@@ -233,7 +320,8 @@ def create_app(backend, model_name, api_key=None):
 
     @app.get("/health")
     async def health():
-        return {"status": "ok"}
+        lifecycle = getattr(backend, 'lifecycle', None)
+        return {"status": "ok", "model": lifecycle.state.value} if lifecycle is not None else {"status": "ok"}
 
     @app.get("/v1/models", dependencies=[Depends(authorize)])
     async def models():
@@ -246,18 +334,47 @@ def create_app(backend, model_name, api_key=None):
 
     def execute(request, wire, **options):
         content, finish, prompt_tokens, completion_tokens = backend.complete(request, **options)
+        wire.metrics = dict(getattr(backend, 'last_metrics', {}))
         message, finish = parse_completion(content, request, finish)
         return wire.body(message, finish, prompt_tokens, completion_tokens)
 
-    def dispatch(request, protocol, custom=()):
+    def lifecycle(start=False):
+        """The model's lifecycle (--model-ttl). Without one, an Ollama request with a finite keep_alive or a load or
+        unload request starts one whose own period is never."""
+        with lifecycle_lock:
+            if start and getattr(backend, 'lifecycle', None) is None and hasattr(backend, 'enable_idle_release'):
+                backend.enable_idle_release(math.inf)
+            return getattr(backend, 'lifecycle', None)
+
+    def dispatch(request, protocol, custom=(), *, keep_alive=None):
         validate_model(request)
-        if not lock.acquire(blocking=False):
+        arrived = time.perf_counter()                   # Ollama's total_duration includes the queue
+        ollama = protocol == 'ollama'
+        # Ollama clients queue requests; the other adapters report a busy model. A queued request counts as pending,
+        # so the model stays loaded for it, and its keep_alive sets the period that follows it.
+        life = lifecycle(start=keep_alive is not None and keep_alive != math.inf) if ollama else None
+        loads = life.arrive() if life is not None else None
+        if not (lock.acquire(blocking=False) or (ollama and lock.acquire())):
             raise APIError("The model is busy; retry after the current request finishes", 429, "model_busy")
+        # An accepted request counts for the idle release from now, not from when its worker starts generating.
+        admitted = contextlib.ExitStack()
+        if life is not None:
+            admitted.callback(life.leave, keep_alive)
+        else:
+            life = getattr(backend, 'lifecycle', None)
+            if life is not None:
+                loads = admitted.enter_context(life.request())
+        options = dict(arrived=loads) if life is not None else {}
+
+        def release():
+            admitted.close()
+            lock.release()
         wire = WireResponse(protocol, model_name, custom, request.stream_usage if request.stream else None)
+        wire.started = arrived
         if request.stream:
-            return stream(request, wire)
+            return stream(request, wire, release, options)
         try:
-            body = execute(request, wire)
+            body = execute(request, wire, **options)
             metrics = dict(getattr(backend, 'last_metrics', {}))
         except APIError:
             raise
@@ -265,13 +382,13 @@ def create_app(backend, model_name, api_key=None):
             logging.getLogger(__name__).exception("Generation failed")
             raise APIError("Generation failed; see server logs", 500, "generation_failed") from exc
         finally:
-            lock.release()
+            release()
         headers = {f'X-{brand}-{name}': str(metrics[key]) for brand in ('Lithos-Metal', 'LMK', 'Monolith') for name, key in (
             ('Decode-Steps', 'steps'), ('Decode-GPU-Ms', 'decode_gpu_ms'),
             ('Decode-Step-Ms', 'decode_step_ms'), ('Verify-Tokens', 'verify_tokens')) if key in metrics}
         return JSONResponse(headers=headers, content=body)
 
-    def stream(request, wire):
+    def stream(request, wire, release, admitted):
         events = queue.Queue()
         cancelled = threading.Event()
         def worker():
@@ -286,9 +403,9 @@ def create_app(backend, model_name, api_key=None):
                         options['on_progress'] = lambda content, count: events.put(('progress', (content, count)))
                     else:
                         options['on_content'] = lambda content: events.put(('content', content))
-                result = execute(request, wire, **options)
+                result = execute(request, wire, **options, **admitted)
                 if not options:
-                    usage = result['usage']
+                    usage = result.get('usage') or {'input_tokens': result.get('prompt_eval_count', 0)}
                     events.put(('start', usage.get('input_tokens', usage.get('prompt_tokens', 0))))
                 events.put(('result', result))
             except APIError as exc:
@@ -297,7 +414,7 @@ def create_app(backend, model_name, api_key=None):
                 logging.getLogger(__name__).exception('Streaming generation failed')
                 events.put(('error', ('Generation failed; see server logs', 'generation_failed')))
             finally:
-                lock.release()
+                release()
         # A worker owns the lock from here, even if the response is never consumed.
         thread = threading.Thread(target=worker, daemon=True)
         thread.start()
@@ -310,7 +427,7 @@ def create_app(backend, model_name, api_key=None):
                             yield wire.error('Generation worker terminated', 'generation_failed')
                             break
                         await asyncio.sleep(.01)
-                        if time.monotonic() - last_ping > 5:
+                        if time.monotonic() - last_ping > 5 and wire.protocol != 'ollama':
                             yield ': keep-alive\n\n'
                             last_ping = time.monotonic()
                         continue
@@ -340,6 +457,8 @@ def create_app(backend, model_name, api_key=None):
                         if wire.protocol == 'chat':
                             text = value['choices'][0]['message'].get('content') or ''
                             wire.output_tokens = value['usage']['completion_tokens']
+                        elif wire.protocol == 'ollama':
+                            text = value['message']['content']
                         elif wire.protocol == 'messages':
                             text = ''.join(b['text'] for b in value['content'] if b['type'] == 'text')
                         else:
@@ -353,7 +472,7 @@ def create_app(backend, model_name, api_key=None):
                 yield wire.error(exc.message, exc.code)
             finally:
                 cancelled.set()
-        return StreamingResponse(generate(), media_type='text/event-stream',
+        return StreamingResponse(generate(), media_type='application/x-ndjson' if wire.protocol == 'ollama' else 'text/event-stream',
                                  headers={'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no'})
 
     @app.post("/v1/chat/completions", dependencies=[Depends(authorize)])
@@ -383,6 +502,63 @@ def create_app(backend, model_name, api_key=None):
     def responses(body: dict):
         request, custom = convert(body, responses_request)
         return dispatch(request, 'responses', custom)
+
+    async def json_body(request: Request):
+        # Ollama reads any request body as JSON; its documented curl calls send no Content-Type.
+        try:
+            body = json.loads(await request.body() or b'{}')
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            raise APIError(f'Invalid JSON body: {exc}') from exc
+        if not isinstance(body, dict):
+            raise APIError('The request body must be a JSON object')
+        return body
+
+    def ollama_entry(**fields):
+        return {'name': model_name, 'model': model_name, 'modified_at': ollama_time(created), 'size': 0,
+                'digest': '', 'details': {}, **fields}
+
+    @app.head('/api/chat', dependencies=[Depends(authorize)])
+    def ollama_probe():
+        # Clients probe before a request: an unloaded model starts loading now.
+        life = lifecycle()
+        if life is not None:
+            life.probe(backend.load)
+        return Response()
+
+    @app.post('/api/chat', dependencies=[Depends(authorize)])
+    def ollama_chat(body: dict = Depends(json_body)):
+        keep_alive = None if body.get('keep_alive') in (None, '') else keep_alive_seconds(body['keep_alive'])
+        if not isinstance(body.get('messages', []), (list, type(None))):
+            raise APIError('messages must be an array', param='messages')
+        if body.get('messages'):
+            return dispatch(convert(body, lambda body: ollama_request(body, model_name)), 'ollama', keep_alive=keep_alive)
+        # No messages: load the model, or unload it with keep_alive 0.
+        if ollama_model(str(body.get('model', '')), model_name) != model_name:
+            raise APIError(f"Unknown model; use {model_name!r}", 404, "model_not_found", "model")
+        unload = keep_alive == 0
+        life = lifecycle(start=True)
+        if unload and life is not None:
+            life.release_now()
+        elif life is not None:
+            try:
+                life.hold(backend.load, keep_alive)
+            except ModelLoadError as exc:
+                raise APIError(f'{exc}; retry the request', 503, 'model_load_failed') from exc
+        return {'model': model_name, 'created_at': ollama_time(), 'message': {'role': 'assistant', 'content': ''},
+                'done_reason': 'unload' if unload else 'load', 'done': True}
+
+    @app.get('/api/tags', dependencies=[Depends(authorize)])
+    def ollama_tags():
+        return {'models': [ollama_entry()]}
+
+    @app.get('/api/ps', dependencies=[Depends(authorize)])
+    def ollama_ps():
+        if not getattr(backend, 'loaded', True):
+            return {'models': []}
+        life = lifecycle()
+        remaining = life.expires_in() if life is not None else None
+        return {'models': [ollama_entry(size_vram=getattr(backend, 'resident_bytes', 0),
+                                        expires_at=None if remaining is None else ollama_time(time.time() + remaining))]}
 
     return app
 
@@ -423,6 +599,10 @@ def parse_args(argv=None):
                         help="Prompt tokens per prefill pass. N-exact reproduces the results of 128-token passes bit for bit; "
                              "auto-exact (default) uses the chip's measured size for the model that way, else 128")
     parser.add_argument("--no-warmup", action='store_true', help="Skip startup compilation/warmup; the first request pays this cost")
+    parser.add_argument("--model-ttl", type=float, default=None, metavar='SECONDS',
+                        help="Idle TTL: release the model's GPU memory (weights, KV/recurrent state, scratch, prefix snapshots) after "
+                             "this many seconds without requests; every request resets it, and the next request loads the model again "
+                             "from the local packs. Default: no TTL, the model stays loaded")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
     args = parser.parse_args(argv)
@@ -431,6 +611,8 @@ def parse_args(argv=None):
         args.draft = default_draft(args.model)
     if args.max_context < 1:
         parser.error("--max-context must be positive")
+    if args.model_ttl is not None and not 0 < args.model_ttl < float('inf'):
+        parser.error('--model-ttl must be a finite number of seconds > 0')
     if args.draft_block_size is not None and args.draft_block_size < 1:
         parser.error('--draft-block-size must be positive')
     if not args.draft and (args.draft_pack or args.draft_revision or args.draft_block_size is not None or args.kernel_config or args.kernel_config_key
@@ -453,6 +635,8 @@ def main(argv=None):
     model_name = args.served_model_name or (assets.model_dir.name if Path(args.model).expanduser().exists() else args.model)
     if not args.no_warmup:
         backend.warmup(model_name)
+    if args.model_ttl is not None:
+        backend.enable_idle_release(args.model_ttl)
     app = create_app(backend, model_name, api_key)
     logging.getLogger(__name__).info('lithos-metal ready: http://%s:%s — model=%s; DSpark=%s; verification rows=%s',
                                    args.host, args.port, model_name, args.draft or 'disabled', assets.gamma + 1)
