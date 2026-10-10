@@ -1,6 +1,7 @@
 """Prefix checkpoints on disk: format, integrity, reuse by later processes, quota and the cache tiers; no GPU needed."""
 
 import errno
+import importlib.util
 import os
 import stat
 from types import SimpleNamespace as NS
@@ -9,6 +10,10 @@ import pytest
 
 from monolith.runtime.prefix_cache import PrefixCache
 from monolith.runtime.prefix_store import SUFFIX, PrefixStore
+
+# The tests that import the server (monolith.serve) need the serve extra.
+serving = pytest.mark.skipif(any(importlib.util.find_spec(m) is None for m in ('fastapi', 'httpx')),
+                             reason='needs the serve extra (fastapi, httpx)')
 
 
 def store(root, identity='a' * 64, max_bytes=1 << 20, **kwargs):
@@ -528,6 +533,7 @@ def test_the_identity_changes_with_the_weights_and_the_configurations(tmp_path):
     assert s.prefix_identity(test=True) != before
 
 
+@serving
 def test_options_and_sizes():
     from monolith.serve import _byte_size, parse_args
     args = parse_args(['--model', 'org/target', '--no-draft'])
@@ -540,6 +546,7 @@ def test_options_and_sizes():
             parse_args(['--model', 'org/target', '--no-draft', *flags])
 
 
+@serving
 def test_an_unusable_directory_leaves_checkpoints_in_memory(tmp_path):
     from monolith.serve import Backend
     root = tmp_path / 'open'
@@ -557,6 +564,7 @@ def test_an_unusable_directory_leaves_checkpoints_in_memory(tmp_path):
     assert isinstance(cache.store, PrefixStore)
 
 
+@serving
 def test_exit_writes_the_host_copies_for_later_servers():
     from monolith.serve import Backend
     order = []
@@ -567,6 +575,7 @@ def test_exit_writes_the_host_copies_for_later_servers():
     assert order == ['flush', 'close']
 
 
+@serving
 def test_idle_release_writes_checkpoints_before_dropping_them(tmp_path):
     from monolith.serve import Backend
     order = []
