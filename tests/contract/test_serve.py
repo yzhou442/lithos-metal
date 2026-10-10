@@ -177,9 +177,10 @@ def test_cli_prefill_chunk_is_a_size_an_exact_size_or_the_chips_exact_size():
             parse('--prefill-chunk-size', value)
 
 
-def _warmup_backend(max_context, seen):
+def _warmup_backend(max_context, seen, chunk=512, exact=True):
     backend = Backend.__new__(Backend)
     backend.assets, backend.max_context = None, max_context
+    backend.prefill_chunk_size, backend.prefill_exact = chunk, exact
     backend.select_session = lambda request, context: None
     backend.session = SimpleNamespace(prepare=lambda: None)
     # a template of 10 tokens around one token per word
@@ -198,11 +199,19 @@ def test_warmup_runs_the_prompt_graph_once():
 
 
 def test_warmup_cuts_the_long_prompt_to_the_context():
-    for max_context, words in ((600, 589), (12, 1), (11, None)):
+    # exact chunks: the decoder ingests up to 128 prompt tokens itself
+    for max_context, words in ((600, 589), (130, 119), (129, None), (12, None)):
         seen = []
         _warmup_backend(max_context, seen).warmup('test-model')
-        # the prompt's tokens plus its 2-token output budget fit; a context with no room skips the long prompt
+        # the prompt's tokens plus its 2-token output budget fit; a context with no room past the decoder's own
+        # ingest skips the long prompt
         assert seen == [1, 1] + ([words] if words else [])
+
+
+def test_warmup_prompt_outgrows_a_plain_chunk():
+    seen = []
+    _warmup_backend(8192, seen, chunk=2048, exact=False).warmup('test-model')
+    assert seen == [1, 1, 2112]          # 2122 tokens: past the 2048 the decoder would ingest itself
 
 
 def test_keep_warm_touches_idle_programs_only_within_its_window(monkeypatch):
