@@ -30,7 +30,8 @@ ap.add_argument('--groups', default='128,cache,4096,8192,16384')
 ap.add_argument('--chunk', type=int, default=512)
 ap.add_argument('--max-new', type=int, default=32)
 ap.add_argument('--max-context', type=int, default=32768)
-ap.add_argument('--budget-s', type=float, default=1000.0, help='do not start another session after this many seconds')
+ap.add_argument('--budget-s', type=float, default=1000.0,
+                help='do not start another session after this many seconds (finished halves of earlier runs are kept)')
 a = ap.parse_args()
 OUT = Path(a.out).expanduser()
 
@@ -270,11 +271,18 @@ if a.cmd == 'plan':
     print('document tokens', len(doc))
     sys.exit(0)
 
+def case_names(group):
+    return [f'cache/{c[0]}' for c in CACHE] if group == 'cache' else [f'{group}/{n}+8' for n in LENGTHS[group]]
+
+
 for group in a.groups.split(','):
-    if time.time() - started > a.budget_s:
-        meta['skipped'].append(group)
-        continue
     for config in ('reference', 'exact'):
+        # A half (one group, one config, one session) resumes whole: the cache cases build on each other's checkpoints.
+        if all(config in cases.get(name, {}) for name in case_names(group)):
+            continue
+        if time.time() - started > a.budget_s:
+            meta['skipped'].append(f'{group}:{config}')
+            continue
         if group == 'cache':
             key, session = session_for(2308, config == 'exact', True)
             for name, prefix, source, n, checkpoint in CACHE:
