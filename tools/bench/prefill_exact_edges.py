@@ -50,6 +50,10 @@ CACHE = [('fresh-unaligned', 1000, 1000, 1300, 1000),      # checkpoint at 1000:
 
 def report():
     cases = json.loads((OUT / 'cases.json').read_text())
+    if '__run__' not in cases:
+        print('NOT_IDENTICAL: the cases carry no run configuration (written by an older version)')
+        return 1
+    run = cases.pop('__run__')
     bad = unchecked = 0
     for name, c in cases.items():
         ref, new = c.get('reference'), c.get('exact')
@@ -72,9 +76,12 @@ def report():
               f"rounds {'same' if same_rounds else 'DIFFER'} "
               f"prefill {ref['prefill_wall_ms'] / 1e3:6.2f}s -> {new['prefill_wall_ms'] / 1e3:6.2f}s  {'OK' if ok else 'FAIL'}")
     meta = json.loads((OUT / 'meta.json').read_text()) if (OUT / 'meta.json').exists() else {}
+    if any(meta.get(k) != v for k, v in run.items()):
+        print('NOT_IDENTICAL: meta.json describes another run (an interrupted rerun?)')
+        return 1
     skipped = meta.get('skipped', [])
     print(f"RESULT cases={len(cases)} failed={bad} logits_unchecked={unchecked} skipped_groups={skipped} "
-          f"head={meta.get('repo_head')} dirty={meta.get('repo_dirty')}")
+          f"model={run['model']} chunk={run['chunk']} head={run['repo_head']} dirty={run['repo_dirty']}")
     print('ALL_IDENTICAL' if cases and not bad else 'NOT_IDENTICAL')
     return 0 if cases and not bad else 1
 
@@ -122,11 +129,17 @@ def sized(p):
 
 
 OUT.mkdir(parents=True, exist_ok=True)
+RUN = dict(repo_head=os.popen(f'git -C {ROOT} rev-parse --short HEAD 2>/dev/null').read().strip(),
+           repo_dirty=bool(os.popen(f'git -C {ROOT} status --porcelain 2>/dev/null').read().strip()),
+           model=a.model, chunk=a.chunk, max_new=a.max_new, max_context=a.max_context,
+           env={k: v for k, v in os.environ.items() if k.startswith('LITHOS_')})
 cases = json.loads((OUT / 'cases.json').read_text()) if (OUT / 'cases.json').exists() else {}
-meta = dict(repo_head=os.popen(f'git -C {ROOT} rev-parse --short HEAD 2>/dev/null').read().strip(),
-            repo_dirty=bool(os.popen(f'git -C {ROOT} status --porcelain 2>/dev/null').read().strip()),
-            chunk=a.chunk, max_new=a.max_new, env={k: v for k, v in os.environ.items() if k.startswith('LITHOS_')},
-            time=time.strftime('%Y-%m-%dT%H:%M:%S'), skipped=[], sessions=[])
+if cases and cases.get('__run__') != RUN:
+    # Cases resume only within one configuration: a reference and an exact half of different runs never pair.
+    print('prefill_exact_edges: the output holds another configuration; starting over', flush=True)
+    cases = {}
+cases['__run__'] = RUN
+meta = dict(RUN, time=time.strftime('%Y-%m-%dT%H:%M:%S'), skipped=[], sessions=[])
 started = time.time()
 shared = {}
 
