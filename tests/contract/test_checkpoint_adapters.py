@@ -36,6 +36,10 @@ def test_mlx_conversion_adapters(tmp_path):
            "a_log": "language_model.model.layers.0.linear_attn.A_log", "final": "language_model.model.norm.weight"}
     hf = {k: mlx_rename(v) for k, v in mlx.items()}
     assert hf["ln"] == TEXT_PREFIX + "layers.0.input_layernorm.weight" and hf["final"] == TEXT_PREFIX + "norm.weight"
+    # an untied head (the 27B; the 0.8B ties it to the embedding) and its 4-bit groups
+    assert [mlx_rename(f"language_model.lm_head.{p}") for p in ("weight", "scales", "biases")] == \
+        ["lm_head.weight", "lm_head.scales", "lm_head.biases"]
+    assert mlx_rename("vision_tower.blocks.0.attn.qkv.weight") == "vision_tower.blocks.0.attn.qkv.weight"
     _write(tmp_path / "model.safetensors", mlx, w, w_gated)
     tree = _Tree([WeightSpec(hf["ln"], (64,), "f32", aux=True, transform="one_plus"),
                   WeightSpec(hf["gated"], (64,), "f32", aux=True, transform="bf16_f32"),

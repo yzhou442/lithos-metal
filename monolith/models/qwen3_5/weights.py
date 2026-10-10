@@ -33,12 +33,18 @@ def is_text_tensor(name: str) -> bool:
 
 
 MLX_PREFIX = "language_model.model."
+MLX_HEAD = "language_model.lm_head."
 
 
 def mlx_rename(name: str) -> str:
-    """An MLX conversion of the checkpoint (``mlx_lm.convert``) stores the text stack as ``language_model.model.*``;
-    the package declares the HF names ``model.language_model.*``."""
-    return TEXT_PREFIX + name[len(MLX_PREFIX):] if name.startswith(MLX_PREFIX) else name
+    """An MLX conversion of the checkpoint (``mlx_lm.convert``) stores the text stack as ``language_model.model.*`` and
+    an untied output head as ``language_model.lm_head.*``; the package declares the HF names ``model.language_model.*``
+    and ``lm_head.*``."""
+    if name.startswith(MLX_PREFIX):
+        return TEXT_PREFIX + name[len(MLX_PREFIX):]
+    if name.startswith(MLX_HEAD):
+        return "lm_head." + name[len(MLX_HEAD):]
+    return name
 
 
 def checkpoint_rename(path: str):
