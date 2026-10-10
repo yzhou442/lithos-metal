@@ -62,13 +62,19 @@ def test_a_later_process_reuses_the_entries_of_its_identity(tmp_path):
     assert store(tmp_path, identity='b' * 64).match(tokens + (0,)) is None   # other weights/code/device
 
 
-def test_a_dead_process_leaves_no_partial_write(tmp_path):
+def test_a_partial_write_nobody_holds_is_removed(tmp_path):
+    import fcntl
     s = store(tmp_path)
     dead = 2 ** 22 + 12345
     (s.tmp / f'{dead}-0000-1.partial').write_bytes(b'half')
-    (s.tmp / f'{os.getpid()}-ffff-1.partial').write_bytes(b'in progress')     # a live writer's
+    (s.tmp / f'{os.getpid()}-eeee-1.partial').write_bytes(b'abandoned')      # its PID now belongs to a live process
+    live = s.tmp / f'{os.getpid()}-ffff-1.partial'
+    live.write_bytes(b'in progress')
+    writer = os.open(live, os.O_WRONLY)                                      # a live writer holds its lease
+    fcntl.flock(writer, fcntl.LOCK_EX)
     again = store(tmp_path)
-    assert [p.name for p in again.tmp.iterdir()] == [f'{os.getpid()}-ffff-1.partial']
+    assert [p.name for p in again.tmp.iterdir()] == [live.name]
+    os.close(writer)
 
 
 def test_a_writer_that_died_after_this_store_started_frees_its_quota(tmp_path):
@@ -186,6 +192,39 @@ def test_an_entry_another_server_is_reading_is_not_evicted(tmp_path, monkeypatch
     assert first.write(*snapshot(4, 2)) is None and a.exists()  # not evicted under the lease
     os.close(reader)
     assert first.write(*snapshot(4, 2)) is not None and not a.exists()
+
+
+def test_a_dropped_entry_another_server_is_reading_stays_until_it_is_done(tmp_path):
+    import fcntl
+    first, second = store(tmp_path), store(tmp_path)
+    tokens, state, buffers = snapshot()
+    path = first.write(tokens, state, buffers)
+    reader = os.open(path, os.O_RDONLY)                         # the second server is loading it
+    fcntl.flock(reader, fcntl.LOCK_SH)
+    first.remove(tokens)                                        # the first server drops it (e.g. a program mismatch)
+    assert path.exists()                                        # kept under the lease
+    os.close(reader)
+    first.remove(tokens)
+    assert not path.exists()
+
+
+def test_a_writer_holds_its_lease_until_the_entry_is_published(tmp_path, monkeypatch):
+    import fcntl
+    s = store(tmp_path)
+    seen, real_replace = [], os.replace
+
+    def replace(src, dst):                                      # another server's cleanup, racing the publication
+        probe = os.open(src, os.O_RDONLY)
+        try:
+            fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            seen.append('free')
+        except BlockingIOError:
+            seen.append('leased')
+        finally:
+            os.close(probe)
+        return real_replace(src, dst)
+    monkeypatch.setattr(os, 'replace', replace)
+    assert s.write(*snapshot()) is not None and seen == ['leased']
 
 
 def test_an_entry_evicted_before_its_lease_is_a_miss_not_damage(tmp_path, monkeypatch):

@@ -8,7 +8,7 @@ another identity is never matched, and one that fails any check is deleted and t
 
 Entries live in ``entries/`` and outlive the process: a later server with the same identity reuses them. All
 entries share one byte quota with least-recently-used eviction; entries being read (by any server: a shared flock is the read lease) or written are never evicted,
-and a partial write that a dead process left is removed.
+and a partial write nobody holds (its writer's exclusive flock) is removed.
 """
 from __future__ import annotations
 
@@ -66,16 +66,6 @@ class CorruptEntry(ValueError):
 
 def _pad(n):
     return -n % ALIGN
-
-
-def _pid_alive(pid):
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    return True
 
 
 def _private_dir(path):
@@ -154,12 +144,8 @@ class PrefixStore:
         return self.dir / f'{self.identity[:16]}-{digest[:40]}{SUFFIX}'
 
     def remove(self, tokens):
-        """Delete this identity's entry for exactly ``tokens``, if there is one."""
-        tokens = tuple(tokens)
-        with self._mutex:
-            paths = [r.path for r in self._index.values() if r.identity == self.identity and r.tokens == tokens]
-        for path in paths:
-            self._discard(path)
+        """Delete this identity's entry for exactly ``tokens``, if there is one and no server holds its lease."""
+        self._discard(self._path(tuple(tokens)))
 
     def load(self, record, expected):
         """Read and verify ``record``: ``(tokens, state, {name: bytes})``, or None (the entry is dropped).
@@ -279,8 +265,6 @@ class PrefixStore:
             for (_, data), blob in zip(named, placed):
                 self._write_all(fd, data, blob['offset'])
             os.fsync(fd)
-            os.close(fd)
-            fd = None
             with self._dir_lock():        # another server counting the quota sees the partial or the entry
                 if os.path.lexists(final):
                     # Another server wrote this prefix meanwhile: the name follows from the identity and the
@@ -288,6 +272,8 @@ class PrefixStore:
                     os.unlink(partial)
                 else:
                     os.replace(partial, final)
+            os.close(fd)                  # releases the writer's lease, after the partial is gone
+            fd = None
             dir_fd = os.open(self.dir, os.O_RDONLY)
             try:
                 os.fsync(dir_fd)
@@ -378,6 +364,7 @@ class PrefixStore:
                 return None
             fd = os.open(partial, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
             try:
+                fcntl.flock(fd, fcntl.LOCK_EX)    # the writer's lease, held until the entry is published
                 os.ftruncate(fd, nbytes)
             except OSError:
                 os.close(fd)
@@ -398,7 +385,7 @@ class PrefixStore:
         for path, size, _, evictable in sorted(entries, key=lambda e: e[2]):
             if used + nbytes <= self.max_bytes:
                 break
-            if not evictable or path in pinned or not self._unlink_unless_read(path):
+            if not evictable or path in pinned or not self._unlink_unless_leased(path):
                 continue
             used -= size
             self.stats['evictions'] += 1
@@ -407,8 +394,9 @@ class PrefixStore:
         return used + nbytes <= self.max_bytes
 
     @staticmethod
-    def _unlink_unless_read(path):
-        """Unlink an entry unless a server holds its read lease; True when the entry is gone."""
+    def _unlink_unless_leased(path):
+        """Unlink an entry or a partial write unless a server holds its lease (a reader's shared or a writer's
+        exclusive flock); True when the file is gone."""
         try:
             fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
         except FileNotFoundError:
@@ -419,7 +407,7 @@ class PrefixStore:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
             os.unlink(path)
             return True
-        except OSError:                                       # BlockingIOError: being read
+        except OSError:                                       # BlockingIOError: leased
             return False
         finally:
             os.close(fd)
@@ -435,17 +423,10 @@ class PrefixStore:
         return (info.st_dev, info.st_ino) == (mine.st_dev, mine.st_ino)
 
     def _remove_stale(self):
-        """Remove partial writes whose process is gone."""
+        """Remove partial writes whose writer is gone: a live writer holds an exclusive flock on its partial (a lease,
+        unlike a process ID, that no other process can inherit)."""
         for path in self.tmp.glob('*.partial'):
-            try:
-                pid = int(path.name.split('-', 1)[0])
-            except ValueError:
-                pid = None
-            if pid is None or not _pid_alive(pid):
-                try:
-                    os.unlink(path)
-                except OSError:
-                    pass
+            self._unlink_unless_leased(path)
 
     def _refresh(self):
         """Index what other servers sharing the root wrote or evicted since this store last listed ``entries/``: a
@@ -481,13 +462,10 @@ class PrefixStore:
                 self._discard(path)
 
     def _discard(self, path):
+        """Forget an entry and delete its file, unless a server holds its lease (that server deletes it later)."""
         with self._mutex:
             self._index.pop(path, None)
-        try:
-            if stat.S_ISREG(os.lstat(path).st_mode):
-                os.unlink(path)
-        except OSError:
-            pass
+        self._unlink_unless_leased(path)
 
     # -- the format -----------------------------------------------------------------------------------------------
 
