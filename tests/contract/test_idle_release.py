@@ -221,6 +221,21 @@ def test_stop_ends_a_watcher_waiting_for_the_gpu():
     assert unloaded == [] and life.state is ModelState.READY
 
 
+def test_stop_ends_probes_waiting_for_the_gpu_and_ignores_later_ones():
+    gpu, loads = threading.Lock(), []
+    life = IdleRelease(gpu, lambda: None, 3600, state=ModelState.UNLOADED)
+    gpu.acquire()                                          # a generation holds the GPU
+    life.probe(lambda: loads.append(1))
+    time.sleep(0.3)
+    started = time.monotonic()
+    life.stop()                                            # the waiting probe stands down
+    assert time.monotonic() - started < 2 and not any(t.is_alive() for t in life._probers)
+    gpu.release()
+    life.probe(lambda: loads.append(1))                    # a probe after stop() starts nothing
+    time.sleep(0.2)
+    assert loads == [] and life.state is ModelState.UNLOADED
+
+
 def test_a_period_longer_than_a_timer_can_wait_keeps_the_watcher_alive():
     life = IdleRelease(threading.Lock(), lambda: None, 1e12).start()
     time.sleep(0.05)

@@ -49,7 +49,7 @@ class IdleRelease:
         self.loads = self.unloads = 0
         self.last_active = clock()
         self.epoch = 0                        # finished requests and explicit releases: older probes stand down
-        self._probe_epoch, self._probing = 0, False
+        self._probe_epoch, self._probing, self._probers = 0, False, []
         self._condition = threading.Condition()
         self._stopped = False
         self._thread = None
@@ -64,9 +64,11 @@ class IdleRelease:
         with self._condition:
             self._stopped = True
             self._condition.notify_all()
-        thread = getattr(self, '_thread', None)
-        if thread is not None and thread is not threading.current_thread():
-            thread.join()
+        with self._condition:
+            threads = [getattr(self, '_thread', None)] + list(self._probers)
+        for thread in threads:
+            if thread is not None and thread is not threading.current_thread():
+                thread.join()
 
     @contextlib.contextmanager
     def request(self, seconds=None):
@@ -175,16 +177,23 @@ class IdleRelease:
         finishes first makes the probe stand down. One worker serves any number of probes."""
         with self._condition:
             self._probe_epoch = self.epoch
-            if self._probing:
+            if self._probing or self._stopped:
                 return
             self._probing = True
-        threading.Thread(target=self._probe, args=(load,), name='idle-release-probe', daemon=True).start()
+            worker = threading.Thread(target=self._probe, args=(load,), name='idle-release-probe', daemon=True)
+            self._probers = [t for t in self._probers if t.is_alive()] + [worker]
+            worker.start()
 
     def _probe(self, load):
-        with self.gpu_lock:
+        while not self.gpu_lock.acquire(timeout=0.1):         # stop() ends the wait, as for the watcher
+            if self._stopped:
+                with self._condition:
+                    self._probing = False
+                return
+        try:
             with self._condition:
                 self._probing = False             # later probes start another worker, which waits for this one
-                if self._probe_epoch != self.epoch:
+                if self._stopped or self._probe_epoch != self.epoch:
                     return
                 ready = self.state is ModelState.READY
                 if ready and self.clock() - self.last_active < self.seconds:
@@ -199,6 +208,8 @@ class IdleRelease:
                 self.last_active = self.clock()
                 self.epoch += 1
                 self._condition.notify_all()
+        finally:
+            self.gpu_lock.release()
 
     def _release(self):
         started = self.clock()
