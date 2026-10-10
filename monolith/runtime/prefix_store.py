@@ -236,6 +236,9 @@ class PrefixStore:
         with self._admission, self._mutex:
             self._closed = True
         self.flush()
+        if self._writer.is_alive():
+            self._queue.put(None)                               # the writer stops after the accepted snapshots
+            self._writer.join()
         with self._unpinned:
             idle = self._unpinned.wait_for(lambda: not self._pinned, timeout)
         if not idle:
@@ -324,7 +327,12 @@ class PrefixStore:
 
     def _drain(self):
         while True:
-            tokens, state, buffers, on_written = self._queue.get()
+            task = self._queue.get()
+            if task is None:                                    # close()
+                self._queue.task_done()
+                return
+            tokens, state, buffers, on_written = task
+            task = None
             try:
                 if not self.contains(tokens):
                     path = self.write(tokens, state, buffers)

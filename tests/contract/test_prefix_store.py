@@ -102,6 +102,8 @@ def test_closing_waits_for_a_submission_in_progress(tmp_path, monkeypatch):
     real_put, closer = s._queue.put, []
 
     def put(*args):                                              # close() starts while this snapshot is queued
+        if closer:                                               # close()'s own stop sentinel
+            return real_put(*args)
         closer.append(threading.Thread(target=s.close))
         closer[0].start()
         closer[0].join(0.1)
@@ -148,6 +150,7 @@ def test_a_read_in_progress_keeps_the_directory(tmp_path):
         s._unpinned.notify_all()
     s.close()                                                    # the read finished: the directory is free
     store(tmp_path).close()
+    assert not s._writer.is_alive()                              # nor does a closed store keep its writer thread
 
 
 @pytest.mark.parametrize('damage', ['flip', 'truncate', 'magic', 'header'])
