@@ -2,6 +2,7 @@
 
 import gc
 import importlib.util
+import math
 import threading
 import time
 import weakref
@@ -230,6 +231,170 @@ def test_a_period_longer_than_a_timer_can_wait_keeps_the_watcher_alive():
     life._thread.join(5)
 
 
+
+# Periods a request sets, explicit loads and releases, and probes (Ollama's keep_alive and HEAD /api/chat).
+
+def wait_for(condition, timeout=5):
+    deadline = time.monotonic() + timeout
+    while not condition():
+        assert time.monotonic() < deadline
+        time.sleep(0.01)
+
+
+def test_a_request_sets_the_period_that_follows_it():
+    life, clock, unloads = lifecycle(30)
+    with life.request(300):
+        pass
+    clock.now += 100
+    assert not life.release_if_idle() and life.expires_in() == 200
+    with life.request(math.inf):                   # never, until a later request sets another period
+        pass
+    clock.now += 10 ** 9
+    assert not life.release_if_idle() and life.expires_in() is None
+    with life.request():                           # without its own: the server's
+        pass
+    clock.now += 30
+    assert life.release_if_idle() and life.expires_in() is None
+
+
+def test_a_zero_period_releases_once_no_request_is_pending():
+    life, clock, unloads = lifecycle(math.inf)
+    life.arrive()                                  # queued behind the request below
+    with life.request(0):
+        pass
+    assert not life.release_if_idle()
+    life.leave()
+    with life.request(0):
+        pass
+    assert life.release_if_idle() and unloads == [clock.now]
+
+
+def test_hold_loads_without_generating_and_restarts_the_period():
+    life, clock, unloads = lifecycle(30, state=ModelState.UNLOADED)
+    loads = []
+    life.hold(lambda: loads.append(1), 600)
+    assert loads == [1] and life.state is ModelState.READY and life.seconds == 600 and life.pending == 0
+    clock.now += 500
+    life.hold(lambda: loads.append(2))             # ready: restarts the period, the server's this time
+    assert loads == [1] and life.expires_in() == 30
+
+
+def test_release_now_waits_for_the_generation_and_the_next_request_loads():
+    life, clock, unloads = lifecycle(math.inf)
+    life.gpu_lock.acquire()                        # a generation owns the GPU
+    result = []
+    worker = threading.Thread(target=lambda: result.append(life.release_now()))
+    worker.start()
+    time.sleep(0.05)
+    assert worker.is_alive() and unloads == []
+    life.gpu_lock.release()
+    worker.join(5)
+    assert result == [True] and life.state is ModelState.UNLOADED and life.unloads == 1
+    assert not life.release_now()                  # nothing left to release
+    with life.request() as arrived, life.gpu_lock:
+        life.ensure_loaded(arrived, lambda: None)
+    assert life.state is ModelState.READY and life.seconds == math.inf
+
+
+def test_a_probe_loads_an_unloaded_model_and_holds_it_for_the_request_it_announces():
+    life, clock, unloads = lifecycle(30, state=ModelState.UNLOADED)
+    loads = []
+    life.probe(lambda: loads.append(1))
+    wait_for(lambda: life.state is ModelState.READY and life.epoch == 1)
+    assert loads == [1] and life.seconds == IdleRelease.PROBE_HOLD
+    clock.now += 59
+    assert not life.release_if_idle()
+    clock.now += 1
+    assert life.release_if_idle()                  # no request followed
+    with life.request(0):
+        pass
+    life.probe(lambda: loads.append(2))            # after a zero period: the probe minute, not the period
+    wait_for(lambda: life.state is ModelState.READY)
+    assert loads == [1, 2] and life.seconds == IdleRelease.PROBE_HOLD
+
+
+def test_a_probe_leaves_a_ready_model_and_its_running_period_alone():
+    life, clock, unloads = lifecycle(30)
+    with life.request(30):
+        pass
+    life.probe(lambda: pytest.fail('loaded a ready model'))
+    wait_for(lambda: not life._probing)
+    with life.gpu_lock:                            # the worker finished
+        pass
+    assert life.seconds == 30 and life.expires_in() == 30
+
+
+def test_a_probe_that_beats_a_due_release_keeps_the_model():
+    life, clock, unloads = lifecycle(30)
+    clock.now += 31                                # the period ran out; the release has not run yet
+    life.probe(lambda: pytest.fail('loaded a ready model'))
+    wait_for(lambda: life.epoch == 1)
+    assert not life.release_if_idle() and life.state is ModelState.READY
+    assert life.expires_in() == IdleRelease.PROBE_HOLD
+
+
+def test_a_probe_overtaken_by_a_request_or_an_explicit_release_stands_down():
+    life, clock, unloads = lifecycle(30, state=ModelState.UNLOADED)
+    with life.gpu_lock:                            # the GPU is busy when the probe arrives
+        life.probe(lambda: pytest.fail('the probe should stand down'))
+        with life.request(0):                      # a request finishes first and sets its own period
+            pass
+    wait_for(lambda: not life._probing)
+    with life.gpu_lock:
+        pass
+    assert life.seconds == 0 and life.state is ModelState.UNLOADED
+    unloads = []
+    life = IdleRelease(threading.RLock(), lambda: unloads.append(1), 30, clock=Clock())
+    with life.gpu_lock:                            # reentrant: this thread runs the release before the probe's worker
+        life.probe(lambda: pytest.fail('the probe should stand down'))
+        assert life.release_now()                  # an explicit release accepted after the probe runs first
+    wait_for(lambda: not life._probing)
+    with life.gpu_lock:
+        pass
+    assert life.state is ModelState.UNLOADED and unloads
+
+
+def test_a_probe_during_a_release_loads_after_it():
+    for release in ('idle', 'explicit'):
+        unloading, finish = threading.Event(), threading.Event()
+        clock = Clock()
+        def unload():
+            unloading.set()
+            assert finish.wait(5)
+        life = IdleRelease(threading.Lock(), unload, 30, clock=clock)
+        clock.now += 30
+        releaser = threading.Thread(target=life.release_if_idle if release == 'idle' else life.release_now)
+        releaser.start()
+        assert unloading.wait(5)
+        loads = []
+        life.probe(lambda: loads.append(1))        # the model is still mapped when the probe arrives
+        finish.set()
+        releaser.join(5)
+        wait_for(lambda: loads == [1] and life.state is ModelState.READY)
+
+
+def test_probes_share_one_worker():
+    life, clock, unloads = lifecycle(30, state=ModelState.UNLOADED)
+    loads, before = [], threading.active_count()
+    with life.gpu_lock:                            # a long request owns the GPU
+        for _ in range(50):
+            life.probe(lambda: loads.append(1))
+        assert threading.active_count() - before <= 1
+    wait_for(lambda: loads == [1] and life.state is ModelState.READY)
+
+
+def test_a_probe_whose_load_fails_leaves_the_retry_to_the_next_request():
+    life, clock, unloads = lifecycle(30, state=ModelState.UNLOADED)
+    life.probe(lambda: (_ for _ in ()).throw(OSError('weights missing')))
+    wait_for(lambda: life.state is ModelState.FAILED)
+    with life.gpu_lock:
+        pass
+    assert life.seconds == 30 and life.epoch == 0
+    with life.request() as arrived, life.gpu_lock:
+        life.ensure_loaded(arrived, lambda: None)  # arrived after the failure: tries again
+    assert life.state is ModelState.READY
+
+
 # Backend integration: what an unload frees and how requests see the lifecycle.
 
 class Engine:
@@ -290,6 +455,20 @@ def test_unload_drops_every_engine_buffer_and_snapshot_but_keeps_programs():
     assert log == ['release', 'release'] and not b.loaded and b.resident_bytes == 0
     assert all(ref() is None for ref in refs)
     assert b.session.prefix_cache.items == []
+
+
+@serving
+def test_a_load_without_a_request_maps_the_most_recent_session_or_the_default_one():
+    log = []
+    b = backend(log)
+    b.unload()
+    log.clear()
+    b.load()
+    assert log == ['load'] and b.loaded            # the most recent session
+    b.session, seen = None, []
+    b.select_session = lambda request, n: (seen.append((request.temperature, n)), setattr(b, 'session', Session(log)))
+    b.load()
+    assert seen == [(0.0, 0)] and log[-1] == 'load' and b.loaded
 
 
 @serving

@@ -131,9 +131,12 @@ class Backend:
         buffers = tuple((getattr(self.session, 'buffers', None) or {}).values())
         return sum({id(b): b.nbytes for b in buffers}.values()) if self.loaded else 0
 
-    def load(self, request, prompt_tokens):
-        """Select the request's session and map its weights, states and scratch again (Session.load)."""
-        self.select_session(request, prompt_tokens)
+    def load(self, request=None, prompt_tokens=0):
+        """Select the request's session and map its weights, states and scratch again (Session.load). Without a
+        request (a load request or a probe): the most recent session, else the default one."""
+        if request is not None or self.session is None:
+            self.select_session(request or ChatRequest(model='', messages=[Message(role='user', content='Hello')]),
+                                prompt_tokens)
         self.session.load()
 
     def unload(self):
