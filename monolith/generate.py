@@ -245,6 +245,31 @@ class Session:
             op.bindings = [(slot, renames.get(n, n), off) for slot, n, off in op.bindings]
         return prog
 
+    def prefix_identity(self, **extra: Any) -> str:
+        """A digest of what this session's prefix checkpoints depend on, for checkpoints kept on disk: the snapshot
+        format and the engine's code, the device and OS, the target and draft packs (their checkpoint identities),
+        the StepState layout, the state entries (the position-major caches without their capacity), the prefill
+        chunking and the options that change numerics, plus the caller's ``extra`` (recipes, tokenizer)."""
+        import hashlib
+        import platform
+
+        from . import __version__
+        from .runtime.prefix_store import FORMAT, code_digest
+        info = self.dev.info()
+
+        def manifest(pack):
+            return hashlib.sha256((pack.dir / 'manifest.json').read_bytes()).hexdigest() if pack is not None else None
+        entries = sorted((e.name, list(e.shape[1:] if e.name in self._kv_buffers else e.shape), e.dtype.name,
+                          e.checkpoints) for e in self.prefix_cache.entries.values())
+        doc = dict(format=FORMAT, version=__version__, code=code_digest(), os=platform.platform(),
+                   device=[info.name, info.gpu_cores, info.apple_family], backend=self.profile.backend,
+                   target=manifest(self.pack), draft=manifest(self.drafter_pack),
+                   layout=[self.layout.size, sorted(self.layout.offsets.items())], entries=entries,
+                   prefill=[self.prefill_exact, self.prefill_chunk_size, self.EXACT_ROWS],
+                   numerics=[self.commute_norm, self.gdn_mixer_fusion, self.fast_math, self.accelerator, self.attention,
+                             self.prefill_attention, self.prefill_optimizations], extra=extra)
+        return hashlib.sha256(json.dumps(doc, sort_keys=True, default=repr).encode()).hexdigest()
+
     @property
     def can_ingest(self) -> bool:
         """Whether the fixed-length verification graph also takes prompt rows (accept_scan commits them under

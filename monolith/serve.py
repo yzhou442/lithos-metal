@@ -34,7 +34,8 @@ class Backend:
     prefill_exact = False
     lifecycle = None                 # IdleRelease: unload after an idle period (--model-ttl)
 
-    def __init__(self, model_dir, pack_dir, max_context=4096, prefill_chunk_size=128, *, assets=None, prefill_exact=False):
+    def __init__(self, model_dir, pack_dir, max_context=4096, prefill_chunk_size=128, *, assets=None, prefill_exact=False,
+                 prefix_store=None):
         from transformers import AutoTokenizer
 
         self.tokenizer = AutoTokenizer.from_pretrained(model_dir, local_files_only=True, trust_remote_code=False)
@@ -46,6 +47,7 @@ class Backend:
         self._sessions = {}
         self.assets = assets
         self.last_metrics = {}
+        self.prefix_store = prefix_store     # PrefixStore options (root, max_bytes, persist): checkpoints on local disk
 
     def warmup(self, model_name):
         """Compile and page in the default generation path before accepting traffic."""
@@ -96,9 +98,50 @@ class Backend:
                 prefill_exact=self.prefill_exact)
         if prefix_cache is not None:
             self.session.prefix_cache = prefix_cache
+        else:
+            self._open_prefix_store()
         while len(sessions) > 8:
             sessions.pop(next(iter(sessions)))
         self.sampling = sampling
+
+    def _open_prefix_store(self):
+        """Put the first session's prefix cache over a disk store; an unusable directory leaves it in memory."""
+        options, cache = getattr(self, 'prefix_store', None), getattr(self.session, 'prefix_cache', None)
+        if not options or cache is None or getattr(cache, 'store', None) is not None:
+            return
+        import hashlib
+        from .runtime.prefix_store import PrefixStore
+        assets = getattr(self, 'assets', None)
+        tokenizer = hashlib.sha256()
+        for name in ('tokenizer.json', 'tokenizer_config.json', 'special_tokens_map.json', 'chat_template.jinja'):
+            path = Path(self.model_dir) / name
+            tokenizer.update(name.encode() + (path.read_bytes() if path.is_file() else b''))
+        try:
+            identity = self.session.prefix_identity(recipes=getattr(assets, 'recipes', None),
+                                                    recipe_key=getattr(assets, 'recipe_key', None),
+                                                    tokenizer=tokenizer.hexdigest())
+            cache.store = PrefixStore(options['root'], options['max_bytes'], identity, persist=options['persist'])
+        except (OSError, ValueError) as exc:
+            logging.getLogger(__name__).warning('Prefix store disabled, checkpoints stay in memory: %s', exc)
+            self.prefix_store = None
+
+    def close(self):
+        """At exit: write the host checkpoints to a persistent store; remove a process-only store's entries."""
+        cache = getattr(self.session, 'prefix_cache', None)
+        store = getattr(cache, 'store', None)
+        if store is None:
+            return
+        lock = self._gpu()
+        if not lock.acquire(timeout=60):
+            logging.getLogger(__name__).warning('A generation still holds the GPU; closing the prefix store without it')
+            store.close()
+            return
+        try:
+            if store.persist:
+                cache.flush()
+            store.close()
+        finally:
+            lock.release()
 
     def _gpu(self):
         """The lock between generations and the model's loads and unloads."""
@@ -150,6 +193,10 @@ class Backend:
             session.release_engines()
         cache = getattr(self.session, 'prefix_cache', None)
         if cache is not None:
+            # On disk before the host copies go; a stalled disk must not hold the GPU lock indefinitely (queued
+            # writes keep their own copies and finish later).
+            if getattr(cache, 'store', None) is not None and not cache.flush(timeout=60):
+                logging.getLogger(__name__).warning('Prefix checkpoints are still being written; releasing anyway')
             cache.clear()
         gc.collect()
         alive = sum(ref() is not None for ref in engines)
@@ -235,6 +282,7 @@ class Backend:
                 options['cache_prefix_tokens'] = sorted(stable) if len(stable) > 1 else next(iter(stable), 0)
             generation = self.session.generate(ids, limit, **options)
             tokens = generation.tokens
+            prefix = getattr(getattr(self.session, 'prefix_cache', None), 'last', None) or {}
             self.last_metrics = dict(steps=getattr(generation, 'steps', 0),
                 decode_gpu_ms=getattr(generation, 'decode_ms', 0.0), wall_ms=(time.perf_counter()-started)*1000,
                 prefill_gpu_ms=getattr(generation, 'prefill_ms', 0.0),
@@ -243,6 +291,8 @@ class Backend:
                 checkpoint_ms=getattr(generation, 'checkpoint_ms', 0.0),
                 setup_ms=getattr(generation, 'setup_ms', 0.0), first_text_ms=first_text_ms,
                 cached_prompt_tokens=getattr(generation, 'cached_prompt_tokens', 0),
+                prefix_source=prefix.get('source') if getattr(generation, 'cached_prompt_tokens', 0) else None,
+                prefix_load_ms=prefix.get('load_ms', 0.0),
                 prefill_encode_ms=sum(t['encode_ms'] for t in getattr(generation, 'prefill_timings', [])),
                 prefill_commit_ms=sum(t['commit_ms'] for t in getattr(generation, 'prefill_timings', [])),
                 prefill_wait_ms=sum(t['wait_ms'] for t in getattr(generation, 'prefill_timings', [])),
@@ -472,6 +522,19 @@ def _prefill_chunk(value):
     return rows, exact
 
 
+def _byte_size(value):
+    """``N``, ``N[K|M|G|T]`` (binary units) -> bytes."""
+    text = value.strip().upper().removesuffix('IB').removesuffix('B')
+    scale = 1024 ** ('KMGT'.index(text[-1]) + 1) if text and text[-1] in 'KMGT' else 1
+    try:
+        number = float(text[:-1] if scale > 1 else text)
+    except ValueError:
+        raise argparse.ArgumentTypeError('expected a size such as 32G') from None
+    if not number * scale >= 1 or number * scale == float('inf'):
+        raise argparse.ArgumentTypeError('must be at least one byte')
+    return int(number * scale)
+
+
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(prog="lithos-metal serve", description=__doc__)
     parser.add_argument("--model", required=True, help="Hugging Face repo ID or local checkpoint path")
@@ -503,6 +566,14 @@ def parse_args(argv=None):
                         help="Idle TTL: release the model's GPU memory (weights, KV/recurrent state, scratch, prefix snapshots) after "
                              "this many seconds without requests; every request resets it, and the next request loads the model again "
                              "from the local packs. Default: no TTL, the model stays loaded")
+    parser.add_argument("--prefix-cache-dir", metavar='DIR',
+                        help="Also keep prefix checkpoints on local disk under DIR (created 0700): a checkpoint reused once is written "
+                             "when memory evicts it, every one before --model-ttl releases the model. Default: memory only")
+    parser.add_argument("--prefix-cache-disk-size", type=_byte_size, default='32G', metavar='BYTES',
+                        help="Disk quota of --prefix-cache-dir, least recently used entries evicted first (e.g. 32G, the default)")
+    parser.add_argument("--prefix-cache-persist", action='store_true',
+                        help="Reuse --prefix-cache-dir checkpoints across restarts (same engine, weights, device and options); "
+                             "without it they are removed when the server exits")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
     args = parser.parse_args(argv)
@@ -511,6 +582,8 @@ def parse_args(argv=None):
         args.draft = default_draft(args.model)
     if args.max_context < 1:
         parser.error("--max-context must be positive")
+    if args.prefix_cache_persist and not args.prefix_cache_dir:
+        parser.error('--prefix-cache-persist requires --prefix-cache-dir')
     if args.model_ttl is not None and not 0 < args.model_ttl < float('inf'):
         parser.error('--model-ttl must be a finite number of seconds > 0')
     if args.draft_block_size is not None and args.draft_block_size < 1:
@@ -530,8 +603,10 @@ def main(argv=None):
     assets = prepare(args)
     api_key = os.environ.get("LITHOS_METAL_API_KEY") or os.environ.get("LMK_API_KEY") or os.environ.get("MONOLITH_API_KEY")
     rows, exact = args.prefill_chunk_size
+    store = (dict(root=args.prefix_cache_dir, max_bytes=args.prefix_cache_disk_size, persist=args.prefix_cache_persist)
+             if args.prefix_cache_dir else None)
     backend = Backend(str(assets.model_dir), str(assets.pack_dir), args.max_context, rows or assets.prefill_chunk_size or 128,
-                      assets=assets, prefill_exact=exact)
+                      assets=assets, prefill_exact=exact, prefix_store=store)
     model_name = args.served_model_name or (assets.model_dir.name if Path(args.model).expanduser().exists() else args.model)
     if not args.no_warmup:
         backend.warmup(model_name)
@@ -540,7 +615,10 @@ def main(argv=None):
     app = create_app(backend, model_name, api_key)
     logging.getLogger(__name__).info('lithos-metal ready: http://%s:%s — model=%s; DSpark=%s; verification rows=%s',
                                    args.host, args.port, model_name, args.draft or 'disabled', assets.gamma + 1)
-    uvicorn.run(app, host=args.host, port=args.port, workers=1)
+    try:
+        uvicorn.run(app, host=args.host, port=args.port, workers=1)
+    finally:
+        backend.close()
 
 
 if __name__ == "__main__":
