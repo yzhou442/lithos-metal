@@ -109,6 +109,7 @@ class PrefixStore:
         self._pinned = set()          # paths being read or written
         self._index = {}              # path -> Record
         self._counter = 0
+        self._closed = False          # closing: no new writes, reads or deletions (the next owner may hold the files)
         self.stats = dict(hits=0, misses=0, writes=0, write_bytes=0, write_ms=0.0, read_ms=0.0,
                           evictions=0, errors=0, dropped=0)
         for path in self.tmp.glob('*.partial'):                # no writer holds them: this store owns the root
@@ -125,6 +126,8 @@ class PrefixStore:
         """The longest entry of this identity whose tokens are a strict prefix of ``tokens``."""
         tokens = tuple(tokens)
         with self._mutex:
+            if self._closed:
+                return None
             records = [r for r in self._index.values() if r.identity == self.identity
                        and len(r.tokens) < len(tokens) and r.tokens == tokens[:len(r.tokens)]]
         return max(records, key=lambda r: len(r.tokens), default=None)
@@ -147,6 +150,8 @@ class PrefixStore:
         ``expected(names_sizes, n_tokens, state_size)`` raises CorruptEntry for buffers this program cannot take."""
         started = time.perf_counter()
         with self._mutex:
+            if self._closed:
+                return None
             self._pinned.add(record.path)
         try:
             fd = os.open(record.path, os.O_RDONLY | os.O_NOFOLLOW)
@@ -185,6 +190,9 @@ class PrefixStore:
         """Queue a snapshot for the writer thread; the bytes objects are shared, not copied. A queue still full after
         ``timeout`` seconds (None: as long as it takes) drops it and returns False."""
         tokens = tuple(tokens)
+        if self._closed:
+            self.stats['dropped'] += 1
+            return False
         if self.contains(tokens):
             return True
         try:
@@ -206,7 +214,10 @@ class PrefixStore:
         return True
 
     def close(self):
-        """Finish queued writes and give the directory up to the next server."""
+        """Refuse new writes, finish the accepted ones and give the directory up to the next server. A closed store
+        reads, writes and deletes nothing: the next owner may hold the files."""
+        with self._mutex:
+            self._closed = True
         self.flush()
         if self._owner is not None:
             os.close(self._owner)
@@ -353,6 +364,8 @@ class PrefixStore:
     def _discard(self, path):
         with self._mutex:
             self._index.pop(path, None)
+            if self._closed:
+                return
         try:
             if stat.S_ISREG(os.lstat(path).st_mode):
                 os.unlink(path)

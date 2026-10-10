@@ -82,6 +82,20 @@ def test_one_server_uses_a_directory_at_a_time(tmp_path):
     assert again.match(tokens + (0,)).tokens == tokens and list(again.tmp.iterdir()) == []
 
 
+def test_a_closed_store_touches_no_file(tmp_path, monkeypatch):
+    s = store(tmp_path)
+    tokens, state, buffers = snapshot()
+    path = s.write(tokens, state, buffers)
+    record = s.match(tokens + (0,))
+    s.close()                                                    # a slow generation can still save afterwards
+    monkeypatch.setattr(s, 'write', lambda *args: pytest.fail('a closed store wrote'))
+    assert not s.submit(*snapshot(4, 2)) and s.flush(timeout=1)
+    assert s.match(tokens + (0,)) is None and s.load(record, accept) is None
+    s.remove(tokens)
+    assert path.exists()                                         # the next owner's files now
+    store(tmp_path).close()                                      # and the directory is free
+
+
 @pytest.mark.parametrize('damage', ['flip', 'truncate', 'magic', 'header'])
 def test_corrupt_entries_are_misses_and_removed(tmp_path, damage):
     s = store(tmp_path)
