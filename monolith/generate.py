@@ -247,7 +247,8 @@ class Session:
 
     def prefix_identity(self, **extra: Any) -> str:
         """A digest of what this session's prefix checkpoints depend on, for checkpoints kept on disk: the snapshot
-        format and the engine's code, the device and OS, the target and draft packs (their checkpoint identities),
+        format and the engine's code, the device and OS, the target and draft packs (manifest, and the payload's size
+        and modification time: a manifest records layouts, not weights, so a pack rebuilt in place keeps it),
         the StepState layout, the state entries (the position-major caches without their capacity), the prefill
         chunking and the options that change numerics, plus the caller's ``extra`` (recipes, tokenizer)."""
         import hashlib
@@ -258,7 +259,11 @@ class Session:
         info = self.dev.info()
 
         def manifest(pack):
-            return hashlib.sha256((pack.dir / 'manifest.json').read_bytes()).hexdigest() if pack is not None else None
+            if pack is None:
+                return None
+            payload = (pack.dir / pack.manifest.get('pack', 'weights.pack')).stat()
+            return [hashlib.sha256((pack.dir / 'manifest.json').read_bytes()).hexdigest(), payload.st_size,
+                    payload.st_mtime_ns]
         entries = sorted((e.name, list(e.shape[1:] if e.name in self._kv_buffers else e.shape), e.dtype.name,
                           e.checkpoints) for e in self.prefix_cache.entries.values())
         doc = dict(format=FORMAT, version=__version__, code=code_digest(), os=platform.platform(),

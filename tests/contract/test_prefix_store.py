@@ -393,6 +393,29 @@ def test_restore_checks_before_writing(tmp_path):
 
 # The server.
 
+def test_the_identity_changes_when_a_pack_is_rebuilt_in_place(tmp_path):
+    import json
+    from monolith.generate import Session
+    entries = [NS(name='target.k_cache', shape=(16, 2), dtype=NS(itemsize=1, name='uint8'), checkpoints=1)]
+    pack_dir = tmp_path / 'pack'
+    pack_dir.mkdir()
+    (pack_dir / 'manifest.json').write_text(json.dumps({'pack': 'weights.pack', 'slabs': []}))
+    (pack_dir / 'weights.pack').write_bytes(b'w' * 64)
+    s = Session.__new__(Session)
+    s.dev = NS(info=lambda: NS(name='gpu', gpu_cores=40, apple_family=10))
+    s.profile, s.pack, s.drafter_pack = NS(backend='m5_max_40c'), NS(dir=pack_dir, manifest={'pack': 'weights.pack'}), None
+    s.layout, s.prefix_cache, s._kv_buffers = NS(size=8, offsets={'step': 0}), PrefixCache(entries, 1 << 20), set()
+    s.prefill_exact, s.prefill_chunk_size = True, 512
+    for name in ('commute_norm', 'gdn_mixer_fusion', 'fast_math', 'accelerator', 'attention', 'prefill_attention',
+                 'prefill_optimizations'):
+        setattr(s, name, None)
+    before = s.prefix_identity(test=True)
+    assert s.prefix_identity(test=True) == before
+    (pack_dir / 'weights.pack').write_bytes(b'v' * 64)          # same size and manifest, other weights
+    os.utime(pack_dir / 'weights.pack', ns=(1, 2))
+    assert s.prefix_identity(test=True) != before
+
+
 def test_options_and_sizes():
     from monolith.serve import _byte_size, parse_args
     args = parse_args(['--model', 'org/target', '--no-draft'])
