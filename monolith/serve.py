@@ -187,6 +187,7 @@ class Backend:
         try:
             started = time.perf_counter()
             stopped = False
+            stops = [request.stop] if isinstance(request.stop, str) else request.stop or []
             def publish(tokens):
                 nonlocal first_text_ms, stopped
                 if on_text or on_content or on_progress:
@@ -200,11 +201,12 @@ class Backend:
                         on_content(content)
                     if on_progress:
                         on_progress(content, min(len(tokens), limit))
-                    stops = [request.stop] if isinstance(request.stop, str) else request.stop or []
-                    if stops:
-                        raw = self.tokenizer.decode(tokens, skip_special_tokens=True, clean_up_tokenization_spaces=False)
-                        stopped = any(stop in raw for stop in stops)
-            options = dict(on_tokens=publish, cancelled=lambda: stopped or bool(cancelled and cancelled())) if on_text or on_content or on_progress else {}
+                if stops:
+                    raw = self.tokenizer.decode(tokens, skip_special_tokens=True, clean_up_tokenization_spaces=False)
+                    stopped = any(stop in raw for stop in stops)
+            # A stop string ends decoding on every path, not only while streaming.
+            options = (dict(on_tokens=publish, cancelled=lambda: stopped or bool(cancelled and cancelled()))
+                       if on_text or on_content or on_progress or stops else {})
             if getattr(self.session, 'prefix_cache', None) is not None:
                 stable = set()
                 if messages:

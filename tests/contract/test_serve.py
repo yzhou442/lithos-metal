@@ -81,7 +81,7 @@ def test_template_sampling_context_and_stop(monkeypatch, eos):
 
     def load(*args, **kwargs):
         calls.append(kwargs)
-        return SimpleNamespace(eos=eos, generate=lambda ids, n: SimpleNamespace(tokens=tokens[:n]))
+        return SimpleNamespace(eos=eos, generate=lambda ids, n, **_: SimpleNamespace(tokens=tokens[:n]))
 
     def decode(ids, **kwargs):
         decoded.append(ids)
@@ -124,6 +124,32 @@ def test_template_sampling_context_and_stop(monkeypatch, eos):
     parts = [{"type": "text", "text": "a"}, {"type": "text", "text": "b"}]
     client.post("/v1/chat/completions", json=payload(max_tokens=2, messages=[{"role": "user", "content": parts}]))
     assert prompts[-1][0] == [{"role": "user", "content": "ab"}]
+
+
+
+def test_a_stop_string_ends_a_non_streaming_generation():
+    generated = []
+
+    def generate(ids, n, on_tokens=None, cancelled=None, **_):
+        tokens = []
+        while len(tokens) < n and not (cancelled and cancelled()):
+            tokens.append(10 + len(tokens))                             # one token per round
+            if on_tokens:
+                on_tokens(list(tokens))
+        generated.append(len(tokens))
+        return SimpleNamespace(tokens=tokens)
+
+    words = {10: "Hello", 11: " world", 12: "\n\n", 13: "More"}
+    backend = Backend.__new__(Backend)
+    backend.max_context, backend.sampling = 64, (0.0, 1.0, 0, 0, None)
+    backend.session = SimpleNamespace(eos=99, generate=generate)
+    backend.tokenizer = SimpleNamespace(apply_chat_template=lambda *a, **kw: [1, 2, 3],
+                                        decode=lambda ids, **kw: "".join(words.get(i, "!") for i in ids))
+    client = TestClient(create_app(backend, "test-model"))
+    response = client.post("/v1/chat/completions", json=payload(max_tokens=50, stop="\n\n")).json()
+    assert response["choices"][0]["message"]["content"] == "Hello world"
+    assert response["choices"][0]["finish_reason"] == "stop"
+    assert generated == [3] and response["usage"]["completion_tokens"] == 3      # not 50 rounds
 
 
 def test_cli_accepts_hub_ids_and_optional_cache():
