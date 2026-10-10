@@ -82,15 +82,18 @@ class PrefixCache:
 
     def flush(self, timeout=None):
         """Write every host copy the store does not hold, waiting up to ``timeout`` seconds in all for room in the
-        writer's queue and for the writes. False when a copy was not written in time."""
+        writer's queue and for the writes. False when a copy is not on disk afterwards (not written in time, or its
+        write failed)."""
         if self.store is None:
             return True
         deadline = None if timeout is None else time.monotonic() + timeout
 
         def left():
             return None if deadline is None else max(0.0, deadline - time.monotonic())
-        queued = [self._spill(item, left()) for item in self.items]
-        return self.store.flush(left()) and all(queued)
+        for item in self.items:
+            self._spill(item, left())
+        # The writer reports no outcome: a copy is persisted when its file is there.
+        return self.store.flush(left()) and all(self.store.contains(item.tokens) for item in self.items)
 
     def clear(self):
         """Drop every snapshot (their host copies of the attention and recurrent state)."""

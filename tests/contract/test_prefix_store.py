@@ -301,6 +301,17 @@ def test_flush_waits_for_room_in_the_writer_queue(tmp_path, monkeypatch):
     gate.set()
 
 
+def test_flush_reports_a_write_that_failed(tmp_path, monkeypatch):
+    entries, eng = engine()
+    disk = store(tmp_path)
+    cache = PrefixCache(entries, 1 << 20, store=disk)
+    cache.save([1, 2, 3], eng)
+    monkeypatch.setattr(disk, 'write', lambda *args: None)      # e.g. ENOSPC: the writer logs it and goes on
+    assert not cache.flush(timeout=5)
+    monkeypatch.undo()
+    assert cache.flush(timeout=5) and disk.contains((1, 2, 3))
+
+
 def test_flush_writes_again_a_copy_the_quota_evicted(tmp_path):
     entries, eng = engine()
     disk = store(tmp_path)

@@ -195,7 +195,8 @@ class Backend:
             # On disk before the host copies go; a stalled disk must not hold the GPU lock indefinitely (queued
             # writes keep their own copies and finish later).
             if getattr(cache, 'store', None) is not None and not cache.flush(timeout=60):
-                logging.getLogger(__name__).warning('Prefix checkpoints are still being written; releasing anyway')
+                logging.getLogger(__name__).warning('Some prefix checkpoints are not on disk (still being written, or the '
+                                                    'write failed); releasing anyway')
             cache.clear()
         gc.collect()
         alive = sum(ref() is not None for ref in engines)
