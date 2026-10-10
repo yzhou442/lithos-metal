@@ -65,7 +65,7 @@ def report():
         same_rounds = ref.get('rounds') == new.get('rounds')
         ok = same_tokens and same_logits and same_rounds
         bad += not ok
-        print(f"{name:28s} P={c['prompt_tokens']:6d} recipe={c['recipe']:>5s} reference passes {str(ref['passes'][-4:]):>22s} "
+        print(f"{name:28s} P={c['prompt_tokens']:6d} recipe={str(c['recipe']):>5s} reference passes {str(ref['passes'][-4:]):>22s} "
               f"exact passes {str(new['passes'][-4:]):>22s} ref-path={str(new['reference_path']):5s} tokens "
               f"{'same' if same_tokens else f'DIFFER@{first}'} logits "
               f"{('same' if ref['logits_rows'] else 'n/a') if same_logits else f'DIFFER rows {rows}'} "
