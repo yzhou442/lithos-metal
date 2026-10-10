@@ -144,6 +144,38 @@ def test_quota_evicts_least_recently_used_but_never_a_pinned_entry(tmp_path):
     assert s.write((7, 8), b's' * 16, {'k': b'x' * (s.max_bytes + 1)}) is None    # larger than the quota
 
 
+def test_servers_sharing_a_directory_see_each_others_writes_and_evictions(tmp_path):
+    first = store(tmp_path)
+    tokens, state, buffers = snapshot()
+    path = first.write(tokens, state, buffers)
+    second = store(tmp_path)                                   # indexes the entry
+    os.unlink(path)                                            # the first server's quota evicts it
+    assert not second.contains(tokens) and second.match(tokens + (0,)) is None   # so a flush writes it again
+    later = snapshot(4, 3)
+    first.write(*later)                                        # written after the second server started
+    assert second.contains(later[0]) and second.match(later[0] + (0,)).tokens == later[0]
+
+
+def test_an_entry_is_published_under_the_quota_lock(tmp_path, monkeypatch):
+    s = store(tmp_path)
+    held, seen = [False], []
+    real_lock, real_replace = s._dir_lock, os.replace
+
+    class Lock:
+        def __enter__(self):
+            self.inner = real_lock()
+            self.inner.__enter__()
+            held[0] = True
+
+        def __exit__(self, *exc):
+            held[0] = False
+            return self.inner.__exit__(*exc)
+    monkeypatch.setattr(s, '_dir_lock', Lock)
+    monkeypatch.setattr(os, 'replace', lambda a, b: seen.append(held[0]) or real_replace(a, b))
+    assert s.write(*snapshot()) is not None
+    assert seen == [True]                     # another server always counts the partial or the entry
+
+
 def test_writer_queue_is_bounded_and_flush_waits(tmp_path, monkeypatch):
     import threading
     s = store(tmp_path, pending=1)

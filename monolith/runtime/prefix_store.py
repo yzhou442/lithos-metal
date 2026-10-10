@@ -131,9 +131,24 @@ class PrefixStore:
         return max(records, key=lambda r: len(r.tokens), default=None)
 
     def contains(self, tokens):
+        """Whether the entry for exactly ``tokens`` is on disk now. Another server sharing the root may have written
+        or evicted it since this store indexed the directory: its name follows from the identity and the tokens."""
         tokens = tuple(tokens)
+        path = self._path(tokens)
+        try:
+            info = os.lstat(path)
+        except OSError:
+            info = None
         with self._mutex:
-            return any(r.identity == self.identity and r.tokens == tokens for r in self._index.values())
+            if info is None or not stat.S_ISREG(info.st_mode):
+                self._index.pop(path, None)
+                return False
+            self._index.setdefault(path, Record(path, self.identity, tokens, info.st_size))
+            return True
+
+    def _path(self, tokens):
+        digest = hashlib.sha256(struct.pack(f'<{len(tokens)}i', *tokens)).hexdigest()
+        return self.dir / f'{self.identity[:16]}-{digest[:40]}{SUFFIX}'
 
     def remove(self, tokens):
         """Delete this identity's entry for exactly ``tokens``, if there is one."""
@@ -232,8 +247,8 @@ class PrefixStore:
                 break
             base = len(prologue) + _pad(len(prologue))
         total = placed[-1]['offset'] + placed[-1]['size']
-        name = f'{self.identity[:16]}-{hashlib.sha256(token_bytes).hexdigest()[:40]}{SUFFIX}'
-        final = self.dir / name
+        final = self._path(tokens)
+        name = final.name
         with self._mutex:
             self._counter += 1
             partial = self.tmp / f'{os.getpid()}-{self._nonce}-{self._counter}.partial'
@@ -252,7 +267,8 @@ class PrefixStore:
             os.fsync(fd)
             os.close(fd)
             fd = None
-            os.replace(partial, final)
+            with self._dir_lock():        # another server counting the quota sees the partial or the entry
+                os.replace(partial, final)
             dir_fd = os.open(self.dir, os.O_RDONLY)
             try:
                 os.fsync(dir_fd)
