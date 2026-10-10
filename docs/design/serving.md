@@ -115,11 +115,12 @@ recomputes them. Scratch, parameter records and the token ring are not saved.
 
 `--prefix-cache-dir DIR` (default off) adds a [disk tier](../../monolith/runtime/prefix_store.py) below the host
 copies. A checkpoint that served at least one restore is written when the host tier evicts it, every host copy is
-written before an idle release drops it (the release waits up to 60 s for those writes), and a longer prefix
-found only on disk is read, verified and promoted to the host tier; writes run on a background thread from the
-host copy's bytes, never per decode step. Both tiers hold the same bytes, so a restore from either sets the same
-state. `--prefix-cache-disk-size` (default `32G`) bounds every entry under `DIR`, evicting the least recently
-used ones; entries being read or written are never evicted, and a snapshot larger than the quota is not saved.
+written before an idle release drops it (the release waits up to 60 s for those writes), and a longer prefix found
+only on disk is read, verified and promoted to the host tier; writes run on a background thread from the host
+copy's bytes, never per decode step. Both tiers hold the same bytes, so a restore from either sets the same state.
+`--prefix-cache-disk-size` (default `32G`) bounds every entry under `DIR`, evicting the least recently used ones;
+an entry that any server sharing `DIR` is reading or writing is never evicted, and a snapshot larger than the
+quota is not saved.
 
 Entries live in `DIR/entries/` and outlive the server: it writes its host copies at exit, and a later server with
 the same identity (below) reuses them. The directory therefore keeps state derived from prompts until the quota

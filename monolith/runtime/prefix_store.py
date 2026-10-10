@@ -7,7 +7,7 @@ identity the bytes depend on (format, code, device, weights, layout; ``Session.p
 another identity is never matched, and one that fails any check is deleted and treated as a miss.
 
 Entries live in ``entries/`` and outlive the process: a later server with the same identity reuses them. All
-entries share one byte quota with least-recently-used eviction; entries being read or written are never evicted,
+entries share one byte quota with least-recently-used eviction; entries being read (by any server: a shared flock is the read lease) or written are never evicted,
 and a partial write that a dead process left is removed.
 """
 from __future__ import annotations
@@ -169,6 +169,13 @@ class PrefixStore:
         try:
             fd = os.open(record.path, os.O_RDONLY | os.O_NOFOLLOW)
             try:
+                # The read lease: no server sharing the root evicts an entry while it is read. One evicted between
+                # the open and the lease is a miss, not damage: its name may already hold a new entry.
+                fcntl.flock(fd, fcntl.LOCK_SH)
+                if not self._is_current(fd, record.path):
+                    with self._mutex:
+                        self._index.pop(record.path, None)
+                    return None
                 header, size = self._header(fd)
                 if header['identity'] != self.identity:
                     raise CorruptEntry('identity changed')
@@ -188,6 +195,10 @@ class PrefixStore:
             self.stats['hits'] += 1
             self.stats['read_ms'] += (time.perf_counter() - started) * 1000
             return tokens, data[0], {b['name']: d for b, d in zip(header['buffers'], data[1:])}
+        except FileNotFoundError:                             # evicted by another server since the lookup
+            with self._mutex:
+                self._index.pop(record.path, None)
+            return None
         except (CorruptEntry, OSError, ValueError, KeyError, TypeError) as exc:
             self.stats['errors'] += 1
             LOG.warning('Prefix store: dropping %s (%s); prefilling instead', record.path.name, exc)
@@ -381,17 +392,41 @@ class PrefixStore:
         for path, size, _, evictable in sorted(entries, key=lambda e: e[2]):
             if used + nbytes <= self.max_bytes:
                 break
-            if not evictable or path in pinned:
-                continue
-            try:
-                os.unlink(path)
-            except OSError:
+            if not evictable or path in pinned or not self._unlink_unless_read(path):
                 continue
             used -= size
             self.stats['evictions'] += 1
             with self._mutex:
                 self._index.pop(path, None)
         return used + nbytes <= self.max_bytes
+
+    @staticmethod
+    def _unlink_unless_read(path):
+        """Unlink an entry unless a server holds its read lease; True when the entry is gone."""
+        try:
+            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        except FileNotFoundError:
+            return True
+        except OSError:
+            return False
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            os.unlink(path)
+            return True
+        except OSError:                                       # BlockingIOError: being read
+            return False
+        finally:
+            os.close(fd)
+
+    @staticmethod
+    def _is_current(fd, path):
+        """Whether ``fd`` is still the file at ``path``."""
+        try:
+            info = os.stat(path, follow_symlinks=False)
+        except FileNotFoundError:
+            return False
+        mine = os.fstat(fd)
+        return (info.st_dev, info.st_ino) == (mine.st_dev, mine.st_ino)
 
     def _remove_stale(self):
         """Remove partial writes whose process is gone."""

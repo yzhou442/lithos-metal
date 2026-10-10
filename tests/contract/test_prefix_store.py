@@ -159,6 +159,55 @@ def test_servers_sharing_a_directory_see_each_others_writes_and_evictions(tmp_pa
     assert second.match(later[0] + (0,)) is None
 
 
+def test_an_entry_another_server_is_reading_is_not_evicted(tmp_path, monkeypatch):
+    import fcntl
+    first, second = store(tmp_path), store(tmp_path)
+    tokens, state, buffers = snapshot()
+    a = first.write(tokens, state, buffers)
+    size = a.stat().st_size
+    seen, real_blob = [], second._blob
+
+    def blob(fd, b):                                           # while the second server reads, try to evict
+        probe = os.open(a, os.O_RDONLY)
+        try:
+            fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            seen.append('free')
+        except BlockingIOError:
+            seen.append('leased')
+        finally:
+            os.close(probe)
+        return real_blob(fd, b)
+    record = second.match(tokens + (0,))                       # indexing reads the header without a lease
+    monkeypatch.setattr(second, '_blob', blob)
+    assert second.load(record, accept) is not None and set(seen) == {'leased'}
+    first.max_bytes = size + size // 2                          # room for one entry
+    reader = os.open(a, os.O_RDONLY)                            # a read in progress in another server
+    fcntl.flock(reader, fcntl.LOCK_SH)
+    assert first.write(*snapshot(4, 2)) is None and a.exists()  # not evicted under the lease
+    os.close(reader)
+    assert first.write(*snapshot(4, 2)) is not None and not a.exists()
+
+
+def test_an_entry_evicted_before_its_lease_is_a_miss_not_damage(tmp_path, monkeypatch):
+    import fcntl
+    import monolith.runtime.prefix_store as ps
+    first, second = store(tmp_path), store(tmp_path)
+    tokens, state, buffers = snapshot()
+    path = first.write(tokens, state, buffers)
+    record = second.match(tokens + (0,))
+    raced, real_flock = [], ps.fcntl.flock
+
+    def flock(fd, op):                                          # evicted and written again in the window
+        if op == fcntl.LOCK_SH and not raced:
+            raced.append(1)
+            os.unlink(path)
+            first.write(tokens, state, {'k': b'z' * 24, 'rec': b'y' * 32})
+        return real_flock(fd, op)
+    monkeypatch.setattr(ps.fcntl, 'flock', flock)
+    assert second.load(record, accept) is None and second.stats['errors'] == 0
+    assert path.exists()                                        # the new entry under that name is kept
+
+
 def test_an_entry_is_published_under_the_quota_lock(tmp_path, monkeypatch):
     s = store(tmp_path)
     held, seen = [False], []
