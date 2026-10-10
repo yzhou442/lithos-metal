@@ -61,10 +61,16 @@ Context and chunk sizes are separate controls: a larger chunk increases temporar
 extending context capacity.
 
 Exact mode preserves the reduction orders of the 128-row reference graph. On the 40-core M5 Max, it uses
-32-key attention blocks and projections that read the decoder's packed weights in the prefill kernel's
-arithmetic order. Compatible prefill and decoder programs share those mappings and remain allocated together
-when they fit the Metal working set. Requests with a one-row reference chunk that needs the reference graph's
-projection path fall back to 128-row chunking. A plain `N` retains that chunk size's own reduction orders.
+32-key attention softmax and value blocks inside 128-key score tiles (the scores kept BF16-rounded, their
+first step, and overwritten by the probabilities in place), and projections that read the decoder's
+packed weights in the prefill kernel's arithmetic order. A chunk shorter than the program's rows spreads its
+weight tiles over the idle token planes. The MLP input projection decodes and multiplies each 128-column
+weight tile in two 64-column halves, each FP8 projection's threadgroup decodes a 32-row weight tile once into
+threadgroup memory for four 32-token blocks, and the GDN recurrence sums four state columns in one transposed
+butterfly in `simd_sum`'s order; `matmul2d` accumulates K in order, so all of these keep every result bit for
+bit. Compatible prefill and decoder programs share those mappings and remain allocated together when they fit
+the Metal working set. Requests with a one-row reference chunk that needs the reference graph's projection path
+fall back to 128-row chunking. A plain `N` retains that chunk size's own reduction orders.
 
 With a compatible fixed-verification recipe, short prompts and cached tails can reuse the resident decoder.
 The limit is one chunk, capped at 128 tokens in exact mode. Longer prompts hand their final rows to the decoder
