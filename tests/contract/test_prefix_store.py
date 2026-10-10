@@ -134,6 +134,22 @@ def test_a_failed_open_releases_the_directory(tmp_path):
     store(tmp_path).close()                                      # no lock left behind
 
 
+def test_a_read_in_progress_keeps_the_directory(tmp_path):
+    from monolith.runtime.prefix_store import StoreBusy
+    s = store(tmp_path)
+    path = s.write(*snapshot())
+    with s._mutex:
+        s._pinned.add(path)                                      # a load still reading it at exit
+    s.close(timeout=0.1)
+    with pytest.raises(StoreBusy):
+        store(tmp_path)                                          # the next server cannot evict it under the read
+    with s._unpinned:
+        s._pinned.discard(path)
+        s._unpinned.notify_all()
+    s.close()                                                    # the read finished: the directory is free
+    store(tmp_path).close()
+
+
 @pytest.mark.parametrize('damage', ['flip', 'truncate', 'magic', 'header'])
 def test_corrupt_entries_are_misses_and_removed(tmp_path, damage):
     s = store(tmp_path)

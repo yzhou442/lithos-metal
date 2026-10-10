@@ -118,6 +118,7 @@ class PrefixStore:
         self.dir = self.root / 'entries'
         _private_dir(self.dir)
         self._mutex = threading.Lock()
+        self._unpinned = threading.Condition(self._mutex)  # notified when a read or write releases its entry
         self._admission = threading.Lock()      # submit() and close(): no snapshot is queued once closing began
         self._pinned = set()          # paths being read or written
         self._index = {}              # path -> Record
@@ -194,8 +195,9 @@ class PrefixStore:
             self._discard(record.path)
             return None
         finally:
-            with self._mutex:
+            with self._unpinned:
                 self._pinned.discard(record.path)
+                self._unpinned.notify_all()
 
     # -- writes ---------------------------------------------------------------------------------------------------
 
@@ -227,13 +229,18 @@ class PrefixStore:
                 self._queue.all_tasks_done.wait(remaining)
         return True
 
-    def close(self):
-        """Refuse new writes, finish the accepted ones and give the directory up to the next server. A closed store
-        reads, writes and deletes nothing: the next owner may hold the files."""
+    def close(self, timeout=60):
+        """Refuse new writes, finish the accepted ones, wait up to ``timeout`` seconds for reads in progress and give
+        the directory up to the next server. A read still running keeps it until this process exits: the next owner
+        could evict that entry under it. A closed store reads, writes and deletes nothing."""
         with self._admission, self._mutex:
             self._closed = True
         self.flush()
-        if self._owner is not None:
+        with self._unpinned:
+            idle = self._unpinned.wait_for(lambda: not self._pinned, timeout)
+        if not idle:
+            LOG.warning('Prefix store: a read is still running; %s stays held until this process exits', self.root)
+        elif self._owner is not None:
             os.close(self._owner)
             self._owner = None
 
@@ -298,8 +305,9 @@ class PrefixStore:
                 pass
             return None
         finally:
-            with self._mutex:
+            with self._unpinned:
                 self._pinned.discard(final)
+                self._unpinned.notify_all()
         with self._mutex:
             self._index[final] = Record(final, self.identity, tokens, total)
         self.stats['writes'] += 1
