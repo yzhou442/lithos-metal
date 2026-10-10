@@ -147,6 +147,7 @@ class Session:
         elif q and drafter is not None:
             raise ValueError("draft_sampling='sample' needs a drafter that can sample its drafts")
         # temperature 0 = greedy (the argmax path); otherwise the Gumbel-max sampler with the thresholds
+        self._sampling = (float(temperature), int(top_k), float(top_p), int(seed)) if temperature > 0 else None
         model.sampler = GreedySampler(prefix="sampler.") if temperature <= 0 else StochasticSampler(temperature, top_k, top_p, min_p, seed, prefix="sampler.",
                                                                                                      topp_in_topk=q)
         self.engines: Dict[Any, Any] = {}
@@ -367,6 +368,35 @@ class Session:
                     prog = backend.optimize_decoder(prog, self.decoder_kernel_config)
             place_barriers(prog, self.barriers)
         return prog
+
+    def set_sampling(self, temperature: float, top_k: int, top_p: float, seed: int) -> None:
+        """Sample with other settings without compiling: rewrite the samplers' parameter records (``sample`` and a
+        sampling drafter's ``draft_q``) in every compiled program and live engine. The session must already sample
+        (greedy and sampling programs differ); its StepState takes the seed at the next request."""
+        from . import kernels
+        if temperature <= 0 or not isinstance(getattr(self.model, "sampler", None), StochasticSampler):
+            raise ValueError("set_sampling: only a sampling session takes other sampling settings")
+        settings = (float(temperature), int(top_k), float(top_p), int(seed))
+        if getattr(self, "_sampling", None) == settings:
+            return
+        for prog in self._programs.values():
+            for name, spec in prog.buffers.items():
+                kind = name.split(".")[2] if spec.role == "params" and name.count(".") >= 3 else None
+                if kind == "sample":
+                    spec.init = kernels.resample_params(spec.init, temperature=temperature, top_k=top_k, top_p=top_p, seed=seed)
+                elif kind == "draft_q":
+                    spec.init = kernels.resample_params(spec.init, temperature=temperature, seed=seed)
+                else:
+                    continue
+                for eng in self.engines.values():
+                    if eng.program is prog and name in eng.buffers:
+                        eng.buffers[name].write(spec.init, 0)
+        sampler = self.model.sampler
+        sampler.temperature, sampler.top_k, sampler.top_p, sampler.seed = settings
+        if getattr(self.drafter, "sampling", None):
+            self.drafter.sampling = float(temperature)
+        self.seed = int(seed)
+        self._sampling = settings
 
     def reset(self, *, preserve_kv: bool = False) -> None:
         """Zero the states, StepState and ring for a new sequence (the weights stay mapped)."""

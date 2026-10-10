@@ -76,12 +76,13 @@ def test_busy_and_failed_requests_release_lock():
 def test_template_sampling_context_and_stop(monkeypatch, eos):
     from monolith import generate
 
-    calls, prompts, decoded = [], [], []
+    calls, prompts, decoded, settings = [], [], [], []
     tokens = [10, 11, 99]
 
     def load(*args, **kwargs):
         calls.append(kwargs)
-        return SimpleNamespace(eos=eos, generate=lambda ids, n: SimpleNamespace(tokens=tokens[:n]))
+        return SimpleNamespace(eos=eos, generate=lambda ids, n: SimpleNamespace(tokens=tokens[:n]),
+                               set_sampling=lambda *values: settings.append(values))
 
     def decode(ids, **kwargs):
         decoded.append(ids)
@@ -114,13 +115,14 @@ def test_template_sampling_context_and_stop(monkeypatch, eos):
     assert response.json()["choices"][0]["finish_reason"] == "length"
     assert calls[-1]["temperature"] == 0.7 and calls[-1]["top_p"] == 0.9 and calls[-1]["seed"] == 42
     assert len(calls) == 2 and calls[-1]["top_k"] == 0
-    for _ in range(2):                                                  # top_k is part of the session key
-        client.post("/v1/chat/completions", json=payload(max_tokens=2, temperature=0.7, top_p=0.9, top_k=20, seed=42))
-    assert len(calls) == 3 and calls[-1]["top_k"] == 20
+    for _ in range(2):                          # other sampling settings reuse the sampling session's programs
+        client.post("/v1/chat/completions", json=payload(max_tokens=2, temperature=0.5, top_p=0.9, top_k=20, seed=7))
+    assert len(calls) == 2 and settings[-1] == (0.5, 20, 0.9, 7)
+    assert settings[0] == (0.7, 0, 0.9, 42)
     response = client.post("/v1/chat/completions", json=payload(max_tokens=7))
     assert response.status_code == 400
     assert response.json()["error"]["code"] == "context_length_exceeded"
-    assert len(calls) == 3
+    assert len(calls) == 2
     parts = [{"type": "text", "text": "a"}, {"type": "text", "text": "b"}]
     client.post("/v1/chat/completions", json=payload(max_tokens=2, messages=[{"role": "user", "content": parts}]))
     assert prompts[-1][0] == [{"role": "user", "content": "ab"}]

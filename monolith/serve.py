@@ -81,8 +81,13 @@ class Backend:
 
         assets = getattr(self, 'assets', None)
         recipe_key, options = assets.options(prompt_tokens) if assets else (None, {'max_context': self.max_context})
-        sampling = (request.temperature, request.top_p, request.top_k, request.seed, recipe_key)
+        # Greedy and sampling programs differ; one sampling program serves every temperature, top-k, top-p and seed
+        # (Session.set_sampling rewrites its parameter records), so compiling it is paid once per recipe.
+        sampling = (request.temperature > 0, recipe_key)
+        settings = (request.temperature, request.top_k, request.top_p, request.seed)
         if self.session is not None and sampling == self.sampling:
+            if request.temperature > 0 and hasattr(self.session, 'set_sampling'):
+                self.session.set_sampling(*settings)
             return
         # Keep CPU programs for a bounded number of recipe/sampling variants.
         # Only the selected session retains GPU buffers; all share executable
@@ -110,6 +115,8 @@ class Backend:
             previous.release_engines()
         if prefix_cache is not None:
             self.session.prefix_cache = prefix_cache
+        if request.temperature > 0 and hasattr(self.session, 'set_sampling'):
+            self.session.set_sampling(*settings)
         while len(sessions) > 8:
             sessions.pop(next(iter(sessions)))
         self.sampling = sampling
