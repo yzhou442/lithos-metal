@@ -139,17 +139,21 @@ def repo_dirty():
 
 
 def code_digest():
-    """The engine's files (Python, kernels, recipes, the native module) as they are, committed or not."""
+    """The engine's files (Python, kernels, recipes, the native module) and this harness, committed or not."""
     digest = hashlib.sha256()
-    for part in ('monolith', 'kernels'):
-        for path in sorted((ROOT / part).rglob('*')):
-            if path.is_file() and '__pycache__' not in path.parts:
-                digest.update(str(path.relative_to(ROOT)).encode() + b'\0' + path.read_bytes())
+    files = [path for part in ('monolith', 'kernels') for path in sorted((ROOT / part).rglob('*'))
+             if path.is_file() and '__pycache__' not in path.parts]
+    for path in files + [Path(__file__).resolve()]:
+        digest.update(str(path.relative_to(ROOT)).encode() + b'\0' + path.read_bytes())
     return digest.hexdigest()[:16]
 
 
 RUN = dict(repo_head=os.popen(f'git -C {ROOT} rev-parse --short HEAD 2>/dev/null').read().strip(),
            repo_dirty=repo_dirty(), code=code_digest(),
+           # the token sequences every case is cut from, and the weights they run on
+           prompts=hashlib.sha256(json.dumps([HEAD, TAIL, doc]).encode()).hexdigest()[:16],
+           model_dir=str(assets.model_dir), pack=str(assets.pack_dir),
+           draft=[str(assets.draft_dir), str(assets.draft_pack)],
            model=a.model, chunk=a.chunk, max_new=a.max_new, max_context=a.max_context,
            env={k: v for k, v in os.environ.items() if k.startswith('LITHOS_')})
 cases = json.loads((OUT / 'cases.json').read_text()) if (OUT / 'cases.json').exists() else {}
@@ -159,6 +163,7 @@ if cases and cases.get('__run__') != RUN:
     print('prefill_exact_edges: the output holds another configuration; starting over', flush=True)
     cases = {}
 cases['__run__'] = RUN
+(OUT / 'cases.json').write_text(json.dumps(cases))     # a reset holds even if this run stops before its first case
 meta = dict(RUN, time=time.strftime('%Y-%m-%dT%H:%M:%S'), skipped=[], sessions=[])
 started = time.time()
 shared = {}
