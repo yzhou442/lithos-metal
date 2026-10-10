@@ -175,17 +175,32 @@ def test_cli_prefill_chunk_is_a_size_an_exact_size_or_the_chips_exact_size():
             parse('--prefill-chunk-size', value)
 
 
-def test_warmup_runs_the_prompt_graph_once():
-    seen = []
+def _warmup_backend(max_context, seen):
     backend = Backend.__new__(Backend)
-    backend.assets, backend.max_context = None, 4096
+    backend.assets, backend.max_context = None, max_context
     backend.select_session = lambda request, context: None
     backend.session = SimpleNamespace(prepare=lambda: None)
+    # a template of 10 tokens around one token per word
+    backend.tokenizer = SimpleNamespace(apply_chat_template=lambda messages, **_: [0] * (10 + len(messages[0]['content'].split())))
     backend.complete = lambda request, **kwargs: seen.append(len(request.messages[0].content.split()))
+    return backend
+
+
+def test_warmup_runs_the_prompt_graph_once():
+    seen = []
+    backend = _warmup_backend(4096, seen)
     backend.warmup('test-model')
     # two short requests on the resident decoder, then one longer than any prompt it keeps resident (512-row chunks)
     assert seen[:2] == [1, 1] and len(seen) == 3 and seen[2] > 512
     assert backend.last_metrics == {}
+
+
+def test_warmup_cuts_the_long_prompt_to_the_context():
+    for max_context, words in ((600, 589), (12, 1), (11, None)):
+        seen = []
+        _warmup_backend(max_context, seen).warmup('test-model')
+        # the prompt's tokens plus its 2-token output budget fit; a context with no room skips the long prompt
+        assert seen == [1, 1] + ([words] if words else [])
 
 
 def test_keep_warm_touches_idle_programs_only_within_its_window(monkeypatch):

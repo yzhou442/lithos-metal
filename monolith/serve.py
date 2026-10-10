@@ -63,10 +63,17 @@ class Backend:
         for _ in range(2):
             self.complete(request, on_text=lambda text: None)
         # Short prompts run on the resident decoder. Run the prompt graph once as well, so the first long request
-        # does not wait for its allocations and their residency.
-        prompt = ChatRequest(model=model_name, messages=[Message(role='user', content=' '.join(['Hello'] * 700))],
-                             max_tokens=2)
-        self.complete(prompt, on_text=lambda text: None)
+        # does not wait for its allocations and their residency. The prompt is cut to fit the context.
+        words = 700
+        while words > 0:
+            prompt = ChatRequest(model=model_name, messages=[Message(role='user', content=' '.join(['Hello'] * words))],
+                                 max_tokens=2)
+            ids = self.tokenizer.apply_chat_template(prompt.template_inputs()[0], tokenize=True, return_dict=False,
+                                                     add_generation_prompt=True, enable_thinking=False)
+            if len(ids) < self.max_context:          # the prompt and its 2-token output budget fit
+                self.complete(prompt, on_text=lambda text: None)
+                break
+            words -= len(ids) - self.max_context + 1
         self.last_metrics = {}
 
     def select_session(self, request, prompt_tokens):
