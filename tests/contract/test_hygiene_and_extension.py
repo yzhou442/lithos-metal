@@ -15,9 +15,11 @@ def test_repo_passes_hygiene():
 def test_hygiene_catches_violations(tmp_path):
     (tmp_path / "monolith").mkdir()
     (tmp_path / "monolith" / "bad.py").write_text(
-        "import mirage\nfrom mirage import x\nmpk_thing = 1\nNAME = 'Qwen3_5ForConditionalGeneration'\n")
+        "import mirage\nfrom mirage import x\nmpk_thing = 1\nNAME = 'Qwen3_5ForConditionalGeneration'\n"
+        "ollama_route = '/api/chat'\nOTHER = 'LlamaForCausalLM'\n")
     imports, idents, models = hygiene.run(tmp_path)
     assert len(imports) == 2 and any("mpk_thing" in s for s in idents) and any("qwen" in s for s in models)
+    assert len(models) == 2 and any("llama" in s for s in models) and not any("ollama" in s for s in models)
 
 
 def test_extension_check_allows_only_model_dirs():

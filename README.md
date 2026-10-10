@@ -60,8 +60,9 @@ curl http://127.0.0.1:8000/v1/chat/completions \
 ```
 
 The server provides **Chat Completions, Responses, and Anthropic Messages** adapters with text generation,
-tool calls, and SSE streaming. One generation runs at a time. Responses is stateless, and tools execute in the
-client. See the [serving design](docs/design/serving.md) for protocol support, caching, sampling, and API limits.
+tool calls, and SSE streaming, plus Ollama's `/api/chat` for Ollama clients. One generation runs at a time.
+Responses is stateless, and tools execute in the client. See the [serving design](docs/design/serving.md) for
+protocol support, caching, sampling, and API limits.
 
 ## Models and hardware
 
