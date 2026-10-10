@@ -16,6 +16,7 @@ import argparse
 import hashlib
 import json
 import os
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -129,8 +130,16 @@ def sized(p):
 
 
 OUT.mkdir(parents=True, exist_ok=True)
+def repo_dirty():
+    """Uncommitted changes in the checkout, apart from this harness's own output."""
+    out = OUT.resolve()
+    spec = ['.'] + ([f':(exclude){out.relative_to(ROOT)}'] if out.is_relative_to(ROOT) else [])
+    return bool(subprocess.run(['git', '-C', str(ROOT), 'status', '--porcelain', '--', *spec],
+                               capture_output=True, text=True).stdout.strip())
+
+
 RUN = dict(repo_head=os.popen(f'git -C {ROOT} rev-parse --short HEAD 2>/dev/null').read().strip(),
-           repo_dirty=bool(os.popen(f'git -C {ROOT} status --porcelain 2>/dev/null').read().strip()),
+           repo_dirty=repo_dirty(),
            model=a.model, chunk=a.chunk, max_new=a.max_new, max_context=a.max_context,
            env={k: v for k, v in os.environ.items() if k.startswith('LITHOS_')})
 cases = json.loads((OUT / 'cases.json').read_text()) if (OUT / 'cases.json').exists() else {}
