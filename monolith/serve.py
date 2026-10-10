@@ -65,8 +65,7 @@ class Backend:
         # Short prompts run on the resident decoder. Run the prompt graph once as well, so the first long request
         # does not wait for its allocations and their residency: a prompt past what the decoder ingests itself, cut to
         # fit the context (none if the context cannot hold one).
-        from .generate import Session
-        resident = Session.EXACT_ROWS if self.prefill_exact else self.prefill_chunk_size
+        resident = self.session.resident_rows
         words = max(700, resident + 64)
         while words > 0:
             prompt = ChatRequest(model=model_name, messages=[Message(role='user', content=' '.join(['Hello'] * words))],

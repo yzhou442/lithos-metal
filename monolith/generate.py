@@ -187,6 +187,11 @@ class Session:
             raise ValueError("Session: a speculative session decodes with engine(0)")
         return self._engine(t, self.decode_t_max if t == 0 else t, dynamic=(t == 0))
 
+    @property
+    def resident_rows(self) -> int:
+        """The longest prompt (past a cached prefix) a verification graph that can ingest prompt rows takes itself."""
+        return self.EXACT_ROWS if self.prefill_exact else self.prefill_chunk_size
+
     def prefill_engine(self, prompt_tokens: Optional[int] = None, rows: Optional[int] = None):
         """A separate graph/ICB for prompt chunks; short prompts use a smaller bucket."""
         bound = rows or self.prefill_chunk_size
@@ -427,7 +432,7 @@ class Session:
         # ICB resident for short prompts/tails instead of remapping both packs.
         can_ingest = (self.decoder_kernel_config is not None and self.drafter is not None
                       and self.verify == 'fixed' and (self.verify_length or 0) >= 1)
-        resident_prefill = can_ingest and p - offset <= (self.EXACT_ROWS if self.prefill_exact else self.prefill_chunk_size)
+        resident_prefill = can_ingest and p - offset <= self.resident_rows
         t_max = self.decode_t_max if resident_prefill else self.prefill_chunk_size
         # Split at the stable message prefix and just before the prompt tail.
         # Intermediate passes do not sample or draft; their state can be reused

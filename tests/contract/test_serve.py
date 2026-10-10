@@ -178,11 +178,14 @@ def test_cli_prefill_chunk_is_a_size_an_exact_size_or_the_chips_exact_size():
 
 
 def _warmup_backend(max_context, seen, chunk=512, exact=True):
+    from monolith.generate import Session
     backend = Backend.__new__(Backend)
     backend.assets, backend.max_context = None, max_context
-    backend.prefill_chunk_size, backend.prefill_exact = chunk, exact
     backend.select_session = lambda request, context: None
-    backend.session = SimpleNamespace(prepare=lambda: None)
+    session = Session.__new__(Session)
+    session.prefill_chunk_size, session.prefill_exact = chunk, exact and chunk > Session.EXACT_ROWS   # as __init__
+    session.prepare = lambda: None
+    backend.session = session
     # a template of 10 tokens around one token per word
     backend.tokenizer = SimpleNamespace(apply_chat_template=lambda messages, **_: [0] * (10 + len(messages[0]['content'].split())))
     backend.complete = lambda request, **kwargs: seen.append(len(request.messages[0].content.split()))
@@ -212,6 +215,9 @@ def test_warmup_prompt_outgrows_a_plain_chunk():
     seen = []
     _warmup_backend(8192, seen, chunk=2048, exact=False).warmup('test-model')
     assert seen == [1, 1, 2112]          # 2122 tokens: past the 2048 the decoder would ingest itself
+    seen = []
+    _warmup_backend(100, seen, chunk=32, exact=True).warmup('test-model')
+    assert seen == [1, 1, 89]            # 32-exact is plain 32-row chunks: 99 tokens are past what the decoder takes
 
 
 def test_keep_warm_touches_idle_programs_only_within_its_window(monkeypatch):
