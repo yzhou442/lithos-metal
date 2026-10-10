@@ -178,13 +178,14 @@ class PrefixStore:
 
     # -- writes ---------------------------------------------------------------------------------------------------
 
-    def submit(self, tokens, state, buffers, on_written=None):
-        """Queue a snapshot for the writer thread; the bytes objects are shared, not copied. A full queue drops it."""
+    def submit(self, tokens, state, buffers, on_written=None, timeout=0):
+        """Queue a snapshot for the writer thread; the bytes objects are shared, not copied. A queue still full after
+        ``timeout`` seconds (None: as long as it takes) drops it and returns False."""
         tokens = tuple(tokens)
         if self.contains(tokens):
             return True
         try:
-            self._queue.put_nowait((tokens, state, buffers, on_written))
+            self._queue.put((tokens, state, buffers, on_written), timeout != 0, timeout)
             return True
         except queue.Full:
             self.stats['dropped'] += 1

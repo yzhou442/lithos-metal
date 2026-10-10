@@ -244,6 +244,41 @@ def test_memory_evictions_spill_only_reused_checkpoints(tmp_path):
     assert disk.contains((1, 2, 3)) and not disk.contains((1, 2, 3, 4, 5)) and len(entries_of(disk)) == 1
 
 
+def test_flush_waits_for_room_in_the_writer_queue(tmp_path, monkeypatch):
+    import threading
+    entries, eng = engine()
+    disk = store(tmp_path, pending=1)
+    gate = threading.Event()
+    real = disk.write
+    monkeypatch.setattr(disk, 'write', lambda *args: gate.wait(5) and real(*args))
+    cache = PrefixCache(entries, 1 << 20, store=disk)
+    cache.save([1, 2, 3], eng)
+    cache.save([1, 2, 3, 4, 5], eng)
+    assert disk.submit(*snapshot(3, 7))                         # an eviction's write keeps the writer busy
+    import time
+    time.sleep(0.05)
+    threading.Timer(0.2, gate.set).start()
+    assert cache.flush(timeout=5)                               # the second copy waits for room instead of dropping
+    assert disk.contains((1, 2, 3)) and disk.contains((1, 2, 3, 4, 5)) and disk.stats['dropped'] == 0
+    gate.clear()
+    cache.save([7, 8, 9], eng)                                  # a new copy; the writer is stuck again
+    assert disk.submit(*snapshot(4, 8))
+    time.sleep(0.05)
+    assert not cache.flush(timeout=0.2)                         # not written in time: reported, not claimed
+    gate.set()
+
+
+def test_flush_writes_again_a_copy_the_quota_evicted(tmp_path):
+    entries, eng = engine()
+    disk = store(tmp_path)
+    cache = PrefixCache(entries, 1 << 20, store=disk)
+    cache.save([1, 2, 3], eng)
+    assert cache.flush(timeout=5) and cache.items[0].on_disk
+    disk.max_bytes = entries_of(disk)[0].stat().st_size         # room for one entry
+    assert disk.write(*snapshot(3, 5)) is not None and not disk.contains((1, 2, 3))
+    assert cache.flush(timeout=5) and disk.contains((1, 2, 3))   # the host copy is the only one left: written again
+
+
 def test_a_stored_checkpoint_of_another_layout_is_never_restored(tmp_path):
     entries, eng = engine()
     disk = store(tmp_path, persist=True)

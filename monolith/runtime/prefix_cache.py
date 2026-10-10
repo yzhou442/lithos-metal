@@ -77,12 +77,16 @@ class PrefixCache:
             {name: engine.buffers[name].read(0, size) for name, size in sizes.items()}))
 
     def flush(self, timeout=None):
-        """Queue every host copy the store does not hold yet and wait for the writes."""
+        """Write every host copy the store does not hold, waiting up to ``timeout`` seconds in all for room in the
+        writer's queue and for the writes. False when a copy was not written in time."""
         if self.store is None:
             return True
-        for item in self.items:
-            self._spill(item)
-        return self.store.flush(timeout)
+        deadline = None if timeout is None else time.monotonic() + timeout
+
+        def left():
+            return None if deadline is None else max(0.0, deadline - time.monotonic())
+        queued = [self._spill(item, left()) for item in self.items]
+        return self.store.flush(left()) and all(queued)
 
     def clear(self):
         """Drop every snapshot (their host copies of the attention and recurrent state)."""
@@ -122,9 +126,10 @@ class PrefixCache:
             self._evict(item.tokens, nbytes)
             self.items.append(item)
 
-    def _spill(self, item):
-        if self.store is not None and not item.on_disk:
-            self.store.submit(item.tokens, item.state, item.buffers, on_written=lambda: setattr(item, 'on_disk', True))
+    def _spill(self, item, timeout=0):
+        # The store decides whether it holds the copy: its quota may have evicted one written before (item.on_disk).
+        return self.store is None or self.store.submit(item.tokens, item.state, item.buffers, timeout=timeout,
+                                                       on_written=lambda: setattr(item, 'on_disk', True))
 
     def _check(self, sizes, n_tokens, state_size):
         """A stored checkpoint must hold exactly the buffers this cache saves, at the sizes it saves them."""
