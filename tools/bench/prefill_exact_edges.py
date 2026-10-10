@@ -188,7 +188,9 @@ RUN = dict(repo_head=os.popen(f'git -C {ROOT} rev-parse --short HEAD 2>/dev/null
            draft=[str(assets.draft_dir), str(assets.draft_pack)],
            artifacts=artifact_stamp(assets.model_dir, assets.pack_dir, assets.draft_dir, assets.draft_pack),
            model=a.model, chunk=a.chunk, max_new=a.max_new, max_context=a.max_context,
-           env={k: v for k, v in os.environ.items() if k.startswith('LITHOS_')})
+           # engine switches (MONOLITH_ACCELERATOR, LITHOS_*) and Metal's (MTL_*, e.g. shader validation); no API keys
+           env={k: v for k, v in os.environ.items() if k.startswith(('LITHOS_', 'MONOLITH_', 'MTL_'))
+                and not k.endswith('API_KEY')})
 cases = json.loads((OUT / 'cases.json').read_text()) if (OUT / 'cases.json').exists() else {}
 if cases and cases.get('__run__') != RUN:
     # Cases resume only within one configuration and the same engine files: a reference and an exact half of
