@@ -1,6 +1,7 @@
 """Idle release: the model's lifecycle, its races with requests and what an unload frees; no GPU needed."""
 
 import gc
+import importlib.util
 import threading
 import time
 import weakref
@@ -245,6 +246,11 @@ class Session:
         return SimpleNamespace(tokens=[1, 0])
 
 
+# The tests below import the server (monolith.serve): they need the serve extra.
+serving = pytest.mark.skipif(any(importlib.util.find_spec(m) is None for m in ('fastapi', 'httpx')),
+                             reason='needs the serve extra (fastapi, httpx)')
+
+
 def backend(log):
     from monolith.serve import Backend
     b = Backend.__new__(Backend)
@@ -257,6 +263,7 @@ def backend(log):
     return b
 
 
+@serving
 def test_unload_drops_every_engine_buffer_and_snapshot_but_keeps_programs():
     log = []
     b = backend(log)
@@ -273,6 +280,7 @@ def test_unload_drops_every_engine_buffer_and_snapshot_but_keeps_programs():
     assert b.session.prefix_cache.items == []
 
 
+@serving
 def test_repeated_cycles_do_not_accumulate_engines():
     log = []
     b = backend(log)
@@ -285,6 +293,7 @@ def test_repeated_cycles_do_not_accumulate_engines():
     assert sum(ref() is not None for ref in refs) == 0
 
 
+@serving
 def test_requests_load_after_an_idle_release_and_keep_the_api(monkeypatch):
     from fastapi.testclient import TestClient
     from monolith.serve import create_app
@@ -306,6 +315,7 @@ def test_requests_load_after_an_idle_release_and_keep_the_api(monkeypatch):
     assert log == ['select', 'load', 'generate'] and life.state is ModelState.READY and life.pending == 0
 
 
+@serving
 def test_a_failed_load_is_a_clear_503_and_the_next_request_retries():
     from fastapi.testclient import TestClient
     from monolith.serve import create_app
@@ -330,6 +340,7 @@ def test_a_failed_load_is_a_clear_503_and_the_next_request_retries():
     assert life.state is ModelState.READY
 
 
+@serving
 def test_without_the_option_requests_and_health_are_unchanged():
     from fastapi.testclient import TestClient
     from monolith.serve import create_app, parse_args
