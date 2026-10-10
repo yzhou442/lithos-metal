@@ -82,7 +82,7 @@ def report():
         return 1
     skipped = meta.get('skipped', [])
     print(f"RESULT cases={len(cases)} failed={bad} logits_unchecked={unchecked} skipped_groups={skipped} "
-          f"model={run['model']} chunk={run['chunk']} head={run['repo_head']} dirty={run['repo_dirty']}")
+          f"model={run['model']} chunk={run['chunk']} head={run['repo_head']} dirty={run['repo_dirty']} code={run['code']}")
     print('ALL_IDENTICAL' if cases and not bad else 'NOT_IDENTICAL')
     return 0 if cases and not bad else 1
 
@@ -138,13 +138,24 @@ def repo_dirty():
                                capture_output=True, text=True).stdout.strip())
 
 
+def code_digest():
+    """The engine's files (Python, kernels, recipes, the native module) as they are, committed or not."""
+    digest = hashlib.sha256()
+    for part in ('monolith', 'kernels'):
+        for path in sorted((ROOT / part).rglob('*')):
+            if path.is_file() and '__pycache__' not in path.parts:
+                digest.update(str(path.relative_to(ROOT)).encode() + b'\0' + path.read_bytes())
+    return digest.hexdigest()[:16]
+
+
 RUN = dict(repo_head=os.popen(f'git -C {ROOT} rev-parse --short HEAD 2>/dev/null').read().strip(),
-           repo_dirty=repo_dirty(),
+           repo_dirty=repo_dirty(), code=code_digest(),
            model=a.model, chunk=a.chunk, max_new=a.max_new, max_context=a.max_context,
            env={k: v for k, v in os.environ.items() if k.startswith('LITHOS_')})
 cases = json.loads((OUT / 'cases.json').read_text()) if (OUT / 'cases.json').exists() else {}
 if cases and cases.get('__run__') != RUN:
-    # Cases resume only within one configuration: a reference and an exact half of different runs never pair.
+    # Cases resume only within one configuration and the same engine files: a reference and an exact half of
+    # different runs never pair.
     print('prefill_exact_edges: the output holds another configuration; starting over', flush=True)
     cases = {}
 cases['__run__'] = RUN
