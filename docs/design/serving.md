@@ -70,6 +70,30 @@ With a compatible fixed-verification recipe, short prompts and cached tails can 
 The limit is one chunk, capped at 128 tokens in exact mode. Longer prompts hand their final rows to the decoder
 before output streaming begins.
 
+## Idle release
+
+`--model-ttl SECONDS` sets an idle TTL that returns the model's memory to the system when the server is idle; without it
+the model stays loaded.
+The period runs on the monotonic clock from the completion of the last request, while no other request is
+pending; any request that arrives restarts it. A request counts as pending from its arrival, before it waits
+for the GPU, through prefill, decode and streaming, until it completes, fails or is cancelled.
+
+The model is `ready`, `unloading`, `unloaded`, `loading` or `failed` (`GET /health` reports it as `model` when
+the option is set). Loads and unloads run under the lock that every GPU submission holds, so an unload never
+overlaps a generation or its command buffers. The unload releases every session's allocations: target and draft
+weight mappings, KV caches, GDN convolution and recurrent states, StepState, scratch, indirect command buffers,
+runners and their residency, and the in-memory prefix checkpoints. The tokenizer, the HTTP server, compiled CPU
+programs and executable pipelines stay, so the next request maps the weights again from the local packs without
+compiling; the pack files' pages can still be in the OS file cache, which makes that load faster than one after
+memory pressure evicted them. No weights or states are copied to the CPU or written anywhere.
+
+The next request selects its session and loads it before prefill. The load is part of that request, so an
+overlapping HTTP request receives 429 as it does during a generation; in-process callers that wait for the GPU
+(`Backend.complete`) share one load and its result. A request that arrives during an unload waits for it and
+loads the model again. A failed load leaves the model `failed` and reports HTTP 503 `model_load_failed` (an error
+event on a stream), and the next request tries again. Without the disk tier the prompt is prefilled again after a
+load; with it, checkpoints are written before the release and restored from disk.
+
 ## Prefix caching and memory ownership
 
 [Prefix checkpoints](../../monolith/runtime/prefix_cache.py) contain target and draft state for an exact
@@ -79,6 +103,39 @@ system instructions, tool definitions, and earlier messages.
 The cache can retain earlier text-block boundaries as well as message boundaries. It is bounded by a fraction
 of the recommended Metal working set and a fixed upper limit; entries are process-local and disappear on
 restart. Short prompts may be replayed instead of copied.
+
+A checkpoint is taken only after an intermediate prefill pass, which neither samples nor drafts: it holds
+exactly the committed prompt prefix (no draft tokens, no recurrent state of a later position) and leaves at
+least one prompt token to prefill, which produces the logits. It consists of the live rows of every attention
+KV cache and of DSpark's injected-context KV, both GDN convolution/recurrent slots, and the StepState (position,
+committed lengths, the recurrent slot parity). DSpark's per-step proposal logits are not state: the next pass
+recomputes them. Scratch, parameter records and the token ring are not saved.
+
+### Prefix checkpoints on disk
+
+`--prefix-cache-dir DIR` (default off) adds a [disk tier](../../monolith/runtime/prefix_store.py) below the host
+copies. A checkpoint that served at least one restore is written when the host tier evicts it, every host copy is
+written before an idle release drops it (the release waits up to 60 s for those writes), and a longer prefix found
+only on disk is read, verified and promoted to the host tier; writes run on a background thread from the host
+copy's bytes, never per decode step. Both tiers hold the same bytes, so a restore from either sets the same state.
+`--prefix-cache-disk-size` (default `32G`) bounds every entry under `DIR`, evicting the least recently used ones;
+an entry being read or written is never evicted, and a snapshot larger than the quota is not saved.
+
+Entries live in `DIR/entries/` and outlive the server: it writes its host copies at exit, and a later server with
+the same identity (below) reuses them. One server uses `DIR` at a time (an exclusive lock on `DIR/.owner`):
+another server started with the same directory keeps its checkpoints in memory and logs why. The directory keeps
+state derived from prompts until the quota evicts it or the directory is deleted.
+
+Each entry is one file: a magic number, a JSON header and 4 KiB-aligned blobs (the token IDs, the StepState, each
+state buffer), each with its SHA-256. The header names an identity digest of the format version, the engine's
+Python and kernel sources, the device and OS, the target and draft packs (each manifest, and the size and
+modification time of its weights, so a pack rebuilt in place does not match), the target's and drafter's
+configurations, the tokenizer and chat template, the StepState layout, the state entries, the prefill chunking,
+the serving recipes and the numerics options. Lookups compare exact token IDs; an entry of another identity is
+never matched, and one that fails its checksums, sizes or layout is deleted and the prompt is prefilled. Files are
+written under `DIR/tmp/` and renamed into place (0600 in 0700 directories that only their owner can write), so a
+partial write is never an entry. An unusable directory, a full disk or an I/O error leaves checkpoints in memory
+or skips the save; none fails a request.
 
 Immutable weight mappings can be shared across compatible programs. Scratch and program-specific parameter
 records are not persistent prefix state. Prefill and decode can use different weight layouts, so a prefix

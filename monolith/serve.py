@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
+import gc
 import queue
 import logging
 import os
@@ -22,6 +24,7 @@ from . import __version__
 from .serving.protocol import (APIError, ChatRequest, Message, TextPart, anthropic_request,
                                responses_request, parse_completion, streaming_text)
 from .serving.events import WireResponse
+from .serving.lifecycle import IdleRelease, ModelLoadError, ModelState
 from .serving.tool_stream import tool_prefixes
 
 
@@ -29,8 +32,10 @@ class Backend:
     """One cached session; sampling changes rebuild its compiled programs, never duplicate model residency."""
 
     prefill_exact = False
+    lifecycle = None                 # IdleRelease: unload after an idle period (--model-ttl)
 
-    def __init__(self, model_dir, pack_dir, max_context=4096, prefill_chunk_size=128, *, assets=None, prefill_exact=False):
+    def __init__(self, model_dir, pack_dir, max_context=4096, prefill_chunk_size=128, *, assets=None, prefill_exact=False,
+                 prefix_store=None):
         from transformers import AutoTokenizer
 
         self.tokenizer = AutoTokenizer.from_pretrained(model_dir, local_files_only=True, trust_remote_code=False)
@@ -42,6 +47,7 @@ class Backend:
         self._sessions = {}
         self.assets = assets
         self.last_metrics = {}
+        self.prefix_store = prefix_store     # PrefixStore options (root, max_bytes): checkpoints on local disk
 
     def warmup(self, model_name):
         """Compile and page in the default generation path before accepting traffic."""
@@ -92,12 +98,116 @@ class Backend:
                 prefill_exact=self.prefill_exact)
         if prefix_cache is not None:
             self.session.prefix_cache = prefix_cache
+        else:
+            self._open_prefix_store()
         while len(sessions) > 8:
             sessions.pop(next(iter(sessions)))
         self.sampling = sampling
 
-    def complete(self, request, *, on_text=None, on_content=None, on_start=None, cancelled=None, on_progress=None):
-        """on_progress(content, completion_tokens) pairs each content snapshot with the committed output count."""
+    def _open_prefix_store(self):
+        """Put the first session's prefix cache over a disk store; an unusable directory leaves it in memory."""
+        options, cache = getattr(self, 'prefix_store', None), getattr(self.session, 'prefix_cache', None)
+        if not options or cache is None or getattr(cache, 'store', None) is not None:
+            return
+        import hashlib
+        from .runtime.prefix_store import PrefixStore
+        assets = getattr(self, 'assets', None)
+        tokenizer = hashlib.sha256()
+        for name in ('tokenizer.json', 'tokenizer_config.json', 'special_tokens_map.json', 'chat_template.jinja'):
+            path = Path(self.model_dir) / name
+            tokenizer.update(name.encode() + (path.read_bytes() if path.is_file() else b''))
+        try:
+            identity = self.session.prefix_identity(recipes=getattr(assets, 'recipes', None),
+                                                    recipe_key=getattr(assets, 'recipe_key', None),
+                                                    tokenizer=tokenizer.hexdigest())
+            cache.store = PrefixStore(options['root'], options['max_bytes'], identity)
+        except (OSError, ValueError) as exc:
+            logging.getLogger(__name__).warning('Prefix store disabled, checkpoints stay in memory: %s', exc)
+            self.prefix_store = None
+
+    def close(self):
+        """At exit: stop the idle release's watcher, then write the host checkpoints to the store, where a later
+        server reuses them."""
+        if self.lifecycle is not None:
+            self.lifecycle.stop()                       # it unloads nothing after this, and releases the backend
+        cache = getattr(self.session, 'prefix_cache', None)
+        store = getattr(cache, 'store', None)
+        if store is None:
+            return
+        lock = self._gpu()
+        if not lock.acquire(timeout=60):
+            logging.getLogger(__name__).warning('A generation still holds the GPU; closing the prefix store without it')
+            store.close()
+            return
+        try:
+            cache.flush()
+            store.close()
+        finally:
+            lock.release()
+
+    def _gpu(self):
+        """The lock between generations and the model's loads and unloads."""
+        return self.__dict__.get('gpu_lock') or self.__dict__.setdefault('gpu_lock', threading.Lock())
+
+    def complete(self, request, arrived=None, **options):
+        """on_progress(content, completion_tokens) pairs each content snapshot with the committed output count.
+        ``arrived``: the lifecycle registration a caller made when it accepted the request (IdleRelease.request);
+        without one the request registers here."""
+        lifecycle = self.lifecycle
+        registered = (lifecycle.request() if lifecycle is not None and arrived is None
+                      else contextlib.nullcontext(arrived or 0))
+        with registered as arrived:
+            with self._gpu():
+                self._arrived = arrived
+                return self._complete(request, **options)
+
+    def enable_idle_release(self, seconds):
+        """Unload the model after ``seconds`` without requests; the next request loads it again."""
+        state = ModelState.READY if self.loaded else ModelState.UNLOADED
+        self.lifecycle = IdleRelease(self._gpu(), self.unload, seconds, state=state).start()
+        return self.lifecycle
+
+    @property
+    def loaded(self):
+        return bool(getattr(self.session, 'engines', None))
+
+    @property
+    def resident_bytes(self):
+        buffers = tuple((getattr(self.session, 'buffers', None) or {}).values())
+        return sum({id(b): b.nbytes for b in buffers}.values()) if self.loaded else 0
+
+    def load(self, request, prompt_tokens):
+        """Select the request's session and map its weights, states and scratch again (Session.load)."""
+        self.select_session(request, prompt_tokens)
+        self.session.load()
+
+    def unload(self):
+        """Release every session's GPU allocations (target and draft weights, KV and recurrent states, scratch,
+        the programs' command resources) and the prefix snapshots. The tokenizer, compiled programs and executable
+        pipelines stay, so a load maps the weights again from the local packs without compiling. Runs with the
+        GPU lock held: no command buffer is in flight."""
+        import weakref
+
+        released = self.resident_bytes
+        sessions = [s for s in (self.session, *getattr(self, '_sessions', {}).values()) if s is not None]
+        engines = [weakref.ref(e) for s in sessions for e in getattr(s, 'engines', {}).values()]
+        for session in sessions:
+            session.release_engines()
+        cache = getattr(self.session, 'prefix_cache', None)
+        if cache is not None:
+            # On disk before the host copies go; a stalled disk must not hold the GPU lock indefinitely (queued
+            # writes keep their own copies and finish later).
+            if getattr(cache, 'store', None) is not None and not cache.flush(timeout=60):
+                logging.getLogger(__name__).warning('Some prefix checkpoints are not on disk (still being written, or the '
+                                                    'write failed); releasing anyway')
+            cache.clear()
+        gc.collect()
+        alive = sum(ref() is not None for ref in engines)
+        if alive:
+            logging.getLogger(__name__).warning('%d released engines are still referenced', alive)
+        logging.getLogger(__name__).info('Released %.2f GB of model allocations', released / 1e9)
+
+    def _complete(self, request, *, on_text=None, on_content=None, on_start=None, cancelled=None, on_progress=None):
         from jinja2 import TemplateError
 
         request_started = time.perf_counter()
@@ -116,7 +226,14 @@ class Backend:
         if on_start:
             on_start(len(ids))
         assets = getattr(self, 'assets', None)
-        self.select_session(request, len(ids))
+        lifecycle = self.lifecycle
+        if lifecycle is not None and lifecycle.state is not ModelState.READY:
+            try:
+                lifecycle.ensure_loaded(getattr(self, '_arrived', 0), lambda: self.load(request, len(ids)))
+            except ModelLoadError as exc:
+                raise APIError(f'{exc}; retry the request', 503, 'model_load_failed') from exc
+        else:
+            self.select_session(request, len(ids))
         try:
             started = time.perf_counter()
             stopped = False
@@ -168,6 +285,7 @@ class Backend:
                 options['cache_prefix_tokens'] = sorted(stable) if len(stable) > 1 else next(iter(stable), 0)
             generation = self.session.generate(ids, limit, **options)
             tokens = generation.tokens
+            prefix = getattr(getattr(self.session, 'prefix_cache', None), 'last', None) or {}
             self.last_metrics = dict(steps=getattr(generation, 'steps', 0),
                 decode_gpu_ms=getattr(generation, 'decode_ms', 0.0), wall_ms=(time.perf_counter()-started)*1000,
                 prefill_gpu_ms=getattr(generation, 'prefill_ms', 0.0),
@@ -176,6 +294,8 @@ class Backend:
                 checkpoint_ms=getattr(generation, 'checkpoint_ms', 0.0),
                 setup_ms=getattr(generation, 'setup_ms', 0.0), first_text_ms=first_text_ms,
                 cached_prompt_tokens=getattr(generation, 'cached_prompt_tokens', 0),
+                prefix_source=prefix.get('source') if getattr(generation, 'cached_prompt_tokens', 0) else None,
+                prefix_load_ms=prefix.get('load_ms', 0.0),
                 prefill_encode_ms=sum(t['encode_ms'] for t in getattr(generation, 'prefill_timings', [])),
                 prefill_commit_ms=sum(t['commit_ms'] for t in getattr(generation, 'prefill_timings', [])),
                 prefill_wait_ms=sum(t['wait_ms'] for t in getattr(generation, 'prefill_timings', [])),
@@ -212,7 +332,7 @@ def create_app(backend, model_name, api_key=None):
 
     @app.exception_handler(APIError)
     async def api_error(request, exc):
-        kind = {401: "authentication_error", 429: "rate_limit_error", 500: "server_error"}.get(
+        kind = {401: "authentication_error", 429: "rate_limit_error", 500: "server_error", 503: "server_error"}.get(
             exc.status, "invalid_request_error")
         if request.url.path.startswith('/v1/messages'):
             return JSONResponse(status_code=exc.status, content={'type': 'error', 'error': {'type': kind, 'message': exc.message}})
@@ -233,7 +353,8 @@ def create_app(backend, model_name, api_key=None):
 
     @app.get("/health")
     async def health():
-        return {"status": "ok"}
+        lifecycle = getattr(backend, 'lifecycle', None)
+        return {"status": "ok", "model": lifecycle.state.value} if lifecycle is not None else {"status": "ok"}
 
     @app.get("/v1/models", dependencies=[Depends(authorize)])
     async def models():
@@ -253,11 +374,19 @@ def create_app(backend, model_name, api_key=None):
         validate_model(request)
         if not lock.acquire(blocking=False):
             raise APIError("The model is busy; retry after the current request finishes", 429, "model_busy")
+        # An accepted request counts for the idle release from now, not from when its worker starts generating.
+        admitted = contextlib.ExitStack()
+        life = getattr(backend, 'lifecycle', None)
+        options = dict(arrived=admitted.enter_context(life.request())) if life is not None else {}
+
+        def release():
+            admitted.close()
+            lock.release()
         wire = WireResponse(protocol, model_name, custom, request.stream_usage if request.stream else None)
         if request.stream:
-            return stream(request, wire)
+            return stream(request, wire, release, options)
         try:
-            body = execute(request, wire)
+            body = execute(request, wire, **options)
             metrics = dict(getattr(backend, 'last_metrics', {}))
         except APIError:
             raise
@@ -265,13 +394,13 @@ def create_app(backend, model_name, api_key=None):
             logging.getLogger(__name__).exception("Generation failed")
             raise APIError("Generation failed; see server logs", 500, "generation_failed") from exc
         finally:
-            lock.release()
+            release()
         headers = {f'X-{brand}-{name}': str(metrics[key]) for brand in ('Lithos-Metal', 'LMK', 'Monolith') for name, key in (
             ('Decode-Steps', 'steps'), ('Decode-GPU-Ms', 'decode_gpu_ms'),
             ('Decode-Step-Ms', 'decode_step_ms'), ('Verify-Tokens', 'verify_tokens')) if key in metrics}
         return JSONResponse(headers=headers, content=body)
 
-    def stream(request, wire):
+    def stream(request, wire, release, admitted):
         events = queue.Queue()
         cancelled = threading.Event()
         def worker():
@@ -286,7 +415,7 @@ def create_app(backend, model_name, api_key=None):
                         options['on_progress'] = lambda content, count: events.put(('progress', (content, count)))
                     else:
                         options['on_content'] = lambda content: events.put(('content', content))
-                result = execute(request, wire, **options)
+                result = execute(request, wire, **options, **admitted)
                 if not options:
                     usage = result['usage']
                     events.put(('start', usage.get('input_tokens', usage.get('prompt_tokens', 0))))
@@ -297,7 +426,7 @@ def create_app(backend, model_name, api_key=None):
                 logging.getLogger(__name__).exception('Streaming generation failed')
                 events.put(('error', ('Generation failed; see server logs', 'generation_failed')))
             finally:
-                lock.release()
+                release()
         # A worker owns the lock from here, even if the response is never consumed.
         thread = threading.Thread(target=worker, daemon=True)
         thread.start()
@@ -396,6 +525,19 @@ def _prefill_chunk(value):
     return rows, exact
 
 
+def _byte_size(value):
+    """``N``, ``N[K|M|G|T]`` (binary units) -> bytes."""
+    text = value.strip().upper().removesuffix('IB').removesuffix('B')
+    scale = 1024 ** ('KMGT'.index(text[-1]) + 1) if text and text[-1] in 'KMGT' else 1
+    try:
+        number = float(text[:-1] if scale > 1 else text)
+    except ValueError:
+        raise argparse.ArgumentTypeError('expected a size such as 32G') from None
+    if not number * scale >= 1 or number * scale == float('inf'):
+        raise argparse.ArgumentTypeError('must be at least one byte')
+    return int(number * scale)
+
+
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(prog="lithos-metal serve", description=__doc__)
     parser.add_argument("--model", required=True, help="Hugging Face repo ID or local checkpoint path")
@@ -423,6 +565,16 @@ def parse_args(argv=None):
                         help="Prompt tokens per prefill pass. N-exact reproduces the results of 128-token passes bit for bit; "
                              "auto-exact (default) uses the chip's measured size for the model that way, else 128")
     parser.add_argument("--no-warmup", action='store_true', help="Skip startup compilation/warmup; the first request pays this cost")
+    parser.add_argument("--model-ttl", type=float, default=None, metavar='SECONDS',
+                        help="Idle TTL: release the model's GPU memory (weights, KV/recurrent state, scratch, prefix snapshots) after "
+                             "this many seconds without requests; every request resets it, and the next request loads the model again "
+                             "from the local packs. Default: no TTL, the model stays loaded")
+    parser.add_argument("--prefix-cache-dir", metavar='DIR',
+                        help="Also keep prefix checkpoints on local disk under DIR (created 0700), where later servers of the same "
+                             "engine, weights, device and options reuse them: a checkpoint reused once is written when memory evicts "
+                             "it, every one before --model-ttl releases the model and at exit. Default: memory only")
+    parser.add_argument("--prefix-cache-disk-size", type=_byte_size, default='32G', metavar='BYTES',
+                        help="Disk quota of --prefix-cache-dir, least recently used entries evicted first (e.g. 32G, the default)")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
     args = parser.parse_args(argv)
@@ -431,6 +583,8 @@ def parse_args(argv=None):
         args.draft = default_draft(args.model)
     if args.max_context < 1:
         parser.error("--max-context must be positive")
+    if args.model_ttl is not None and not 0 < args.model_ttl < float('inf'):
+        parser.error('--model-ttl must be a finite number of seconds > 0')
     if args.draft_block_size is not None and args.draft_block_size < 1:
         parser.error('--draft-block-size must be positive')
     if not args.draft and (args.draft_pack or args.draft_revision or args.draft_block_size is not None or args.kernel_config or args.kernel_config_key
@@ -448,15 +602,22 @@ def main(argv=None):
     assets = prepare(args)
     api_key = os.environ.get("LITHOS_METAL_API_KEY") or os.environ.get("LMK_API_KEY") or os.environ.get("MONOLITH_API_KEY")
     rows, exact = args.prefill_chunk_size
+    store = (dict(root=args.prefix_cache_dir, max_bytes=args.prefix_cache_disk_size)
+             if args.prefix_cache_dir else None)
     backend = Backend(str(assets.model_dir), str(assets.pack_dir), args.max_context, rows or assets.prefill_chunk_size or 128,
-                      assets=assets, prefill_exact=exact)
+                      assets=assets, prefill_exact=exact, prefix_store=store)
     model_name = args.served_model_name or (assets.model_dir.name if Path(args.model).expanduser().exists() else args.model)
     if not args.no_warmup:
         backend.warmup(model_name)
+    if args.model_ttl is not None:
+        backend.enable_idle_release(args.model_ttl)
     app = create_app(backend, model_name, api_key)
     logging.getLogger(__name__).info('lithos-metal ready: http://%s:%s — model=%s; DSpark=%s; verification rows=%s',
                                    args.host, args.port, model_name, args.draft or 'disabled', assets.gamma + 1)
-    uvicorn.run(app, host=args.host, port=args.port, workers=1)
+    try:
+        uvicorn.run(app, host=args.host, port=args.port, workers=1)
+    finally:
+        backend.close()
 
 
 if __name__ == "__main__":

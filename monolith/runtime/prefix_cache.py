@@ -1,6 +1,7 @@
 """Bounded, exact-token checkpoints for attention and recurrent model state."""
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import math
+import time
 
 
 @dataclass
@@ -8,22 +9,51 @@ class Prefix:
     tokens: tuple
     state: bytes
     buffers: dict
+    hits: int = field(default=0, compare=False)            # restores served from this copy
+    on_disk: bool = field(default=False, compare=False)    # a PrefixStore holds the same bytes
+
+
+class StalePrefix(ValueError):
+    """A checkpoint read from disk that this program cannot take. It is dropped from both tiers; the request prefills."""
 
 
 class PrefixCache:
-    def __init__(self, entries, max_bytes=4 * 1024**3, min_tokens=0):
+    """Host copies of the newest checkpoints, optionally over a ``store`` (PrefixStore) on local disk.
+
+    Without a store the cache is process memory only. With one, a checkpoint that was restored at least once is
+    written to the store when the host tier evicts it, ``flush()`` writes every host copy (before an idle release
+    drops them, and at exit), and a longer prefix found only on disk is read, verified and
+    promoted to the host tier. Both tiers hold the same bytes, so a restore from either sets the same state."""
+
+    def __init__(self, entries, max_bytes=4 * 1024**3, min_tokens=0, store=None):
         if not isinstance(max_bytes, int) or isinstance(max_bytes, bool) or max_bytes < 0:
             raise ValueError('prefix cache byte budget must be a nonnegative integer')
         self.entries = {entry.name: entry for entry in entries}
         self.max_bytes = max_bytes
         self.min_tokens = min_tokens
         self.items = []
+        self.store = store
+        self.state_size = self.saved_names = None     # StepState bytes and saved buffer names, from the first save
+        self.last = {}                                 # the latest match: its tier and the time reading it took
 
     def match(self, tokens):
         # Leave at least one input token for the final prefill/sampling pass.
         matches = [item for item in self.items if len(item.tokens) < len(tokens)
                    and item.tokens == tuple(tokens[:len(item.tokens)])]
-        return max(matches, key=lambda item: len(item.tokens), default=None)
+        item = max(matches, key=lambda item: len(item.tokens), default=None)
+        self.last = dict(source='memory' if item is not None else None, load_ms=0.0)
+        if self.store is not None:
+            record = self.store.match(tokens)
+            if record is not None and len(record.tokens) > (len(item.tokens) if item is not None else 0):
+                started = time.perf_counter()
+                loaded = self.store.load(record, self._check)
+                if loaded is not None:
+                    item = Prefix(*loaded, on_disk=True)
+                    self._insert(item)
+                    self.last = dict(source='disk', load_ms=(time.perf_counter() - started) * 1000)
+        if item is not None:
+            item.hits += 1
+        return item
 
     def save(self, tokens, engine):
         tokens = tuple(tokens)
@@ -37,25 +67,103 @@ class PrefixCache:
             if spec.role != 'state' or entry is None:
                 continue
             size = spec.nbytes
-            if entry.checkpoints == 1 and name.endswith(('k_cache', 'v_cache', 'k_ctx', 'v_ctx')):
+            if self._position_major(entry):
                 size = len(tokens) * math.prod(entry.shape[1:]) * entry.dtype.itemsize
             sizes[name] = size
         if sum(sizes.values()) > self.max_bytes:
             return
+        self.state_size, self.saved_names = engine.program.layout.size, frozenset(sizes)
         # Evict before copying so peak memory stays bounded, including the two
         # recurrent slots whose parity is carried by the saved StepState.
-        while self.items and (len(self.items) >= 2 or
-                sum(len(v) for item in self.items for v in item.buffers.values()) + sum(sizes.values()) > self.max_bytes):
-            # Retain the shared system/tool prefix while refreshing the latest
-            # conversation checkpoint; replace unrelated prefixes normally.
-            index = -1 if len(self.items) > 1 and tokens[:len(self.items[0].tokens)] == self.items[0].tokens else 0
-            self.items.pop(index)
+        self._evict(tokens, sum(sizes.values()))
         self.items.append(Prefix(tokens,
             engine.buffers[engine.program.step_state].read(0, engine.program.layout.size),
             {name: engine.buffers[name].read(0, size) for name, size in sizes.items()}))
 
-    @staticmethod
-    def restore(item, engine):
+    def flush(self, timeout=None):
+        """Write every host copy the store does not hold, waiting up to ``timeout`` seconds in all for room in the
+        writer's queue and for the writes. False when a copy is not on disk afterwards (not written in time, or its
+        write failed)."""
+        if self.store is None:
+            return True
+        deadline = None if timeout is None else time.monotonic() + timeout
+
+        def left():
+            return None if deadline is None else max(0.0, deadline - time.monotonic())
+        for item in self.items:
+            self._spill(item, left())
+        # The writer reports no outcome: a copy is persisted when its file is there.
+        return self.store.flush(left()) and all(self.store.contains(item.tokens) for item in self.items)
+
+    def clear(self):
+        """Drop every snapshot (their host copies of the attention and recurrent state)."""
+        self.items.clear()
+
+    def restore(self, item, engine):
+        # Check first: a checkpoint that does not fit is never partly written. One read from disk is dropped (until
+        # this process saves, nothing tells the disk check which buffers and StepState size to expect).
+        try:
+            self._check_fits(item, engine)
+        except ValueError as exc:
+            if not item.on_disk:
+                raise
+            self.items = [other for other in self.items if other is not item]
+            if self.store is not None:
+                self.store.remove(item.tokens)
+            raise StalePrefix(str(exc)) from exc
         for name, data in item.buffers.items():
             engine.buffers[name].write(data, 0)
         engine.buffers[engine.program.step_state].write(item.state, 0)
+
+    def _check_fits(self, item, engine):
+        if item.on_disk and frozenset(item.buffers) != frozenset(
+                n for n, spec in engine.program.buffers.items() if spec.role == 'state' and n in self.entries):
+            raise ValueError("a stored prefix checkpoint does not hold this program's state buffers")
+        for name, data in item.buffers.items():
+            if len(data) > engine.program.buffers[name].nbytes:
+                raise ValueError(f'prefix checkpoint buffer {name!r} exceeds its allocation')
+        if len(item.state) != engine.program.layout.size:
+            raise ValueError('prefix checkpoint StepState does not match the program layout')
+
+    @staticmethod
+    def _position_major(entry):
+        return entry.checkpoints == 1 and entry.name.endswith(('k_cache', 'v_cache', 'k_ctx', 'v_ctx'))
+
+    def _evict(self, tokens, incoming):
+        while self.items and (len(self.items) >= 2 or
+                sum(len(v) for item in self.items for v in item.buffers.values()) + incoming > self.max_bytes):
+            # Retain the shared system/tool prefix while refreshing the latest
+            # conversation checkpoint; replace unrelated prefixes normally.
+            index = -1 if len(self.items) > 1 and tokens[:len(self.items[0].tokens)] == self.items[0].tokens else 0
+            evicted = self.items.pop(index)
+            if evicted.hits:                          # reused once: worth a disk copy
+                self._spill(evicted)
+
+    def _insert(self, item):
+        nbytes = sum(len(v) for v in item.buffers.values())
+        if nbytes <= self.max_bytes:
+            self._evict(item.tokens, nbytes)
+            self.items.append(item)
+
+    def _spill(self, item, timeout=0):
+        # The store decides whether it holds the copy: its quota may have evicted one written before (item.on_disk).
+        return self.store is None or self.store.submit(item.tokens, item.state, item.buffers, timeout=timeout,
+                                                       on_written=lambda: setattr(item, 'on_disk', True))
+
+    def _check(self, sizes, n_tokens, state_size):
+        """A stored checkpoint must hold exactly the buffers this cache saves, at the sizes it saves them."""
+        from .prefix_store import CorruptEntry
+        if self.saved_names is not None and frozenset(sizes) != self.saved_names:
+            raise CorruptEntry('different state buffers')
+        if self.state_size is not None and state_size != self.state_size:
+            raise CorruptEntry('different StepState size')
+        for name, size in sizes.items():
+            entry = self.entries.get(name)
+            if entry is None:
+                raise CorruptEntry(f'unknown state buffer {name}')
+            if self._position_major(entry):
+                want = n_tokens * math.prod(entry.shape[1:]) * entry.dtype.itemsize
+            else:
+                want = max(1, entry.checkpoints) * math.prod(entry.shape) * entry.dtype.itemsize
+            if size != want:
+                raise CorruptEntry(f'{name} holds {size} bytes, not {want}')
