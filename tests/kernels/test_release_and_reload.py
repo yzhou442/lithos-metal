@@ -93,6 +93,7 @@ def test_disk_checkpoints_restore_the_state_a_cold_prefill_computes(factory, tmp
     # A later process with the same identity starts from the stored checkpoints.
     cache.flush(timeout=60)
     identity = cache.store.identity
+    cache.store.close()                                             # this server exits; the next takes the directory
     restarted = factory(prefix_cache=True)
     assert restarted.prefix_identity(test=True) == identity
     restarted.prefix_cache.store = PrefixStore(tmp_path / 'store', 1 << 30, identity)

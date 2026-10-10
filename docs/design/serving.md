@@ -119,12 +119,12 @@ written before an idle release drops it (the release waits up to 60 s for those 
 only on disk is read, verified and promoted to the host tier; writes run on a background thread from the host
 copy's bytes, never per decode step. Both tiers hold the same bytes, so a restore from either sets the same state.
 `--prefix-cache-disk-size` (default `32G`) bounds every entry under `DIR`, evicting the least recently used ones;
-an entry that any server sharing `DIR` is reading or writing is never evicted, and a snapshot larger than the
-quota is not saved.
+an entry being read or written is never evicted, and a snapshot larger than the quota is not saved.
 
 Entries live in `DIR/entries/` and outlive the server: it writes its host copies at exit, and a later server with
-the same identity (below) reuses them. The directory therefore keeps state derived from prompts until the quota
-evicts it or the directory is deleted.
+the same identity (below) reuses them. One server uses `DIR` at a time (an exclusive lock on `DIR/.owner`):
+another server started with the same directory keeps its checkpoints in memory and logs why. The directory keeps
+state derived from prompts until the quota evicts it or the directory is deleted.
 
 Each entry is one file: a magic number, a JSON header and 4 KiB-aligned blobs (the token IDs, the StepState, each
 state buffer), each with its SHA-256. The header names an identity digest of the format version, the engine's

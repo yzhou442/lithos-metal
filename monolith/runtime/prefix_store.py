@@ -6,9 +6,11 @@ Files are written under ``tmp/`` and renamed into place, so a partial write is n
 identity the bytes depend on (format, code, device, weights, layout; ``Session.prefix_identity``); an entry with
 another identity is never matched, and one that fails any check is deleted and treated as a miss.
 
-Entries live in ``entries/`` and outlive the process: a later server with the same identity reuses them. All
-entries share one byte quota with least-recently-used eviction; entries being read (by any server: a shared flock is the read lease) or written are never evicted,
-and a partial write nobody holds (its writer's exclusive flock) is removed.
+Entries live in ``entries/`` and outlive the process: a later server with the same identity reuses them. One server
+uses a directory at a time: an open store holds an exclusive lock on ``.owner``, and opening another store on the
+same root raises ``StoreBusy`` (that server keeps its checkpoints in memory). All entries share one byte quota with
+least-recently-used eviction; an entry being read or written is never evicted. Partial writes a stopped server left
+are removed when the next one opens the directory.
 """
 from __future__ import annotations
 
@@ -21,7 +23,6 @@ import json
 import logging
 import os
 import queue
-import secrets
 import stat
 import struct
 import threading
@@ -64,6 +65,10 @@ class CorruptEntry(ValueError):
     pass
 
 
+class StoreBusy(OSError):
+    """Another server holds the directory."""
+
+
 def _pad(n):
     return -n % ALIGN
 
@@ -90,24 +95,25 @@ class PrefixStore:
         self.workers = workers
         os.makedirs(self.root, mode=0o700, exist_ok=True)
         _private_dir(self.root)
+        self._owner = os.open(self.root / '.owner', os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+        try:
+            fcntl.flock(self._owner, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            os.close(self._owner)
+            raise StoreBusy(errno.EBUSY, f'another server uses the prefix cache at {self.root}') from None
         self.tmp = self.root / 'tmp'
         _private_dir(self.tmp)
-        self._lock_fd = os.open(self.root / '.lock', os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
-        self._nonce = secrets.token_hex(4)
         self.dir = self.root / 'entries'
         _private_dir(self.dir)
         self._mutex = threading.Lock()
         self._pinned = set()          # paths being read or written
-        self._index = {}              # path -> Record (this store's directory)
+        self._index = {}              # path -> Record
         self._counter = 0
-        self._stamp = None            # the entries directory's mtime when this store last listed it
-        self._listed_at = 0           # time.time_ns() when it did
-        self._rejected = {}           # path -> (inode, mtime) of an entry this store dropped while a lease kept it
         self.stats = dict(hits=0, misses=0, writes=0, write_bytes=0, write_ms=0.0, read_ms=0.0,
                           evictions=0, errors=0, dropped=0)
-        with self._dir_lock():
-            self._remove_stale()
-            self._refresh()
+        for path in self.tmp.glob('*.partial'):                # no writer holds them: this store owns the root
+            path.unlink(missing_ok=True)
+        self._scan()
         self._queue = queue.Queue(maxsize=pending)
         self._writer = threading.Thread(target=self._drain, name='prefix-store', daemon=True)
         self._writer.start()
@@ -118,34 +124,22 @@ class PrefixStore:
     def match(self, tokens):
         """The longest entry of this identity whose tokens are a strict prefix of ``tokens``."""
         tokens = tuple(tokens)
-        self._refresh()
         with self._mutex:
             records = [r for r in self._index.values() if r.identity == self.identity
                        and len(r.tokens) < len(tokens) and r.tokens == tokens[:len(r.tokens)]]
         return max(records, key=lambda r: len(r.tokens), default=None)
 
     def contains(self, tokens):
-        """Whether the entry for exactly ``tokens`` is on disk now. Another server sharing the root may have written
-        or evicted it since this store indexed the directory: its name follows from the identity and the tokens."""
         tokens = tuple(tokens)
-        path = self._path(tokens)
-        try:
-            info = os.lstat(path)
-        except OSError:
-            info = None
         with self._mutex:
-            if info is None or not stat.S_ISREG(info.st_mode) or self._is_rejected(path, info):
-                self._index.pop(path, None)
-                return False
-            self._index.setdefault(path, Record(path, self.identity, tokens, info.st_size))
-            return True
+            return self._path(tokens) in self._index
 
     def _path(self, tokens):
         digest = hashlib.sha256(struct.pack(f'<{len(tokens)}i', *tokens)).hexdigest()
         return self.dir / f'{self.identity[:16]}-{digest[:40]}{SUFFIX}'
 
     def remove(self, tokens):
-        """Delete this identity's entry for exactly ``tokens``, if there is one and no server holds its lease."""
+        """Delete this identity's entry for exactly ``tokens``, if there is one."""
         self._discard(self._path(tuple(tokens)))
 
     def load(self, record, expected):
@@ -157,13 +151,6 @@ class PrefixStore:
         try:
             fd = os.open(record.path, os.O_RDONLY | os.O_NOFOLLOW)
             try:
-                # The read lease: no server sharing the root evicts an entry while it is read. One evicted between
-                # the open and the lease is a miss, not damage: its name may already hold a new entry.
-                fcntl.flock(fd, fcntl.LOCK_SH)
-                if not self._is_current(fd, record.path):
-                    with self._mutex:
-                        self._index.pop(record.path, None)
-                    return None
                 header, size = self._header(fd)
                 if header['identity'] != self.identity:
                     raise CorruptEntry('identity changed')
@@ -183,10 +170,6 @@ class PrefixStore:
             self.stats['hits'] += 1
             self.stats['read_ms'] += (time.perf_counter() - started) * 1000
             return tokens, data[0], {b['name']: d for b, d in zip(header['buffers'], data[1:])}
-        except FileNotFoundError:                             # evicted by another server since the lookup
-            with self._mutex:
-                self._index.pop(record.path, None)
-            return None
         except (CorruptEntry, OSError, ValueError, KeyError, TypeError) as exc:
             self.stats['errors'] += 1
             LOG.warning('Prefix store: dropping %s (%s); prefilling instead', record.path.name, exc)
@@ -223,8 +206,11 @@ class PrefixStore:
         return True
 
     def close(self):
-        """Finish queued writes."""
+        """Finish queued writes and give the directory up to the next server."""
         self.flush()
+        if self._owner is not None:
+            os.close(self._owner)
+            self._owner = None
 
     def write(self, tokens, state, buffers):
         """Write one snapshot now (the writer thread's work). Returns the entry's path, or None on any failure."""
@@ -252,29 +238,24 @@ class PrefixStore:
         name = final.name
         with self._mutex:
             self._counter += 1
-            partial = self.tmp / f'{os.getpid()}-{self._nonce}-{self._counter}.partial'
+            partial = self.tmp / f'{self._counter}.partial'
             self._pinned.add(final)
         started = time.perf_counter()
         fd = None
         try:
-            fd = self._reserve(total, final, partial)
-            if fd is None:
+            if total > self.max_bytes or not self._make_room(total, final):
                 LOG.warning('Prefix store: a %.2f GB snapshot does not fit the %.1f GB quota; not saved',
                             total / 1e9, self.max_bytes / 1e9)
                 return None
+            fd = os.open(partial, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+            os.ftruncate(fd, total)
             self._write_all(fd, prologue, 0)
             for (_, data), blob in zip(named, placed):
                 self._write_all(fd, data, blob['offset'])
             os.fsync(fd)
-            with self._dir_lock():        # another server counting the quota sees the partial or the entry
-                if os.path.lexists(final):
-                    # Another server wrote this prefix meanwhile: the name follows from the identity and the
-                    # tokens, so its entry holds the same state. Replacing it would unlink a file under a read lease.
-                    os.unlink(partial)
-                else:
-                    os.replace(partial, final)
-            os.close(fd)                  # releases the writer's lease, after the partial is gone
+            os.close(fd)
             fd = None
+            os.replace(partial, final)
             dir_fd = os.open(self.dir, os.O_RDONLY)
             try:
                 os.fsync(dir_fd)
@@ -327,66 +308,27 @@ class PrefixStore:
 
     # -- quota, scanning and cleanup -------------------------------------------------------------------------------
 
-    def _dir_lock(self):
-        store = self
-
-        class Lock:
-            def __enter__(self):
-                fcntl.flock(store._lock_fd, fcntl.LOCK_EX)
-
-            def __exit__(self, *exc):
-                fcntl.flock(store._lock_fd, fcntl.LOCK_UN)
-        return Lock()
-
-    def _entries(self):
-        """Every entry file and partial write under root: (path, size, mtime, evictable)."""
-        out = []
+    def _make_room(self, nbytes, keep):
+        """Unlink the least recently used entries (never one being read or written) until ``nbytes`` more fit."""
+        entries = []
         for path in self.dir.glob(f'*{SUFFIX}'):
             try:
                 info = os.lstat(path)
             except OSError:
                 continue
             if stat.S_ISREG(info.st_mode):
-                out.append((path, info.st_size, info.st_mtime, True))
-        for path in self.tmp.glob('*.partial'):
-            try:
-                out.append((path, os.lstat(path).st_size, 0.0, False))
-            except OSError:
-                continue
-        return out
-
-    def _reserve(self, nbytes, keep, partial):
-        """Evict least recently used entries until ``nbytes`` fit the quota, then create ``partial`` at that size
-        under the same directory lock, so other processes count it. Returns its descriptor, or None."""
-        if nbytes > self.max_bytes:
-            return None
-        with self._dir_lock():
-            if not self._make_room(nbytes, keep):
-                return None
-            fd = os.open(partial, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
-            try:
-                fcntl.flock(fd, fcntl.LOCK_EX)    # the writer's lease, held until the entry is published
-                os.ftruncate(fd, nbytes)
-            except OSError:
-                os.close(fd)
-                raise
-            return fd
-
-    def _make_room(self, nbytes, keep):
-        """With the directory lock held: remove partial writes that dead processes left, then unlink the least recently
-        used entries (never a pinned one or a partial write) until ``nbytes`` more fit the quota."""
-        entries = self._entries()
-        used = sum(size for _, size, _, _ in entries)
-        if used + nbytes > self.max_bytes:
-            self._remove_stale()                  # a writer that died after this store started still holds quota
-            entries = self._entries()
-            used = sum(size for _, size, _, _ in entries)
+                entries.append((info.st_mtime, path, info.st_size))
+        used = sum(size for _, _, size in entries)
         with self._mutex:
             pinned = set(self._pinned) | {keep}
-        for path, size, _, evictable in sorted(entries, key=lambda e: e[2]):
+        for _, path, size in sorted(entries):
             if used + nbytes <= self.max_bytes:
                 break
-            if not evictable or path in pinned or not self._unlink_unless_leased(path):
+            if path in pinned:
+                continue
+            try:
+                os.unlink(path)
+            except OSError:
                 continue
             used -= size
             self.stats['evictions'] += 1
@@ -394,95 +336,28 @@ class PrefixStore:
                 self._index.pop(path, None)
         return used + nbytes <= self.max_bytes
 
-    @staticmethod
-    def _unlink_unless_leased(path):
-        """Unlink an entry or a partial write unless a server holds its lease (a reader's shared or a writer's
-        exclusive flock); True when the file is gone."""
-        try:
-            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
-        except FileNotFoundError:
-            return True
-        except OSError:
-            return False
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            os.unlink(path)
-            return True
-        except OSError:                                       # BlockingIOError: leased
-            return False
-        finally:
-            os.close(fd)
-
-    @staticmethod
-    def _is_current(fd, path):
-        """Whether ``fd`` is still the file at ``path``."""
-        try:
-            info = os.stat(path, follow_symlinks=False)
-        except FileNotFoundError:
-            return False
-        mine = os.fstat(fd)
-        return (info.st_dev, info.st_ino) == (mine.st_dev, mine.st_ino)
-
-    def _remove_stale(self):
-        """Remove partial writes whose writer is gone: a live writer holds an exclusive flock on its partial (a lease,
-        unlike a process ID, that no other process can inherit)."""
-        for path in self.tmp.glob('*.partial'):
-            self._unlink_unless_leased(path)
-
-    def _refresh(self):
-        """Index what other servers sharing the root wrote or evicted since this store last listed ``entries/``: a
-        rename into the directory and an unlink both change its mtime, so an unchanged directory costs one stat.
-        Filesystems stamp times at a coarse granularity, so a change shortly after a listing can keep the mtime that
-        listing saw: the directory is listed again until its mtime is a second older than the last listing."""
-        try:
-            stamp = os.stat(self.dir).st_mtime_ns
-        except OSError:
-            return
-        if stamp == self._stamp and self._listed_at - stamp > 1_000_000_000:
-            return
-        self._stamp, self._listed_at = stamp, time.time_ns()
-        present = set(self.dir.glob(f'*{SUFFIX}'))
-        with self._mutex:
-            for path in [p for p in self._index if p not in present]:
-                del self._index[path]
-            new = sorted(p for p in present if p not in self._index)
-        for path in new:
+    def _scan(self):
+        for path in sorted(self.dir.glob(f'*{SUFFIX}')):
             try:
                 fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
                 try:
-                    with self._mutex:
-                        if self._is_rejected(path, os.fstat(fd)):
-                            continue                  # dropped here; another server's lease still holds the file
                     header, size = self._header(fd)
                     tokens = self._tokens(fd, header)
                 finally:
                     os.close(fd)
-                with self._mutex:
-                    self._index.setdefault(path, Record(path, header['identity'], tokens, size))
-            except FileNotFoundError:
-                continue                          # evicted since the listing
+                self._index[path] = Record(path, header['identity'], tokens, size)
             except (CorruptEntry, OSError, ValueError, KeyError, TypeError) as exc:
                 LOG.warning('Prefix store: removing unreadable %s (%s)', path.name, exc)
                 self._discard(path)
 
     def _discard(self, path):
-        """Forget an entry and delete its file, unless a server holds its lease. A file the lease keeps is not indexed
-        or matched again by this store (a new file under the name is)."""
-        try:
-            info = os.lstat(path)
-        except OSError:
-            info = None
         with self._mutex:
             self._index.pop(path, None)
-            if info is not None:
-                self._rejected[path] = (info.st_ino, info.st_mtime_ns)
-        if self._unlink_unless_leased(path):
-            with self._mutex:
-                self._rejected.pop(path, None)
-
-    def _is_rejected(self, path, info):
-        """With the mutex held: whether ``info`` is the file this store dropped at ``path``."""
-        return self._rejected.get(path) == (info.st_ino, info.st_mtime_ns)
+        try:
+            if stat.S_ISREG(os.lstat(path).st_mode):
+                os.unlink(path)
+        except OSError:
+            pass
 
     # -- the format -----------------------------------------------------------------------------------------------
 

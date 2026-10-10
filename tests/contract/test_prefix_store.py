@@ -63,34 +63,23 @@ def test_a_later_process_reuses_the_entries_of_its_identity(tmp_path):
     first.write(tokens, state, buffers)
     first.close()
     assert entries_of(first) and first.dir == first.root / 'entries'
-    assert store(tmp_path).match(tokens + (0,)).tokens == tokens
+    later = store(tmp_path)
+    assert later.match(tokens + (0,)).tokens == tokens
+    later.close()
     assert store(tmp_path, identity='b' * 64).match(tokens + (0,)) is None   # other weights/code/device
 
 
-def test_a_partial_write_nobody_holds_is_removed(tmp_path):
-    import fcntl
-    s = store(tmp_path)
-    dead = 2 ** 22 + 12345
-    (s.tmp / f'{dead}-0000-1.partial').write_bytes(b'half')
-    (s.tmp / f'{os.getpid()}-eeee-1.partial').write_bytes(b'abandoned')      # its PID now belongs to a live process
-    live = s.tmp / f'{os.getpid()}-ffff-1.partial'
-    live.write_bytes(b'in progress')
-    writer = os.open(live, os.O_WRONLY)                                      # a live writer holds its lease
-    fcntl.flock(writer, fcntl.LOCK_EX)
-    again = store(tmp_path)
-    assert [p.name for p in again.tmp.iterdir()] == [live.name]
-    os.close(writer)
-
-
-def test_a_writer_that_died_after_this_store_started_frees_its_quota(tmp_path):
-    s = store(tmp_path)
-    a = s.write((1, 2), b's' * 16, {'k': b'a' * 100})
-    size = a.stat().st_size
-    s.max_bytes = 2 * size                                     # room for two entries
-    dead = 2 ** 22 + 12345
-    (s.tmp / f'{dead}-0000-1.partial').write_bytes(b'o' * size)   # a peer that crashed mid-write
-    assert s.write((3, 4), b's' * 16, {'k': b'b' * 100}) is not None
-    assert a.exists() and s.stats['evictions'] == 0 and list(s.tmp.iterdir()) == []    # its write went, not an entry
+def test_one_server_uses_a_directory_at_a_time(tmp_path):
+    from monolith.runtime.prefix_store import StoreBusy
+    first = store(tmp_path)
+    tokens, state, buffers = snapshot()
+    first.write(tokens, state, buffers)
+    (first.tmp / '7.partial').write_bytes(b'half')               # a write the server stopped in
+    with pytest.raises(StoreBusy):
+        store(tmp_path)                                          # a second server keeps its checkpoints in memory
+    first.close()
+    again = store(tmp_path)                                      # the next server takes the directory over
+    assert again.match(tokens + (0,)).tokens == tokens and list(again.tmp.iterdir()) == []
 
 
 @pytest.mark.parametrize('damage', ['flip', 'truncate', 'magic', 'header'])
@@ -110,6 +99,7 @@ def test_corrupt_entries_are_misses_and_removed(tmp_path, damage):
     path.write_bytes(bytes(data))
     if damage == 'flip':                                       # found at load time
         assert s.load(s.match(tokens + (0,)), accept) is None and s.stats['errors'] == 1
+    s.close()
     restarted = store(tmp_path)                  # or when a process scans the directory
     assert restarted.match(tokens + (0,)) is None and not path.exists()
 
@@ -153,139 +143,6 @@ def test_quota_evicts_least_recently_used_but_never_a_pinned_entry(tmp_path):
     assert a.exists() and not b.exists() and c.exists() and s.stats['evictions'] == 1
     s._pinned.clear()
     assert s.write((7, 8), b's' * 16, {'k': b'x' * (s.max_bytes + 1)}) is None    # larger than the quota
-
-
-def test_servers_sharing_a_directory_see_each_others_writes_and_evictions(tmp_path):
-    first = store(tmp_path)
-    tokens, state, buffers = snapshot()
-    path = first.write(tokens, state, buffers)
-    second = store(tmp_path)                                   # indexes the entry
-    os.unlink(path)                                            # the first server's quota evicts it
-    assert not second.contains(tokens) and second.match(tokens + (0,)) is None   # so a flush writes it again
-    later = snapshot(4, 3)
-    first.write(*later)                                        # written after the second server started
-    assert second.match(later[0] + (0,)).tokens == later[0]   # found by a lookup, not only by contains()
-    assert second.contains(later[0])
-    os.unlink(entries_of(first)[0])                            # evicted by the first server again
-    assert second.match(later[0] + (0,)) is None
-
-
-def test_an_entry_another_server_is_reading_is_not_evicted(tmp_path, monkeypatch):
-    import fcntl
-    first, second = store(tmp_path), store(tmp_path)
-    tokens, state, buffers = snapshot()
-    a = first.write(tokens, state, buffers)
-    size = a.stat().st_size
-    seen, real_blob = [], second._blob
-
-    def blob(fd, b):                                           # while the second server reads, try to evict
-        probe = os.open(a, os.O_RDONLY)
-        try:
-            fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            seen.append('free')
-        except BlockingIOError:
-            seen.append('leased')
-        finally:
-            os.close(probe)
-        return real_blob(fd, b)
-    record = second.match(tokens + (0,))                       # indexing reads the header without a lease
-    monkeypatch.setattr(second, '_blob', blob)
-    assert second.load(record, accept) is not None and set(seen) == {'leased'}
-    first.max_bytes = size + size // 2                          # room for one entry
-    reader = os.open(a, os.O_RDONLY)                            # a read in progress in another server
-    fcntl.flock(reader, fcntl.LOCK_SH)
-    assert first.write(*snapshot(4, 2)) is None and a.exists()  # not evicted under the lease
-    os.close(reader)
-    assert first.write(*snapshot(4, 2)) is not None and not a.exists()
-
-
-def test_a_dropped_entry_another_server_is_reading_stays_until_it_is_done(tmp_path):
-    import fcntl
-    first, second = store(tmp_path), store(tmp_path)
-    tokens, state, buffers = snapshot()
-    path = first.write(tokens, state, buffers)
-    reader = os.open(path, os.O_RDONLY)                         # the second server is loading it
-    fcntl.flock(reader, fcntl.LOCK_SH)
-    first.remove(tokens)                                        # the first server drops it (e.g. a program mismatch)
-    assert path.exists()                                        # kept under the lease
-    for _ in range(2):                                          # and not found again by the store that dropped it
-        assert first.match(tokens + (0,)) is None and not first.contains(tokens)
-    assert second.match(tokens + (0,)) is not None              # the other server decides for itself
-    os.close(reader)
-    first.remove(tokens)
-    assert not path.exists()
-
-
-def test_a_writer_holds_its_lease_until_the_entry_is_published(tmp_path, monkeypatch):
-    import fcntl
-    s = store(tmp_path)
-    seen, real_replace = [], os.replace
-
-    def replace(src, dst):                                      # another server's cleanup, racing the publication
-        probe = os.open(src, os.O_RDONLY)
-        try:
-            fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            seen.append('free')
-        except BlockingIOError:
-            seen.append('leased')
-        finally:
-            os.close(probe)
-        return real_replace(src, dst)
-    monkeypatch.setattr(os, 'replace', replace)
-    assert s.write(*snapshot()) is not None and seen == ['leased']
-
-
-def test_an_entry_evicted_before_its_lease_is_a_miss_not_damage(tmp_path, monkeypatch):
-    import fcntl
-    import monolith.runtime.prefix_store as ps
-    first, second = store(tmp_path), store(tmp_path)
-    tokens, state, buffers = snapshot()
-    path = first.write(tokens, state, buffers)
-    record = second.match(tokens + (0,))
-    raced, real_flock = [], ps.fcntl.flock
-
-    def flock(fd, op):                                          # evicted and written again in the window
-        if op == fcntl.LOCK_SH and not raced:
-            raced.append(1)
-            os.unlink(path)
-            first.write(tokens, state, {'k': b'z' * 24, 'rec': b'y' * 32})
-        return real_flock(fd, op)
-    monkeypatch.setattr(ps.fcntl, 'flock', flock)
-    assert second.load(record, accept) is None and second.stats['errors'] == 0
-    assert path.exists()                                        # the new entry under that name is kept
-
-
-def test_a_second_write_of_one_prefix_keeps_the_first_entry(tmp_path):
-    import fcntl
-    first, second = store(tmp_path), store(tmp_path)
-    tokens, state, buffers = snapshot()
-    path = first.write(tokens, state, buffers)
-    inode = path.stat().st_ino
-    reader = os.open(path, os.O_RDONLY)                         # a third server is reading it
-    fcntl.flock(reader, fcntl.LOCK_SH)
-    assert second.write(tokens, state, buffers) == path         # both passed contains() before either published
-    assert path.stat().st_ino == inode and list(second.tmp.iterdir()) == []
-    os.close(reader)
-
-
-def test_an_entry_is_published_under_the_quota_lock(tmp_path, monkeypatch):
-    s = store(tmp_path)
-    held, seen = [False], []
-    real_lock, real_replace = s._dir_lock, os.replace
-
-    class Lock:
-        def __enter__(self):
-            self.inner = real_lock()
-            self.inner.__enter__()
-            held[0] = True
-
-        def __exit__(self, *exc):
-            held[0] = False
-            return self.inner.__exit__(*exc)
-    monkeypatch.setattr(s, '_dir_lock', Lock)
-    monkeypatch.setattr(os, 'replace', lambda a, b: seen.append(held[0]) or real_replace(a, b))
-    assert s.write(*snapshot()) is not None
-    assert seen == [True]                     # another server always counts the partial or the entry
 
 
 def test_writer_queue_is_bounded_and_flush_waits(tmp_path, monkeypatch):
@@ -372,6 +229,7 @@ def test_disk_restore_sets_the_same_state_as_the_memory_restore(tmp_path):
     assert cache.last['source'] == 'disk' and loaded.tokens == tuple(prompt[:5]) and loaded.on_disk
     cache.restore(loaded, other)
     assert state_of(other) == from_memory
+    disk.close()
     restarted = PrefixCache(entries, 1 << 20, store=store(tmp_path))
     assert restarted.match(prompt).buffers == item.buffers     # a later process
 
@@ -441,6 +299,7 @@ def test_a_stored_checkpoint_of_another_layout_is_never_restored(tmp_path):
     cache = PrefixCache(entries, 1 << 20, store=disk)
     cache.save([1, 2, 3], eng)
     cache.flush(timeout=5)
+    disk.close()
     changed = [NS(name=e.name, shape=(16, 3) if e.checkpoints == 1 else e.shape, dtype=e.dtype, checkpoints=e.checkpoints)
                for e in entries]                               # same identity claimed, other per-token size
     other = PrefixCache(changed, 1 << 20, store=store(tmp_path))
@@ -459,6 +318,7 @@ def test_a_persisted_checkpoint_this_program_cannot_take_is_dropped(tmp_path, fl
     buffers = {k: v for k, v in item.buffers.items() if k != 'recurrent' or flaw != 'missing buffer'}
     state = item.state + (b'\0' * 8 if flaw == 'StepState size' else b'')
     assert disk.write(item.tokens, state, buffers) is not None
+    disk.close()
     restarted = PrefixCache(entries, 1 << 20, store=store(tmp_path))   # nothing saved yet to compare
     loaded = restarted.match([1, 2, 3, 4])
     assert loaded is not None and loaded.on_disk
@@ -565,6 +425,11 @@ def test_an_unusable_directory_leaves_checkpoints_in_memory(tmp_path):
     b.prefix_store = dict(root=tmp_path / 'private', max_bytes=1 << 20)
     b._open_prefix_store()
     assert isinstance(cache.store, PrefixStore)
+    busy = NS(store=None)                                     # a second server on the same directory
+    b.prefix_store = dict(root=tmp_path / 'private', max_bytes=1 << 20)
+    b.session = NS(prefix_cache=busy, prefix_identity=lambda **kw: 'a' * 64)
+    b._open_prefix_store()
+    assert busy.store is None and b.prefix_store is None
 
 
 @serving
