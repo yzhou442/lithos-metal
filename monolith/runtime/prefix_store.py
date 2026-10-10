@@ -110,11 +110,12 @@ class PrefixStore:
         self._pinned = set()          # paths being read or written
         self._index = {}              # path -> Record (this store's directory)
         self._counter = 0
+        self._stamp = None            # the entries directory's mtime when this store last listed it
         self.stats = dict(hits=0, misses=0, writes=0, write_bytes=0, write_ms=0.0, read_ms=0.0,
                           evictions=0, errors=0, dropped=0)
         with self._dir_lock():
             self._remove_stale()
-            self._scan()
+            self._refresh()
         self._queue = queue.Queue(maxsize=pending)
         self._writer = threading.Thread(target=self._drain, name='prefix-store', daemon=True)
         self._writer.start()
@@ -125,6 +126,7 @@ class PrefixStore:
     def match(self, tokens):
         """The longest entry of this identity whose tokens are a strict prefix of ``tokens``."""
         tokens = tuple(tokens)
+        self._refresh()
         with self._mutex:
             records = [r for r in self._index.values() if r.identity == self.identity
                        and len(r.tokens) < len(tokens) and r.tokens == tokens[:len(r.tokens)]]
@@ -404,8 +406,22 @@ class PrefixStore:
                 except OSError:
                     pass
 
-    def _scan(self):
-        for path in sorted(self.dir.glob(f'*{SUFFIX}')):
+    def _refresh(self):
+        """Index what other servers sharing the root wrote or evicted since this store last listed ``entries/``: a
+        rename into the directory and an unlink both change its mtime, so an unchanged directory costs one stat."""
+        try:
+            stamp = os.stat(self.dir).st_mtime_ns
+        except OSError:
+            return
+        if stamp == self._stamp:
+            return
+        self._stamp = stamp
+        present = set(self.dir.glob(f'*{SUFFIX}'))
+        with self._mutex:
+            for path in [p for p in self._index if p not in present]:
+                del self._index[path]
+            new = sorted(p for p in present if p not in self._index)
+        for path in new:
             try:
                 fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
                 try:
@@ -413,7 +429,10 @@ class PrefixStore:
                     tokens = self._tokens(fd, header)
                 finally:
                     os.close(fd)
-                self._index[path] = Record(path, header['identity'], tokens, size)
+                with self._mutex:
+                    self._index.setdefault(path, Record(path, header['identity'], tokens, size))
+            except FileNotFoundError:
+                continue                          # evicted since the listing
             except (CorruptEntry, OSError, ValueError, KeyError, TypeError) as exc:
                 LOG.warning('Prefix store: removing unreadable %s (%s)', path.name, exc)
                 self._discard(path)

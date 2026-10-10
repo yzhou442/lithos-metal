@@ -153,7 +153,10 @@ def test_servers_sharing_a_directory_see_each_others_writes_and_evictions(tmp_pa
     assert not second.contains(tokens) and second.match(tokens + (0,)) is None   # so a flush writes it again
     later = snapshot(4, 3)
     first.write(*later)                                        # written after the second server started
-    assert second.contains(later[0]) and second.match(later[0] + (0,)).tokens == later[0]
+    assert second.match(later[0] + (0,)).tokens == later[0]   # found by a lookup, not only by contains()
+    assert second.contains(later[0])
+    os.unlink(entries_of(first)[0])                            # evicted by the first server again
+    assert second.match(later[0] + (0,)) is None
 
 
 def test_an_entry_is_published_under_the_quota_lock(tmp_path, monkeypatch):
