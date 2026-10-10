@@ -248,8 +248,9 @@ class Session:
     def prefix_identity(self, **extra: Any) -> str:
         """A digest of what this session's prefix checkpoints depend on, for checkpoints kept on disk: the snapshot
         format and the engine's code, the device and OS, the target and draft packs (manifest, and the payload's size
-        and modification time: a manifest records layouts, not weights, so a pack rebuilt in place keeps it),
-        the StepState layout, the state entries (the position-major caches without their capacity), the prefill
+        and modification time: a manifest records layouts, not weights, so a pack rebuilt in place keeps it), the
+        target's and drafter's configurations (a same-shape change such as an epsilon changes the computation), the
+        StepState layout, the state entries (the position-major caches without their capacity), the prefill
         chunking and the options that change numerics, plus the caller's ``extra`` (recipes, tokenizer)."""
         import hashlib
         import platform
@@ -264,11 +265,15 @@ class Session:
             payload = (pack.dir / pack.manifest.get('pack', 'weights.pack')).stat()
             return [hashlib.sha256((pack.dir / 'manifest.json').read_bytes()).hexdigest(), payload.st_size,
                     payload.st_mtime_ns]
+        def config(module):
+            cfg = getattr(module, 'config', None) or getattr(module, 'cfg', None)
+            return repr(cfg) if cfg is not None else None
         entries = sorted((e.name, list(e.shape[1:] if e.name in self._kv_buffers else e.shape), e.dtype.name,
                           e.checkpoints) for e in self.prefix_cache.entries.values())
         doc = dict(format=FORMAT, version=__version__, code=code_digest(), os=platform.platform(),
                    device=[info.name, info.gpu_cores, info.apple_family], backend=self.profile.backend,
                    target=manifest(self.pack), draft=manifest(self.drafter_pack),
+                   config=[config(self.model), config(getattr(self, 'drafter', None))],
                    layout=[self.layout.size, sorted(self.layout.offsets.items())], entries=entries,
                    prefill=[self.prefill_exact, self.prefill_chunk_size, self.EXACT_ROWS],
                    numerics=[self.commute_norm, self.gdn_mixer_fusion, self.fast_math, self.accelerator, self.attention,

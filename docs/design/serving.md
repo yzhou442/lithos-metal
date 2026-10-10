@@ -129,12 +129,13 @@ evicts it or the directory is deleted.
 Each entry is one file: a magic number, a JSON header and 4 KiB-aligned blobs (the token IDs, the StepState, each
 state buffer), each with its SHA-256. The header names an identity digest of the format version, the engine's
 Python and kernel sources, the device and OS, the target and draft packs (each manifest, and the size and
-modification time of its weights, so a pack rebuilt in place does not match), the tokenizer and chat template, the
-StepState layout, the state entries, the prefill chunking, the serving recipes and the numerics options. Lookups
-compare exact token IDs; an entry of another identity is never matched, and one that fails its checksums, sizes or
-layout is deleted and the prompt is prefilled. Files are written under `DIR/tmp/` and renamed into place (0600 in
-0700 directories that only their owner can write), so a partial write is never an entry. An unusable directory, a
-full disk or an I/O error leaves checkpoints in memory or skips the save; none fails a request.
+modification time of its weights, so a pack rebuilt in place does not match), the target's and drafter's
+configurations, the tokenizer and chat template, the StepState layout, the state entries, the prefill chunking,
+the serving recipes and the numerics options. Lookups compare exact token IDs; an entry of another identity is
+never matched, and one that fails its checksums, sizes or layout is deleted and the prompt is prefilled. Files are
+written under `DIR/tmp/` and renamed into place (0600 in 0700 directories that only their owner can write), so a
+partial write is never an entry. An unusable directory, a full disk or an I/O error leaves checkpoints in memory
+or skips the save; none fails a request.
 
 Immutable weight mappings can be shared across compatible programs. Scratch and program-specific parameter
 records are not persistent prefix state. Prefill and decode can use different weight layouts, so a prefix

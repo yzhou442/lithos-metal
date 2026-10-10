@@ -458,7 +458,7 @@ def test_restore_checks_before_writing(tmp_path):
 
 # The server.
 
-def test_the_identity_changes_when_a_pack_is_rebuilt_in_place(tmp_path):
+def test_the_identity_changes_with_the_weights_and_the_configurations(tmp_path):
     import json
     from monolith.generate import Session
     entries = [NS(name='target.k_cache', shape=(16, 2), dtype=NS(itemsize=1, name='uint8'), checkpoints=1)]
@@ -474,7 +474,15 @@ def test_the_identity_changes_when_a_pack_is_rebuilt_in_place(tmp_path):
     for name in ('commute_norm', 'gdn_mixer_fusion', 'fast_math', 'accelerator', 'attention', 'prefill_attention',
                  'prefill_optimizations'):
         setattr(s, name, None)
+    s.model, s.drafter = NS(config=NS(rms_norm_eps=1e-6)), NS(cfg=NS(rms_norm_eps=1e-6))
     before = s.prefix_identity(test=True)
+    assert s.prefix_identity(test=True) == before
+    s.model.config.rms_norm_eps = 1e-5                          # a same-shape configuration change
+    assert s.prefix_identity(test=True) != before
+    s.model.config.rms_norm_eps = 1e-6
+    s.drafter.cfg.rms_norm_eps = 1e-5                           # the drafter's too
+    assert s.prefix_identity(test=True) != before
+    s.drafter.cfg.rms_norm_eps = 1e-6
     assert s.prefix_identity(test=True) == before
     (pack_dir / 'weights.pack').write_bytes(b'v' * 64)          # same size and manifest, other weights
     os.utime(pack_dir / 'weights.pack', ns=(1, 2))
