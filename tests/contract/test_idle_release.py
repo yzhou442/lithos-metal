@@ -204,8 +204,7 @@ def test_watcher_thread_releases_on_the_real_clock_and_stops():
         assert unloaded.wait(5) and life.state is ModelState.UNLOADED
     finally:
         life.stop()
-    life._thread.join(5)
-    assert not life._thread.is_alive()
+    assert not life._thread.is_alive()                     # stop() waits for the watcher
 
 
 def test_a_period_longer_than_a_timer_can_wait_keeps_the_watcher_alive():

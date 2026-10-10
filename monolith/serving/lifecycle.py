@@ -53,9 +53,13 @@ class IdleRelease:
         return self
 
     def stop(self):
+        """Stop the watcher and wait for it (it finishes an unload in progress first); it unloads nothing after."""
         with self._condition:
             self._stopped = True
             self._condition.notify_all()
+        thread = getattr(self, '_thread', None)
+        if thread is not None and thread is not threading.current_thread():
+            thread.join()
 
     @contextlib.contextmanager
     def request(self):
