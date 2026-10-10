@@ -1,4 +1,4 @@
-"""Prefix checkpoints on disk: format, integrity, persistence scope, quota and the cache tiers; no GPU needed."""
+"""Prefix checkpoints on disk: format, integrity, reuse by later processes, quota and the cache tiers; no GPU needed."""
 
 import errno
 import os
@@ -29,7 +29,7 @@ def accept(*args):
 
 
 def test_round_trip_is_private_atomic_and_exact(tmp_path):
-    s = store(tmp_path, persist=True)
+    s = store(tmp_path)
     tokens, state, buffers = snapshot()
     path = s.write(tokens, state, buffers)
     assert path is not None and path.parent == s.dir
@@ -52,53 +52,39 @@ def test_longest_strict_prefix_wins(tmp_path):
     assert s.match((1, 2, 3)).tokens == (1, 2)
 
 
-def test_entries_last_for_the_process_unless_persistence_is_enabled(tmp_path):
+def test_a_later_process_reuses_the_entries_of_its_identity(tmp_path):
     first = store(tmp_path)
     tokens, state, buffers = snapshot()
     first.write(tokens, state, buffers)
-    restarted = store(tmp_path)
-    assert restarted.match(tokens + (0,)) is None             # another process's entries are not this one's
     first.close()
-    assert not first.dir.exists()
-    keep = store(tmp_path, persist=True)
-    keep.write(tokens, state, buffers)
-    keep.close()
-    assert store(tmp_path, persist=True).match(tokens + (0,)).tokens == tokens
-    assert store(tmp_path, persist=True, identity='b' * 64).match(tokens + (0,)) is None   # other weights/code/device
-    assert store(tmp_path).match(tokens + (0,)) is None        # not opted in
+    assert entries_of(first) and first.dir == first.root / 'entries'
+    assert store(tmp_path).match(tokens + (0,)).tokens == tokens
+    assert store(tmp_path, identity='b' * 64).match(tokens + (0,)) is None   # other weights/code/device
 
 
-def test_a_dead_process_leaves_no_partial_or_run_directory(tmp_path):
+def test_a_dead_process_leaves_no_partial_write(tmp_path):
     s = store(tmp_path)
     dead = 2 ** 22 + 12345
     (s.tmp / f'{dead}-0000-1.partial').write_bytes(b'half')
-    stale = s.root / f'run-{dead}-abcd'
-    stale.mkdir(mode=0o700)
-    (stale / f'x{SUFFIX}').write_bytes(b'old')
     (s.tmp / f'{os.getpid()}-ffff-1.partial').write_bytes(b'in progress')     # a live writer's
     again = store(tmp_path)
-    assert not stale.exists() and [p.name for p in again.tmp.iterdir()] == [f'{os.getpid()}-ffff-1.partial']
-    assert s.dir.exists()                                      # the live process keeps its directory
+    assert [p.name for p in again.tmp.iterdir()] == [f'{os.getpid()}-ffff-1.partial']
 
 
-def test_a_process_that_died_after_this_store_started_frees_its_quota(tmp_path):
+def test_a_writer_that_died_after_this_store_started_frees_its_quota(tmp_path):
     s = store(tmp_path)
     a = s.write((1, 2), b's' * 16, {'k': b'a' * 100})
     size = a.stat().st_size
     s.max_bytes = 2 * size                                     # room for two entries
     dead = 2 ** 22 + 12345
-    stale = s.root / f'run-{dead}-abcd'                        # a peer that crashed after this store started
-    stale.mkdir(mode=0o700)
-    (stale / f'x{SUFFIX}').write_bytes(b'o' * size)
-    (s.tmp / f'{dead}-0000-1.partial').write_bytes(b'half')
+    (s.tmp / f'{dead}-0000-1.partial').write_bytes(b'o' * size)   # a peer that crashed mid-write
     assert s.write((3, 4), b's' * 16, {'k': b'b' * 100}) is not None
-    assert not stale.exists() and a.exists() and s.stats['evictions'] == 0    # its files went, not this store's
-    assert list(s.tmp.iterdir()) == []
+    assert a.exists() and s.stats['evictions'] == 0 and list(s.tmp.iterdir()) == []    # its write went, not an entry
 
 
 @pytest.mark.parametrize('damage', ['flip', 'truncate', 'magic', 'header'])
 def test_corrupt_entries_are_misses_and_removed(tmp_path, damage):
-    s = store(tmp_path, persist=True)
+    s = store(tmp_path)
     tokens, state, buffers = snapshot()
     path = s.write(tokens, state, buffers)
     data = bytearray(path.read_bytes())
@@ -113,7 +99,7 @@ def test_corrupt_entries_are_misses_and_removed(tmp_path, damage):
     path.write_bytes(bytes(data))
     if damage == 'flip':                                       # found at load time
         assert s.load(s.match(tokens + (0,)), accept) is None and s.stats['errors'] == 1
-    restarted = store(tmp_path, persist=True)                  # or when a process scans the directory
+    restarted = store(tmp_path)                  # or when a process scans the directory
     assert restarted.match(tokens + (0,)) is None and not path.exists()
 
 
@@ -224,7 +210,7 @@ def state_of(eng):
 
 def test_disk_restore_sets_the_same_state_as_the_memory_restore(tmp_path):
     entries, eng = engine()
-    disk = store(tmp_path, persist=True)
+    disk = store(tmp_path)
     cache = PrefixCache(entries, 1 << 20, store=disk)
     prompt = list(range(100, 112))
     cache.save(prompt[:5], eng)
@@ -242,8 +228,8 @@ def test_disk_restore_sets_the_same_state_as_the_memory_restore(tmp_path):
     assert cache.last['source'] == 'disk' and loaded.tokens == tuple(prompt[:5]) and loaded.on_disk
     cache.restore(loaded, other)
     assert state_of(other) == from_memory
-    restarted = PrefixCache(entries, 1 << 20, store=store(tmp_path, persist=True))
-    assert restarted.match(prompt).buffers == item.buffers     # a later process, persistence enabled
+    restarted = PrefixCache(entries, 1 << 20, store=store(tmp_path))
+    assert restarted.match(prompt).buffers == item.buffers     # a later process
 
 
 def test_memory_evictions_spill_only_reused_checkpoints(tmp_path):
@@ -296,13 +282,13 @@ def test_flush_writes_again_a_copy_the_quota_evicted(tmp_path):
 
 def test_a_stored_checkpoint_of_another_layout_is_never_restored(tmp_path):
     entries, eng = engine()
-    disk = store(tmp_path, persist=True)
+    disk = store(tmp_path)
     cache = PrefixCache(entries, 1 << 20, store=disk)
     cache.save([1, 2, 3], eng)
     cache.flush(timeout=5)
     changed = [NS(name=e.name, shape=(16, 3) if e.checkpoints == 1 else e.shape, dtype=e.dtype, checkpoints=e.checkpoints)
                for e in entries]                               # same identity claimed, other per-token size
-    other = PrefixCache(changed, 1 << 20, store=store(tmp_path, persist=True))
+    other = PrefixCache(changed, 1 << 20, store=store(tmp_path))
     assert other.match([1, 2, 3, 4]) is None and other.store.stats['errors'] == 1
     assert entries_of(other.store) == []
 
@@ -311,14 +297,14 @@ def test_a_stored_checkpoint_of_another_layout_is_never_restored(tmp_path):
 def test_a_persisted_checkpoint_this_program_cannot_take_is_dropped(tmp_path, flaw):
     from monolith.runtime.prefix_cache import StalePrefix
     entries, eng = engine()
-    disk = store(tmp_path, persist=True)
+    disk = store(tmp_path)
     cache = PrefixCache(entries, 1 << 20, store=disk)
     cache.save([1, 2, 3], eng)
     item = cache.items[0]
     buffers = {k: v for k, v in item.buffers.items() if k != 'recurrent' or flaw != 'missing buffer'}
     state = item.state + (b'\0' * 8 if flaw == 'StepState size' else b'')
     assert disk.write(item.tokens, state, buffers) is not None
-    restarted = PrefixCache(entries, 1 << 20, store=store(tmp_path, persist=True))   # nothing saved yet to compare
+    restarted = PrefixCache(entries, 1 << 20, store=store(tmp_path))   # nothing saved yet to compare
     loaded = restarted.match([1, 2, 3, 4])
     assert loaded is not None and loaded.on_disk
     before = state_of(eng)
@@ -367,8 +353,9 @@ def test_restore_checks_before_writing(tmp_path):
 def test_options_and_sizes():
     from monolith.serve import _byte_size, parse_args
     args = parse_args(['--model', 'org/target', '--no-draft'])
-    assert args.prefix_cache_dir is None and args.prefix_cache_disk_size == 32 << 30 and not args.prefix_cache_persist
+    assert args.prefix_cache_dir is None and args.prefix_cache_disk_size == 32 << 30
     assert [_byte_size(v) for v in ('4096', '1.5G', '64MiB', '2t')] == [4096, 3 << 29, 64 << 20, 2 << 40]
+    # entries always outlive the server, so there is no --prefix-cache-persist
     for flags in (['--prefix-cache-persist'], ['--prefix-cache-dir', 'x', '--prefix-cache-disk-size', '0'],
                   ['--prefix-cache-dir', 'x', '--prefix-cache-disk-size', 'lots']):
         with pytest.raises(SystemExit):
@@ -382,14 +369,24 @@ def test_an_unusable_directory_leaves_checkpoints_in_memory(tmp_path):
     os.chmod(root, 0o777)
     b = Backend.__new__(Backend)
     b.model_dir, b.assets = str(tmp_path), None
-    b.prefix_store = dict(root=root, max_bytes=1 << 20, persist=False)
+    b.prefix_store = dict(root=root, max_bytes=1 << 20)
     cache = NS(store=None)
     b.session = NS(prefix_cache=cache, prefix_identity=lambda **kw: 'a' * 64)
     b._open_prefix_store()
     assert cache.store is None and b.prefix_store is None
-    b.prefix_store = dict(root=tmp_path / 'private', max_bytes=1 << 20, persist=False)
+    b.prefix_store = dict(root=tmp_path / 'private', max_bytes=1 << 20)
     b._open_prefix_store()
     assert isinstance(cache.store, PrefixStore)
+
+
+def test_exit_writes_the_host_copies_for_later_servers():
+    from monolith.serve import Backend
+    order = []
+    cache = NS(store=NS(close=lambda: order.append('close')), flush=lambda timeout=None: order.append('flush') or True)
+    b = Backend.__new__(Backend)
+    b.session = NS(prefix_cache=cache)
+    b.close()
+    assert order == ['flush', 'close']
 
 
 def test_idle_release_writes_checkpoints_before_dropping_them(tmp_path):

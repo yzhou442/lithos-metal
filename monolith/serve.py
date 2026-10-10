@@ -47,7 +47,7 @@ class Backend:
         self._sessions = {}
         self.assets = assets
         self.last_metrics = {}
-        self.prefix_store = prefix_store     # PrefixStore options (root, max_bytes, persist): checkpoints on local disk
+        self.prefix_store = prefix_store     # PrefixStore options (root, max_bytes): checkpoints on local disk
 
     def warmup(self, model_name):
         """Compile and page in the default generation path before accepting traffic."""
@@ -120,13 +120,13 @@ class Backend:
             identity = self.session.prefix_identity(recipes=getattr(assets, 'recipes', None),
                                                     recipe_key=getattr(assets, 'recipe_key', None),
                                                     tokenizer=tokenizer.hexdigest())
-            cache.store = PrefixStore(options['root'], options['max_bytes'], identity, persist=options['persist'])
+            cache.store = PrefixStore(options['root'], options['max_bytes'], identity)
         except (OSError, ValueError) as exc:
             logging.getLogger(__name__).warning('Prefix store disabled, checkpoints stay in memory: %s', exc)
             self.prefix_store = None
 
     def close(self):
-        """At exit: write the host checkpoints to a persistent store; remove a process-only store's entries."""
+        """At exit: write the host checkpoints to the store, where a later server reuses them."""
         cache = getattr(self.session, 'prefix_cache', None)
         store = getattr(cache, 'store', None)
         if store is None:
@@ -137,8 +137,7 @@ class Backend:
             store.close()
             return
         try:
-            if store.persist:
-                cache.flush()
+            cache.flush()
             store.close()
         finally:
             lock.release()
@@ -567,13 +566,11 @@ def parse_args(argv=None):
                              "this many seconds without requests; every request resets it, and the next request loads the model again "
                              "from the local packs. Default: no TTL, the model stays loaded")
     parser.add_argument("--prefix-cache-dir", metavar='DIR',
-                        help="Also keep prefix checkpoints on local disk under DIR (created 0700): a checkpoint reused once is written "
-                             "when memory evicts it, every one before --model-ttl releases the model. Default: memory only")
+                        help="Also keep prefix checkpoints on local disk under DIR (created 0700), where later servers of the same "
+                             "engine, weights, device and options reuse them: a checkpoint reused once is written when memory evicts "
+                             "it, every one before --model-ttl releases the model and at exit. Default: memory only")
     parser.add_argument("--prefix-cache-disk-size", type=_byte_size, default='32G', metavar='BYTES',
                         help="Disk quota of --prefix-cache-dir, least recently used entries evicted first (e.g. 32G, the default)")
-    parser.add_argument("--prefix-cache-persist", action='store_true',
-                        help="Reuse --prefix-cache-dir checkpoints across restarts (same engine, weights, device and options); "
-                             "without it they are removed when the server exits")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
     args = parser.parse_args(argv)
@@ -582,8 +579,6 @@ def parse_args(argv=None):
         args.draft = default_draft(args.model)
     if args.max_context < 1:
         parser.error("--max-context must be positive")
-    if args.prefix_cache_persist and not args.prefix_cache_dir:
-        parser.error('--prefix-cache-persist requires --prefix-cache-dir')
     if args.model_ttl is not None and not 0 < args.model_ttl < float('inf'):
         parser.error('--model-ttl must be a finite number of seconds > 0')
     if args.draft_block_size is not None and args.draft_block_size < 1:
@@ -603,7 +598,7 @@ def main(argv=None):
     assets = prepare(args)
     api_key = os.environ.get("LITHOS_METAL_API_KEY") or os.environ.get("LMK_API_KEY") or os.environ.get("MONOLITH_API_KEY")
     rows, exact = args.prefill_chunk_size
-    store = (dict(root=args.prefix_cache_dir, max_bytes=args.prefix_cache_disk_size, persist=args.prefix_cache_persist)
+    store = (dict(root=args.prefix_cache_dir, max_bytes=args.prefix_cache_disk_size)
              if args.prefix_cache_dir else None)
     backend = Backend(str(assets.model_dir), str(assets.pack_dir), args.max_context, rows or assets.prefill_chunk_size or 128,
                       assets=assets, prefill_exact=exact, prefix_store=store)

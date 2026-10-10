@@ -121,9 +121,9 @@ host copy's bytes, never per decode step. Both tiers hold the same bytes, so a r
 state. `--prefix-cache-disk-size` (default `32G`) bounds every entry under `DIR`, evicting the least recently
 used ones; entries being read or written are never evicted, and a snapshot larger than the quota is not saved.
 
-Entries are process-scoped by default: they live in a directory of the running server, which removes it at
-exit (a later start removes one whose process is gone), so they survive an idle release but not a restart.
-`--prefix-cache-persist` keeps them in `DIR/persistent/` for later servers.
+Entries live in `DIR/entries/` and outlive the server: it writes its host copies at exit, and a later server with
+the same identity (below) reuses them. The directory therefore keeps state derived from prompts until the quota
+evicts it or the directory is deleted.
 
 Each entry is one file: a magic number, a JSON header and 4 KiB-aligned blobs (the token IDs, the StepState,
 each state buffer), each with its SHA-256. The header names an identity digest of the format version, the

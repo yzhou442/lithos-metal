@@ -22,7 +22,7 @@ class PrefixCache:
 
     Without a store the cache is process memory only. With one, a checkpoint that was restored at least once is
     written to the store when the host tier evicts it, ``flush()`` writes every host copy (before an idle release
-    drops them, and at exit when the store persists), and a longer prefix found only on disk is read, verified and
+    drops them, and at exit), and a longer prefix found only on disk is read, verified and
     promoted to the host tier. Both tiers hold the same bytes, so a restore from either sets the same state."""
 
     def __init__(self, entries, max_bytes=4 * 1024**3, min_tokens=0, store=None):

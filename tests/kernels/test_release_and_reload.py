@@ -74,7 +74,7 @@ def test_disk_checkpoints_restore_the_state_a_cold_prefill_computes(factory, tmp
 
     session = factory(prefix_cache=True)
     cache = session.prefix_cache
-    cache.store = PrefixStore(tmp_path / 'store', 1 << 30, session.prefix_identity(test=True), persist=True)
+    cache.store = PrefixStore(tmp_path / 'store', 1 << 30, session.prefix_identity(test=True))
     first = session.generate(turns[0], 12, cache_prefix_tokens=[200, len(turns[0]) - 1])
     assert first.tokens == expected[0] and first.cached_prompt_tokens == 0
     second = session.generate(turns[1], 12, cache_prefix_tokens=[200])
@@ -90,12 +90,12 @@ def test_disk_checkpoints_restore_the_state_a_cold_prefill_computes(factory, tmp
     turn2 = session.generate(follow, 12, cache_prefix_tokens=[len(turns[0]) - 1])
     assert turn2.tokens == expected_follow and turn2.cached_prompt_tokens == len(turns[0]) - 1
 
-    # A later process with persistence enabled and the same identity starts from the stored checkpoints.
+    # A later process with the same identity starts from the stored checkpoints.
     cache.flush(timeout=60)
     identity = cache.store.identity
     restarted = factory(prefix_cache=True)
     assert restarted.prefix_identity(test=True) == identity
-    restarted.prefix_cache.store = PrefixStore(tmp_path / 'store', 1 << 30, identity, persist=True)
+    restarted.prefix_cache.store = PrefixStore(tmp_path / 'store', 1 << 30, identity)
     again = restarted.generate(turns[1], 12, cache_prefix_tokens=[200])
     assert again.tokens == expected[1] and again.cached_prompt_tokens == 200
     assert restarted.prefix_cache.last['source'] == 'disk'

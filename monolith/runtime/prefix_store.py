@@ -6,10 +6,9 @@ Files are written under ``tmp/`` and renamed into place, so a partial write is n
 identity the bytes depend on (format, code, device, weights, layout; ``Session.prefix_identity``); an entry with
 another identity is never matched, and one that fails any check is deleted and treated as a miss.
 
-Without ``persist`` the entries live in a directory of this process, removed when it closes (and at a later start
-if it did not): they survive an idle release but not a restart. With ``persist`` they live in ``persistent/`` and
-a later process with the same identity reuses them. All entries share one byte quota with least-recently-used
-eviction; entries being read or written are never evicted.
+Entries live in ``entries/`` and outlive the process: a later server with the same identity reuses them. All
+entries share one byte quota with least-recently-used eviction; entries being read or written are never evicted,
+and a partial write that a dead process left is removed.
 """
 from __future__ import annotations
 
@@ -23,7 +22,6 @@ import logging
 import os
 import queue
 import secrets
-import shutil
 import stat
 import struct
 import threading
@@ -94,11 +92,11 @@ def _private_dir(path):
 class PrefixStore:
     """``identity``: the hex digest snapshots must match; ``max_bytes``: the quota of every entry under ``root``."""
 
-    def __init__(self, root, max_bytes, identity, *, persist=False, workers=8, pending=2):
+    def __init__(self, root, max_bytes, identity, *, workers=8, pending=2):
         if not isinstance(max_bytes, int) or isinstance(max_bytes, bool) or max_bytes <= 0:
             raise ValueError('the prefix store quota must be a positive number of bytes')
         self.root = Path(root).expanduser().absolute()
-        self.max_bytes, self.identity, self.persist = max_bytes, identity, persist
+        self.max_bytes, self.identity = max_bytes, identity
         self.workers = workers
         os.makedirs(self.root, mode=0o700, exist_ok=True)
         _private_dir(self.root)
@@ -106,7 +104,7 @@ class PrefixStore:
         _private_dir(self.tmp)
         self._lock_fd = os.open(self.root / '.lock', os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
         self._nonce = secrets.token_hex(4)
-        self.dir = self.root / ('persistent' if persist else f'run-{os.getpid()}-{self._nonce}')
+        self.dir = self.root / 'entries'
         _private_dir(self.dir)
         self._mutex = threading.Lock()
         self._pinned = set()          # paths being read or written
@@ -116,13 +114,11 @@ class PrefixStore:
                           evictions=0, errors=0, dropped=0)
         with self._dir_lock():
             self._remove_stale()
-            if persist:
-                self._scan()
+            self._scan()
         self._queue = queue.Queue(maxsize=pending)
         self._writer = threading.Thread(target=self._drain, name='prefix-store', daemon=True)
         self._writer.start()
-        LOG.info('Prefix store at %s (%s, quota %.1f GB, %d entries)', self.dir,
-                 'persistent' if persist else 'this process only', max_bytes / 1e9, len(self._index))
+        LOG.info('Prefix store at %s (quota %.1f GB, %d entries)', self.dir, max_bytes / 1e9, len(self._index))
 
     # -- lookup ---------------------------------------------------------------------------------------------------
 
@@ -211,13 +207,8 @@ class PrefixStore:
         return True
 
     def close(self):
-        """Finish queued writes. Without ``persist``, remove this process's entries."""
+        """Finish queued writes."""
         self.flush()
-        if not self.persist:
-            with self._dir_lock():
-                shutil.rmtree(self.dir, ignore_errors=True)
-                with self._mutex:
-                    self._index.clear()
 
     def write(self, tokens, state, buffers):
         """Write one snapshot now (the writer thread's work). Returns the entry's path, or None on any failure."""
@@ -326,19 +317,15 @@ class PrefixStore:
         return Lock()
 
     def _entries(self):
-        """Every entry file under root: (path, size, mtime, evictable by this process)."""
+        """Every entry file and partial write under root: (path, size, mtime, evictable)."""
         out = []
-        for directory in [self.root / 'persistent'] + [p for p in self.root.glob('run-*')]:
-            if not directory.is_dir():
+        for path in self.dir.glob(f'*{SUFFIX}'):
+            try:
+                info = os.lstat(path)
+            except OSError:
                 continue
-            own = directory == self.dir or directory.name == 'persistent'
-            for path in directory.glob(f'*{SUFFIX}'):
-                try:
-                    info = os.lstat(path)
-                except OSError:
-                    continue
-                if stat.S_ISREG(info.st_mode):
-                    out.append((path, info.st_size, info.st_mtime, own))
+            if stat.S_ISREG(info.st_mode):
+                out.append((path, info.st_size, info.st_mtime, True))
         for path in self.tmp.glob('*.partial'):
             try:
                 out.append((path, os.lstat(path).st_size, 0.0, False))
@@ -363,20 +350,20 @@ class PrefixStore:
             return fd
 
     def _make_room(self, nbytes, keep):
-        """With the directory lock held: remove what dead processes left, then unlink this store's least recently used
-        entries (never a pinned one, another process's directory or a partial write) until ``nbytes`` more fit."""
+        """With the directory lock held: remove partial writes that dead processes left, then unlink the least recently
+        used entries (never a pinned one or a partial write) until ``nbytes`` more fit the quota."""
         entries = self._entries()
         used = sum(size for _, size, _, _ in entries)
         if used + nbytes > self.max_bytes:
-            self._remove_stale()                  # a process that died after this store started still holds quota
+            self._remove_stale()                  # a writer that died after this store started still holds quota
             entries = self._entries()
             used = sum(size for _, size, _, _ in entries)
         with self._mutex:
             pinned = set(self._pinned) | {keep}
-        for path, size, _, own in sorted(entries, key=lambda e: e[2]):
+        for path, size, _, evictable in sorted(entries, key=lambda e: e[2]):
             if used + nbytes <= self.max_bytes:
                 break
-            if not own or path in pinned or path.suffix != SUFFIX:
+            if not evictable or path in pinned:
                 continue
             try:
                 os.unlink(path)
@@ -389,7 +376,7 @@ class PrefixStore:
         return used + nbytes <= self.max_bytes
 
     def _remove_stale(self):
-        """Remove partial writes and process directories whose process is gone."""
+        """Remove partial writes whose process is gone."""
         for path in self.tmp.glob('*.partial'):
             try:
                 pid = int(path.name.split('-', 1)[0])
@@ -400,13 +387,6 @@ class PrefixStore:
                     os.unlink(path)
                 except OSError:
                     pass
-        for directory in self.root.glob('run-*'):
-            try:
-                pid = int(directory.name.split('-')[1])
-            except (IndexError, ValueError):
-                continue
-            if directory != self.dir and not _pid_alive(pid) and not directory.is_symlink():
-                shutil.rmtree(directory, ignore_errors=True)
 
     def _scan(self):
         for path in sorted(self.dir.glob(f'*{SUFFIX}')):
