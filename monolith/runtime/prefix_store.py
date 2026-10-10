@@ -111,6 +111,7 @@ class PrefixStore:
         self._index = {}              # path -> Record (this store's directory)
         self._counter = 0
         self._stamp = None            # the entries directory's mtime when this store last listed it
+        self._listed_at = 0           # time.time_ns() when it did
         self.stats = dict(hits=0, misses=0, writes=0, write_bytes=0, write_ms=0.0, read_ms=0.0,
                           evictions=0, errors=0, dropped=0)
         with self._dir_lock():
@@ -448,14 +449,16 @@ class PrefixStore:
 
     def _refresh(self):
         """Index what other servers sharing the root wrote or evicted since this store last listed ``entries/``: a
-        rename into the directory and an unlink both change its mtime, so an unchanged directory costs one stat."""
+        rename into the directory and an unlink both change its mtime, so an unchanged directory costs one stat.
+        Filesystems stamp times at a coarse granularity, so a change shortly after a listing can keep the mtime that
+        listing saw: the directory is listed again until its mtime is a second older than the last listing."""
         try:
             stamp = os.stat(self.dir).st_mtime_ns
         except OSError:
             return
-        if stamp == self._stamp:
+        if stamp == self._stamp and self._listed_at - stamp > 1_000_000_000:
             return
-        self._stamp = stamp
+        self._stamp, self._listed_at = stamp, time.time_ns()
         present = set(self.dir.glob(f'*{SUFFIX}'))
         with self._mutex:
             for path in [p for p in self._index if p not in present]:
