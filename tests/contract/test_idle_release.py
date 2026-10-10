@@ -341,6 +341,28 @@ def test_a_failed_load_is_a_clear_503_and_the_next_request_retries():
 
 
 @serving
+def test_an_accepted_stream_counts_before_its_worker_starts(monkeypatch):
+    from fastapi.testclient import TestClient
+    from monolith.serve import create_app
+    log, seen = [], []
+    b = backend(log)
+    life = b.enable_idle_release(3600)
+    life.stop()
+
+    class Worker(threading.Thread):                       # the stream's worker thread, observed as it starts
+        def start(self):
+            if getattr(self, '_target', None) is not None and self._target.__name__ == 'worker':
+                seen.append(life.pending)
+            super().start()
+    monkeypatch.setattr(threading, 'Thread', Worker)
+    client = TestClient(create_app(b, 'test-model'))
+    body = {'model': 'test-model', 'messages': [{'role': 'user', 'content': 'Hello'}], 'max_tokens': 4, 'stream': True}
+    assert client.post('/v1/chat/completions', json=body).status_code == 200
+    assert seen == [1] and life.pending == 0                   # registered on acceptance, released when done
+    assert log == ['select', 'generate']
+
+
+@serving
 def test_without_the_option_requests_and_health_are_unchanged():
     from fastapi.testclient import TestClient
     from monolith.serve import create_app, parse_args

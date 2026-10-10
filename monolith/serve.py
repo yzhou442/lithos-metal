@@ -104,10 +104,14 @@ class Backend:
         """The lock between generations and the model's loads and unloads."""
         return self.__dict__.get('gpu_lock') or self.__dict__.setdefault('gpu_lock', threading.Lock())
 
-    def complete(self, request, **options):
-        """on_progress(content, completion_tokens) pairs each content snapshot with the committed output count."""
+    def complete(self, request, arrived=None, **options):
+        """on_progress(content, completion_tokens) pairs each content snapshot with the committed output count.
+        ``arrived``: the lifecycle registration a caller made when it accepted the request (IdleRelease.request);
+        without one the request registers here."""
         lifecycle = self.lifecycle
-        with lifecycle.request() if lifecycle is not None else contextlib.nullcontext(0) as arrived:
+        registered = (lifecycle.request() if lifecycle is not None and arrived is None
+                      else contextlib.nullcontext(arrived or 0))
+        with registered as arrived:
             with self._gpu():
                 self._arrived = arrived
                 return self._complete(request, **options)
@@ -317,11 +321,19 @@ def create_app(backend, model_name, api_key=None):
         validate_model(request)
         if not lock.acquire(blocking=False):
             raise APIError("The model is busy; retry after the current request finishes", 429, "model_busy")
+        # An accepted request counts for the idle release from now, not from when its worker starts generating.
+        admitted = contextlib.ExitStack()
+        life = getattr(backend, 'lifecycle', None)
+        options = dict(arrived=admitted.enter_context(life.request())) if life is not None else {}
+
+        def release():
+            admitted.close()
+            lock.release()
         wire = WireResponse(protocol, model_name, custom, request.stream_usage if request.stream else None)
         if request.stream:
-            return stream(request, wire)
+            return stream(request, wire, release, options)
         try:
-            body = execute(request, wire)
+            body = execute(request, wire, **options)
             metrics = dict(getattr(backend, 'last_metrics', {}))
         except APIError:
             raise
@@ -329,13 +341,13 @@ def create_app(backend, model_name, api_key=None):
             logging.getLogger(__name__).exception("Generation failed")
             raise APIError("Generation failed; see server logs", 500, "generation_failed") from exc
         finally:
-            lock.release()
+            release()
         headers = {f'X-{brand}-{name}': str(metrics[key]) for brand in ('Lithos-Metal', 'LMK', 'Monolith') for name, key in (
             ('Decode-Steps', 'steps'), ('Decode-GPU-Ms', 'decode_gpu_ms'),
             ('Decode-Step-Ms', 'decode_step_ms'), ('Verify-Tokens', 'verify_tokens')) if key in metrics}
         return JSONResponse(headers=headers, content=body)
 
-    def stream(request, wire):
+    def stream(request, wire, release, admitted):
         events = queue.Queue()
         cancelled = threading.Event()
         def worker():
@@ -350,7 +362,7 @@ def create_app(backend, model_name, api_key=None):
                         options['on_progress'] = lambda content, count: events.put(('progress', (content, count)))
                     else:
                         options['on_content'] = lambda content: events.put(('content', content))
-                result = execute(request, wire, **options)
+                result = execute(request, wire, **options, **admitted)
                 if not options:
                     usage = result['usage']
                     events.put(('start', usage.get('input_tokens', usage.get('prompt_tokens', 0))))
@@ -361,7 +373,7 @@ def create_app(backend, model_name, api_key=None):
                 logging.getLogger(__name__).exception('Streaming generation failed')
                 events.put(('error', ('Generation failed; see server logs', 'generation_failed')))
             finally:
-                lock.release()
+                release()
         # A worker owns the lock from here, even if the response is never consumed.
         thread = threading.Thread(target=worker, daemon=True)
         thread.start()
