@@ -174,6 +174,28 @@ def test_exact_policy_reads_decoder_layouts_and_keeps_bf16_operands(monkeypatch)
     assert calls == ['private', 'private']
 
 
+@pytest.mark.parametrize('exact', [True, False])
+def test_affine_4bit_projections_take_two_token_blocks_per_weight_tile(exact):
+    def program(n, k, rows=512):
+        params = struct.pack('<IIIIfIII', n, n//32, 960, rows, 1., 0, n//32, 0)
+        kernel = KernelSpec('', 'gemm_tile', {'TK': '128u', 'TN': '32u', 'TM': '32', 'T_SRC': '0'})
+        op = OpSpec('gemm', [(0, 'weights', 0), (4, 'params', 0)], (80, 16, 1), (384, 1, 1),
+                    meta={'format': 'int4_affine', 'n': n, 'k': k, 't_variant': rows})
+        return Program({'gemm': kernel}, {'params': BufferSpec(32, params, 'params'),
+                                        'weights': BufferSpec(64, role='weights')}, [op])
+    backend = get_backend('m5_max_40c')
+    p = backend.optimize_prefill(program(5120, 17408), exact=exact)
+    macros = p.kernels[p.ops[0].kernel].macros
+    assert (p.ops[0].grid, p.ops[0].threadgroup) == ((320, 16, 1), (128, 1, 1))      # 16 planes of two 16-row blocks
+    assert (macros['TM'], macros['TN'], macros['TB2'], macros['KSPLIT']) == ('16', '32u', '1', '1u')
+    assert struct.unpack_from('<II', p.buffers['params'].init, 4) == (160, 1280)    # row tiles, SIMD groups
+    p = backend.optimize_prefill(program(6144, 5120), exact=exact)
+    assert (p.ops[0].grid, p.ops[0].threadgroup) == ((80, 8, 1), (512, 1, 1))
+    for shape in ((34816, 5120), (6144, 5120, 128)):            # the MLP input projection; a 128-row graph
+        original = program(*shape)
+        assert backend.optimize_prefill(copy.deepcopy(original), exact=exact).to_json() == original.to_json()
+
+
 @pytest.mark.parametrize('fmt', ['nvfp4', 'fp8_e4m3'])
 def test_decoder_projection_maps_the_file_a_verification_graph_derived(tmp_path, monkeypatch, fmt):
     import numpy as np

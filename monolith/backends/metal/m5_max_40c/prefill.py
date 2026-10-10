@@ -25,6 +25,11 @@ STAGED = {('fp8_e4m3', 10240, 5120): (32, 4), ('fp8_e4m3', 5120, 6144): (32, 4),
 SHARED = {('nvfp4', 34816, 5120): (16, 16, 160, 1), ('nvfp4', 5120, 17408): (16, 16, 160, 2),
           ('fp8_e4m3', 10240, 5120): (16, 16, 80, 1), ('fp8_e4m3', 5120, 6144): (16, 16, 80, 1),
           ('fp8_e4m3', 6144, 5120): (16, 16, 40, 1), ('fp8_e4m3', 8192, 5120): (16, 16, 80, 1)}
+# INT4: affine 4-bit projections at 512 rows, (token rows, output rows, SIMD groups, workers), each SIMD group
+# multiplying its decoded weight tile with two token blocks. Geometry only: each row keeps the emitted tile's sums.
+# The MLP input projection is no faster this way and keeps the emitted tile.
+INT4 = {('int4_affine', 5120, 17408): (16, 32, 4, 320), ('int4_affine', 10336, 5120): (16, 32, 4, 160),
+        ('int4_affine', 6144, 5120): (32, 16, 16, 80), ('int4_affine', 5120, 6144): (32, 16, 16, 80)}
 
 
 def optimize(program, exact=False):
@@ -133,6 +138,9 @@ def optimize(program, exact=False):
             if shape in SPLIT:
                 program.kernels[op.kernel].macros['SPLIT_K'] = '1'
             decoder_projection(program, op, shared)
+        elif shape in INT4 and op.meta['t_variant'] == 512:
+            tm, tn, sgs, groups = INT4[shape]
+            projection_geometry(program, op, tm=tm, tn=tn, sgs=sgs, groups=groups, token_blocks=2)
         elif shape == ('bf16', 96, 5120) and op.meta['t_variant'] == 512 and not exact:
             # Reorder native BF16 only; FP8 projections stay eight-bit.
             projection_geometry(program, op, tm=32, tn=16, sgs=4, groups=40)
