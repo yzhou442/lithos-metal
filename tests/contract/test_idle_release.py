@@ -501,9 +501,13 @@ def test_requests_load_after_an_idle_release_and_keep_the_api(monkeypatch):
     assert life.release_if_idle() and not b.loaded
     assert client.get('/health').json()['model'] == 'unloaded'
     log.clear()
+    assert b.last_metrics['load_ms'] == 0.0
+    load = b.session.load
+    b.session.load = lambda: time.sleep(0.02) or load()
     response = client.post('/v1/chat/completions', json=body)
     assert response.status_code == 200 and response.json()['choices'][0]['message']['content'] == 'Hi'
     assert log == ['select', 'load', 'generate'] and life.state is ModelState.READY and life.pending == 0
+    assert b.last_metrics['load_ms'] >= 20                       # the reload, which generate()'s setup_ms leaves out
 
 
 @serving

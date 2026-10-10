@@ -30,8 +30,8 @@ def make_client(text='Hello world.', served='local'):
     def complete(request, **_):
         seen.append(request)
         return text, 'stop', 12, 3
-    backend = SimpleNamespace(complete=complete, last_metrics={'prefill_wall_ms': 20.0, 'wall_ms': 60.0, 'setup_ms': 5.0,
-                                                               'decode_wall_ms': 30.0})
+    backend = SimpleNamespace(complete=complete, last_metrics={'prefill_wall_ms': 20.0, 'wall_ms': 60.0, 'setup_ms': 2.0,
+                                                               'load_ms': 3.0, 'decode_wall_ms': 30.0})
     return TestClient(create_app(backend, served)), seen
 
 

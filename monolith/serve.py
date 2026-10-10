@@ -186,11 +186,14 @@ class Backend:
             on_start(len(ids))
         assets = getattr(self, 'assets', None)
         lifecycle = self.lifecycle
+        load_ms = 0.0                           # waiting for and loading a released model (generate() resets setup_ms)
         if lifecycle is not None and lifecycle.state is not ModelState.READY:
+            load_started = time.perf_counter()
             try:
                 lifecycle.ensure_loaded(getattr(self, '_arrived', 0), lambda: self.load(request, len(ids)))
             except ModelLoadError as exc:
                 raise APIError(f'{exc}; retry the request', 503, 'model_load_failed') from exc
+            load_ms = (time.perf_counter() - load_started) * 1000
         else:
             self.select_session(request, len(ids))
         try:
@@ -252,7 +255,7 @@ class Backend:
                 prefill_wall_ms=getattr(generation, 'prefill_wall_ms', 0.0),
                 state_reset_ms=getattr(generation, 'state_reset_ms', 0.0),
                 checkpoint_ms=getattr(generation, 'checkpoint_ms', 0.0),
-                setup_ms=getattr(generation, 'setup_ms', 0.0), first_text_ms=first_text_ms,
+                setup_ms=getattr(generation, 'setup_ms', 0.0), load_ms=load_ms, first_text_ms=first_text_ms,
                 decode_wall_ms=getattr(generation, 'decode_wall_ms', 0.0),
                 cached_prompt_tokens=getattr(generation, 'cached_prompt_tokens', 0),
                 prefill_encode_ms=sum(t['encode_ms'] for t in getattr(generation, 'prefill_timings', [])),

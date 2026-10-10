@@ -89,11 +89,11 @@ compiling; the pack files' pages can still be in the OS file cache, which makes 
 memory pressure evicted them. No weights or states are copied to the CPU or written anywhere.
 
 The next request selects its session and loads it before prefill. The load is part of that request, so an
-overlapping HTTP request receives 429 as it does during a generation; in-process callers that wait for the GPU
-(`Backend.complete`) share one load and its result. A request that arrives during an unload waits for it and
-loads the model again. A failed load leaves the model `failed` and reports HTTP 503 `model_load_failed` (an error
-event on a stream), and the next request tries again. After a load the prompt is prefilled again: the released
-prefix checkpoints were host copies of GPU state.
+overlapping HTTP request is answered as during a generation (429, or a wait for an Ollama chat request);
+in-process callers that wait for the GPU (`Backend.complete`) share one load and its result. A request that
+arrives during an unload waits for it and loads the model again. A failed load leaves the model `failed` and
+reports HTTP 503 `model_load_failed` (an error event on a stream), and the next request tries again. After a load
+the prompt is prefilled again: the released prefix checkpoints were host copies of GPU state.
 
 An Ollama request's `keep_alive` (seconds or a duration such as `5m`; `0` releases the model once no request is
 pending, a negative value never) sets the period that follows that request, as in Ollama; requests without one
