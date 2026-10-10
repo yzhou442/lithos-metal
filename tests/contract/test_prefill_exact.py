@@ -75,3 +75,27 @@ def test_without_a_decoder_recipe_the_last_chunk_is_a_prompt_graph_chunk():
         session, graphs, passes = fake_session(recipe=False)
         session.generate(list(range(n)), 1)
         assert passes() == expected and list(graphs) == [rows]
+
+
+def test_the_decoder_maps_in_the_background_while_prompt_chunks_run():
+    import threading
+    session, graphs, passes = fake_session()
+    decoder = session.engine.return_value
+    calls = []
+    session.engine = Mock(side_effect=lambda t: calls.append(threading.current_thread().name) or decoder)
+    session.generate(list(range(2000)), 1)
+    assert calls[0] == 'map-decoder' and session._prefetch is None       # joined before the hand-off
+    session, graphs, passes = fake_session()
+
+    def fail(t):
+        if threading.current_thread().name == 'map-decoder':
+            raise MemoryError('decoder allocation')
+        return decoder
+    session.engine = Mock(side_effect=fail)
+    with pytest.raises(MemoryError, match='decoder allocation'):
+        session.generate(list(range(2000)), 1)                      # the request that needs it reports it
+    session, graphs, passes = fake_session()
+    calls.clear()
+    session.engine = Mock(side_effect=lambda t: calls.append(threading.current_thread().name) or decoder)
+    session.generate(list(range(100)), 1)                           # runs on the decoder alone: nothing to overlap
+    assert calls == ['MainThread'] and not graphs

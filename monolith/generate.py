@@ -14,6 +14,7 @@ import argparse
 import json
 import os
 import sys
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -169,6 +170,7 @@ class Session:
                 budget = min(4 * 1024**3, info.recommended_working_set // 8)
             self.prefix_cache = PrefixCache(entries, max_bytes=budget, min_tokens=prefix_cache_min_tokens)
         self._last_engine = None
+        self._prefetch = None                                  # (thread, error) mapping the decoder during a prompt
         self.buffers: Optional[Dict[str, Any]] = None
         self.tuner = None
         if autotune:
@@ -245,8 +247,17 @@ class Session:
             op.bindings = [(slot, renames.get(n, n), off) for slot, n, off in op.bindings]
         return prog
 
+    def _settle(self, *, raise_error=True) -> None:
+        """Wait for a decoder mapped in the background; re-raise its failure for the request that needs it."""
+        prefetch, self._prefetch = getattr(self, '_prefetch', None), None
+        if prefetch is not None:
+            prefetch[0].join()
+            if prefetch[1] and raise_error:
+                raise prefetch[1][0]
+
     def release_engines(self, keep_state_from=None):
         """Release GPU allocations, retaining CPU programs and executable pipelines."""
+        self._settle(raise_error=False)
         self.buffers = ({n: b for n, b in keep_state_from.buffers.items()
                          if keep_state_from.program.buffers[n].role in ('state', 'step_state', 'ring')
                          or n in ('accept_log', 'conf_log')} if keep_state_from is not None else None)
@@ -357,6 +368,7 @@ class Session:
         p = len(prompt_ids)
         if p < 1:
             raise ValueError("the prompt must have at least one token")
+        self._settle(raise_error=False)
         self._setup_ms = 0.0
         cache = getattr(self, 'prefix_cache', None)
         cached = cache.match(prompt_ids) if cache is not None else None
@@ -432,6 +444,18 @@ class Session:
             cache.restore(cached, pre)
             checkpoint_ms += (time.perf_counter() - checkpoint_started) * 1000
         initial_step = int(self.layout.unpack(st.read(0, self.layout.size))['step'])
+        if can_ingest and not resident_prefill and keep and 0 not in self.engines and len(chunks) > 1:
+            # Map the decoder while the GPU runs the prompt chunks (Runner.run releases the GIL). After a session
+            # switch its weight windows can differ from the prompt graph's: hundreds of ms of host-side mapping.
+            errors = []
+
+            def map_decoder():
+                try:
+                    self.engine(0)
+                except BaseException as exc:
+                    errors.append(exc)
+            self._prefetch = (threading.Thread(target=map_decoder, name='map-decoder', daemon=True), errors)
+            self._prefetch[0].start()
         prefill_ms = prefill_wall_ms = 0.0
         prefill_timings = []
         tokens: List[int] = []
@@ -441,6 +465,7 @@ class Session:
             if can_ingest and not resident_prefill and k == len(chunks) - 1:
                 if not keep:
                     self.release_engines(keep_state_from=pre)
+                self._settle()
                 del pre
                 pre = self.engine(0)
                 self._last_engine = pre
