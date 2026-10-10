@@ -186,7 +186,7 @@ class Backend:
             on_start(len(ids))
         assets = getattr(self, 'assets', None)
         lifecycle = self.lifecycle
-        load_ms = 0.0                           # waiting for and loading a released model (generate() resets setup_ms)
+        load_ms = 0.0               # loading a released model or selecting a session (generate() resets setup_ms)
         if lifecycle is not None and lifecycle.state is not ModelState.READY:
             load_started = time.perf_counter()
             try:
@@ -195,7 +195,9 @@ class Backend:
                 raise APIError(f'{exc}; retry the request', 503, 'model_load_failed') from exc
             load_ms = (time.perf_counter() - load_started) * 1000
         else:
-            self.select_session(request, len(ids))
+            select_started = time.perf_counter()
+            self.select_session(request, len(ids))            # a new recipe or sampling variant can compile here
+            load_ms = (time.perf_counter() - select_started) * 1000
         try:
             started = time.perf_counter()
             stopped = False
