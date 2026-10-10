@@ -316,7 +316,7 @@ def test_unlimited_output_stops_at_the_context_capacity():
     session = Session()
     session.eos = 99
     backend = Backend.__new__(Backend)
-    backend.max_context, backend.session, backend.sampling = 8, session, (0.0, 1.0, 0, 0, None)
+    backend.max_context, backend.session, backend.select_session = 8, session, lambda request, n: None
     backend.tokenizer = SimpleNamespace(apply_chat_template=lambda *a, **kw: [1, 2, 3], decode=lambda *a, **kw: 'x')
     backend.complete(ollama_request(chat(stream=False)))
     assert session.generated == [6]                                           # 3 prompt + 6 new - 1 = capacity 8
@@ -328,7 +328,7 @@ def test_stop_strings_end_a_non_streaming_generation():
     session = Session()
     session.eos = 99
     backend = Backend.__new__(Backend)
-    backend.max_context, backend.session, backend.sampling = 64, session, (0.0, 1.0, 0, 0, None)
+    backend.max_context, backend.session, backend.select_session = 64, session, lambda request, n: None
     decode = lambda ids, **kw: ''.join({10: 'Hello', 11: ' world', 12: '\n\n', 13: 'More'}.get(i, '!') for i in ids)
     backend.tokenizer = SimpleNamespace(apply_chat_template=lambda *a, **kw: [1, 2, 3], decode=decode)
     content, finish, _, completion = backend.complete(ollama_request(chat(stream=False, options={'stop': ['\n\n']})))

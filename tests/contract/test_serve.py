@@ -141,7 +141,7 @@ def test_a_stop_string_ends_a_non_streaming_generation():
 
     words = {10: "Hello", 11: " world", 12: "\n\n", 13: "More"}
     backend = Backend.__new__(Backend)
-    backend.max_context, backend.sampling = 64, (0.0, 1.0, 0, 0, None)
+    backend.max_context, backend.select_session = 64, lambda request, n: None   # the session below serves every request
     backend.session = SimpleNamespace(eos=99, generate=generate)
     backend.tokenizer = SimpleNamespace(apply_chat_template=lambda *a, **kw: [1, 2, 3],
                                         decode=lambda ids, **kw: "".join(words.get(i, "!") for i in ids))
