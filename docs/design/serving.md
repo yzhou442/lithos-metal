@@ -87,11 +87,12 @@ programs and executable pipelines stay, so the next request maps the weights aga
 compiling; the pack files' pages can still be in the OS file cache, which makes that load faster than one after
 memory pressure evicted them. No weights or states are copied to the CPU or written anywhere.
 
-The next request selects its session and loads it before prefill; concurrent callers share that one load and
-its result. A request that arrives during an unload waits for it and loads the model again. A failed load
-leaves the model `failed`, reports HTTP 503 `model_load_failed` (an error event on a stream) to the request
-and those that waited for that load, and the next request tries again. After a load the prompt is prefilled
-again: the released prefix checkpoints were host copies of GPU state.
+The next request selects its session and loads it before prefill. The load is part of that request, so an
+overlapping HTTP request receives 429 as it does during a generation; in-process callers that wait for the GPU
+(`Backend.complete`) share one load and its result. A request that arrives during an unload waits for it and
+loads the model again. A failed load leaves the model `failed` and reports HTTP 503 `model_load_failed` (an error
+event on a stream), and the next request tries again. After a load the prompt is prefilled again: the released
+prefix checkpoints were host copies of GPU state.
 
 ## Prefix caching and memory ownership
 
