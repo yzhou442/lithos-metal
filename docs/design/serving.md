@@ -76,6 +76,9 @@ With a compatible fixed-verification recipe, short prompts and cached tails can 
 The limit is one chunk, capped at 128 tokens in exact mode. Longer prompts hand their final rows to the decoder
 before output streaming begins.
 
+Buffers stay in one Metal residency set while they are allocated, so switching between the prompt and decode
+programs does not declare them again per command buffer (`LITHOS_RESIDENCY_SET=0` restores the declarations).
+
 ## Prefix caching and memory ownership
 
 [Prefix checkpoints](../../monolith/runtime/prefix_cache.py) contain target and draft state for an exact
