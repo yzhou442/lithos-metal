@@ -156,6 +156,16 @@ def test_exact_policy_reads_decoder_layouts_and_keeps_bf16_operands(monkeypatch)
     assert (p.ops[0].grid, p.ops[0].threadgroup) == ((320, 4, 1), (128, 1, 1))
     assert (macros['TN'], macros['STAGE_B'], macros['STAGE_SB'], macros['SHARE_PLANES']) == ('32u', '1', '4u', '0')
     calls.clear()
+    widths = []
+    narrow = {'tn': 16}                                     # a verification graph whose file tiles hold 16 rows
+    monkeypatch.setattr(prefill, 'decoder_layout', lambda program, op, tn, rows: widths.append(tn) or (
+        narrow if narrow['tn'] % tn == 0 else None))
+    p = get_backend('m5_max_40c').optimize_prefill(program('fp8_e4m3', 10240, 5120), exact=True)
+    assert widths == [32, 16] and calls == [('decoder', narrow)]  # not staged: its 32-row tiles cannot read that file
+    assert (p.ops[0].grid, p.kernels[p.ops[0].kernel].macros['TN']) == ((80, 16, 1), '16u')
+    assert 'STAGE_B' not in p.kernels[p.ops[0].kernel].macros
+    monkeypatch.setattr(prefill, 'decoder_layout', lambda program, op, tn, rows: record)
+    calls.clear()
     record = None                                          # no verification graph: the private layout, as without exact
     get_backend('m5_max_40c').optimize_prefill(program('nvfp4', 34816, 5120), exact=True)
     get_backend('m5_max_40c').optimize_prefill(program('nvfp4', 34816, 5120))

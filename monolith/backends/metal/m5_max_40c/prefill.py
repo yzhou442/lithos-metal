@@ -116,11 +116,14 @@ def optimize(program, exact=False):
                 or int(k.macros.get('TK', '0').rstrip('u')) != 128):
             continue
         shape = (op.meta.get('format'), op.meta.get('n'), op.meta.get('k'))
-        shared = None
+        shared = staged = None
         tn, sgs, groups, blocks = SHARED.get(shape, (0, 0, 0, 1))
         if exact and tn and op.meta['t_variant'] == 512:
-            shared = decoder_layout(program, op, tn, fp8_rows.get(next((n, o) for slot, n, o in op.bindings if slot == 0)))
-        if shared and shape in STAGED:
+            rows = fp8_rows.get(next((n, o) for slot, n, o in op.bindings if slot == 0))
+            # a layout the staged tiles read through their own width, else one the shared tiles read
+            staged = shape in STAGED and decoder_layout(program, op, STAGED[shape][0], rows)
+            shared = staged or decoder_layout(program, op, tn, rows)
+        if staged:
             stage_tn, stage_sgs = STAGED[shape]
             tiles = (shape[1] + stage_tn - 1) // stage_tn
             projection_geometry(program, op, tm=32, tn=stage_tn, sgs=stage_sgs, groups=tiles, staged=True)
