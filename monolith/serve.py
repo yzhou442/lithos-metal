@@ -126,7 +126,10 @@ class Backend:
             self.prefix_store = None
 
     def close(self):
-        """At exit: write the host checkpoints to the store, where a later server reuses them."""
+        """At exit: stop the idle release's watcher, then write the host checkpoints to the store, where a later
+        server reuses them."""
+        if self.lifecycle is not None:
+            self.lifecycle.stop()                       # it unloads nothing after this, and releases the backend
         cache = getattr(self.session, 'prefix_cache', None)
         store = getattr(cache, 'store', None)
         if store is None:

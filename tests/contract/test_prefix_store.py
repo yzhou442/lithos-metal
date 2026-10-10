@@ -512,6 +512,10 @@ def test_exit_writes_the_host_copies_for_later_servers():
     b.session = NS(prefix_cache=cache)
     b.close()
     assert order == ['flush', 'close']
+    b.lifecycle, order[:] = NS(stop=lambda: order.append('stop')), []
+    b.session = NS(prefix_cache=NS(store=None))                # with the idle release on, even without a store
+    b.close()
+    assert order == ['stop']
 
 
 @serving
