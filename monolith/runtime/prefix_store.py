@@ -101,11 +101,24 @@ class PrefixStore:
         except BlockingIOError:
             os.close(self._owner)
             raise StoreBusy(errno.EBUSY, f'another server uses the prefix cache at {self.root}') from None
+        try:
+            self._open()
+        except BaseException:
+            os.close(self._owner)                           # the next server may take the directory
+            self._owner = None
+            raise
+        self._queue = queue.Queue(maxsize=pending)
+        self._writer = threading.Thread(target=self._drain, name='prefix-store', daemon=True)
+        self._writer.start()
+        LOG.info('Prefix store at %s (quota %.1f GB, %d entries)', self.dir, max_bytes / 1e9, len(self._index))
+
+    def _open(self):
         self.tmp = self.root / 'tmp'
         _private_dir(self.tmp)
         self.dir = self.root / 'entries'
         _private_dir(self.dir)
         self._mutex = threading.Lock()
+        self._admission = threading.Lock()      # submit() and close(): no snapshot is queued once closing began
         self._pinned = set()          # paths being read or written
         self._index = {}              # path -> Record
         self._counter = 0
@@ -115,10 +128,6 @@ class PrefixStore:
         for path in self.tmp.glob('*.partial'):                # no writer holds them: this store owns the root
             path.unlink(missing_ok=True)
         self._scan()
-        self._queue = queue.Queue(maxsize=pending)
-        self._writer = threading.Thread(target=self._drain, name='prefix-store', daemon=True)
-        self._writer.start()
-        LOG.info('Prefix store at %s (quota %.1f GB, %d entries)', self.dir, max_bytes / 1e9, len(self._index))
 
     # -- lookup ---------------------------------------------------------------------------------------------------
 
@@ -175,6 +184,10 @@ class PrefixStore:
             self.stats['hits'] += 1
             self.stats['read_ms'] += (time.perf_counter() - started) * 1000
             return tokens, data[0], {b['name']: d for b, d in zip(header['buffers'], data[1:])}
+        except FileNotFoundError:                                  # evicted since the lookup: a miss
+            with self._mutex:
+                self._index.pop(record.path, None)
+            return None
         except (CorruptEntry, OSError, ValueError, KeyError, TypeError) as exc:
             self.stats['errors'] += 1
             LOG.warning('Prefix store: dropping %s (%s); prefilling instead', record.path.name, exc)
@@ -190,17 +203,18 @@ class PrefixStore:
         """Queue a snapshot for the writer thread; the bytes objects are shared, not copied. A queue still full after
         ``timeout`` seconds (None: as long as it takes) drops it and returns False."""
         tokens = tuple(tokens)
-        if self._closed:
-            self.stats['dropped'] += 1
-            return False
-        if self.contains(tokens):
-            return True
-        try:
-            self._queue.put((tokens, state, buffers, on_written), timeout != 0, timeout)
-            return True
-        except queue.Full:
-            self.stats['dropped'] += 1
-            return False
+        with self._admission:
+            if self._closed:
+                self.stats['dropped'] += 1
+                return False
+            if self.contains(tokens):
+                return True
+            try:
+                self._queue.put((tokens, state, buffers, on_written), timeout != 0, timeout)
+                return True
+            except queue.Full:
+                self.stats['dropped'] += 1
+                return False
 
     def flush(self, timeout=None):
         """Wait until every queued snapshot is written or abandoned."""
@@ -216,7 +230,7 @@ class PrefixStore:
     def close(self):
         """Refuse new writes, finish the accepted ones and give the directory up to the next server. A closed store
         reads, writes and deletes nothing: the next owner may hold the files."""
-        with self._mutex:
+        with self._admission, self._mutex:
             self._closed = True
         self.flush()
         if self._owner is not None:
@@ -330,21 +344,19 @@ class PrefixStore:
             if stat.S_ISREG(info.st_mode):
                 entries.append((info.st_mtime, path, info.st_size))
         used = sum(size for _, _, size in entries)
-        with self._mutex:
-            pinned = set(self._pinned) | {keep}
         for _, path, size in sorted(entries):
             if used + nbytes <= self.max_bytes:
                 break
-            if path in pinned:
-                continue
-            try:
-                os.unlink(path)
-            except OSError:
-                continue
+            with self._mutex:                       # a load pins its entry under this mutex before it opens it
+                if path == keep or path in self._pinned:
+                    continue
+                try:
+                    os.unlink(path)
+                except OSError:
+                    continue
+                self._index.pop(path, None)
             used -= size
             self.stats['evictions'] += 1
-            with self._mutex:
-                self._index.pop(path, None)
         return used + nbytes <= self.max_bytes
 
     def _scan(self):

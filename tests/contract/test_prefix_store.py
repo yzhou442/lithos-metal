@@ -96,6 +96,44 @@ def test_a_closed_store_touches_no_file(tmp_path, monkeypatch):
     store(tmp_path).close()                                      # and the directory is free
 
 
+def test_closing_waits_for_a_submission_in_progress(tmp_path, monkeypatch):
+    import threading
+    s = store(tmp_path)
+    real_put, closer = s._queue.put, []
+
+    def put(*args):                                              # close() starts while this snapshot is queued
+        closer.append(threading.Thread(target=s.close))
+        closer[0].start()
+        closer[0].join(0.1)
+        assert closer[0].is_alive()                              # it waits for the submission's admission
+        return real_put(*args)
+    monkeypatch.setattr(s._queue, 'put', put)
+    assert s.submit(*snapshot())
+    closer[0].join(5)
+    assert not closer[0].is_alive() and len(entries_of(s)) == 1  # written before the directory was given up
+
+
+def test_eviction_checks_each_pin_as_it_unlinks(tmp_path, monkeypatch):
+    s = store(tmp_path)
+    a = s.write((1, 2), b's' * 16, {'k': b'a' * 100})
+    s.max_bytes = a.stat().st_size + 100
+    real_unlink, held = os.unlink, []
+    monkeypatch.setattr(os, 'unlink', lambda path, *a, **k: held.append(s._mutex.locked()) or real_unlink(path, *a, **k))
+    assert s.write((3, 4), b's' * 16, {'k': b'b' * 100}) is not None and not a.exists()
+    assert held and all(held)                                    # the pin check and the unlink are one step
+
+
+def test_a_failed_open_releases_the_directory(tmp_path):
+    root = tmp_path / 'cache'
+    root.mkdir(mode=0o700)
+    (root / 'entries').mkdir(mode=0o777)
+    os.chmod(root / 'entries', 0o777)                            # others could write it: refused
+    with pytest.raises(PermissionError):
+        store(tmp_path)
+    os.chmod(root / 'entries', 0o700)
+    store(tmp_path).close()                                      # no lock left behind
+
+
 @pytest.mark.parametrize('damage', ['flip', 'truncate', 'magic', 'header'])
 def test_corrupt_entries_are_misses_and_removed(tmp_path, damage):
     s = store(tmp_path)
