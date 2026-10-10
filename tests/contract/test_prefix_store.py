@@ -96,6 +96,19 @@ def test_a_closed_store_touches_no_file(tmp_path, monkeypatch):
     store(tmp_path).close()                                      # and the directory is free
 
 
+def test_two_reads_of_one_entry_both_keep_it(tmp_path):
+    s = store(tmp_path)
+    a = s.write((1, 2), b's' * 16, {'k': b'a' * 100})
+    s.max_bytes = a.stat().st_size + 100                         # room for one entry
+    with s._mutex:
+        s._pinned[a] += 2                                        # two loads of the same entry
+        s._unpin(a)                                              # the first one finishes
+    assert s.write((3, 4), b's' * 16, {'k': b'b' * 100}) is None and a.exists()   # the second still reads it
+    with s._mutex:
+        s._unpin(a)
+    assert s.write((3, 4), b's' * 16, {'k': b'b' * 100}) is not None and not a.exists()
+
+
 def test_closing_waits_for_a_submission_in_progress(tmp_path, monkeypatch):
     import threading
     s = store(tmp_path)
@@ -141,13 +154,12 @@ def test_a_read_in_progress_keeps_the_directory(tmp_path):
     s = store(tmp_path)
     path = s.write(*snapshot())
     with s._mutex:
-        s._pinned.add(path)                                      # a load still reading it at exit
+        s._pinned[path] += 1                                     # a load still reading it at exit
     s.close(timeout=0.1)
     with pytest.raises(StoreBusy):
         store(tmp_path)                                          # the next server cannot evict it under the read
     with s._unpinned:
-        s._pinned.discard(path)
-        s._unpinned.notify_all()
+        s._unpin(path)
     s.close()                                                    # the read finished: the directory is free
     store(tmp_path).close()
     assert not s._writer.is_alive()                              # nor does a closed store keep its writer thread
@@ -209,7 +221,7 @@ def test_quota_evicts_least_recently_used_but_never_a_pinned_entry(tmp_path):
     b = s.write((3, 4), b's' * 16, {'k': b'b' * 100})
     os.utime(a, (1, 1))
     os.utime(b, (2, 2))
-    s._pinned.add(a)                                           # being read: kept although it is older
+    s._pinned[a] += 1                                          # being read: kept although it is older
     c = s.write((5, 6), b's' * 16, {'k': b'c' * 100})
     assert a.exists() and not b.exists() and c.exists() and s.stats['evictions'] == 1
     s._pinned.clear()

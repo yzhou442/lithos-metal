@@ -14,6 +14,7 @@ are removed when the next one opens the directory.
 """
 from __future__ import annotations
 
+import collections
 import concurrent.futures
 import errno
 import fcntl
@@ -120,7 +121,7 @@ class PrefixStore:
         self._mutex = threading.Lock()
         self._unpinned = threading.Condition(self._mutex)  # notified when a read or write releases its entry
         self._admission = threading.Lock()      # submit() and close(): no snapshot is queued once closing began
-        self._pinned = set()          # paths being read or written
+        self._pinned = collections.Counter()   # path -> reads and writes in progress
         self._index = {}              # path -> Record
         self._counter = 0
         self._closed = False          # closing: no new writes, reads or deletions (the next owner may hold the files)
@@ -162,7 +163,7 @@ class PrefixStore:
         with self._mutex:
             if self._closed:
                 return None
-            self._pinned.add(record.path)
+            self._pinned[record.path] += 1
         try:
             fd = os.open(record.path, os.O_RDONLY | os.O_NOFOLLOW)
             try:
@@ -196,8 +197,7 @@ class PrefixStore:
             return None
         finally:
             with self._unpinned:
-                self._pinned.discard(record.path)
-                self._unpinned.notify_all()
+                self._unpin(record.path)
 
     # -- writes ---------------------------------------------------------------------------------------------------
 
@@ -274,7 +274,7 @@ class PrefixStore:
         with self._mutex:
             self._counter += 1
             partial = self.tmp / f'{self._counter}.partial'
-            self._pinned.add(final)
+            self._pinned[final] += 1
         started = time.perf_counter()
         fd = None
         try:
@@ -309,8 +309,7 @@ class PrefixStore:
             return None
         finally:
             with self._unpinned:
-                self._pinned.discard(final)
-                self._unpinned.notify_all()
+                self._unpin(final)
         with self._mutex:
             self._index[final] = Record(final, self.identity, tokens, total)
         self.stats['writes'] += 1
@@ -388,6 +387,13 @@ class PrefixStore:
             except (CorruptEntry, OSError, ValueError, KeyError, TypeError) as exc:
                 LOG.warning('Prefix store: removing unreadable %s (%s)', path.name, exc)
                 self._discard(path)
+
+    def _unpin(self, path):
+        """With the mutex held: one read or write of ``path`` finished."""
+        self._pinned[path] -= 1
+        if self._pinned[path] <= 0:
+            del self._pinned[path]
+        self._unpinned.notify_all()
 
     def _discard(self, path):
         with self._mutex:
