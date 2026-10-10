@@ -130,19 +130,36 @@ def sized(p):
 
 
 OUT.mkdir(parents=True, exist_ok=True)
+
+
+ARTIFACTS = ('cases.json', 'meta.json')         # what this harness writes into OUT
+
+
+def save(name, text):
+    """Replace OUT/name in one step: an interrupted write never leaves a truncated file behind."""
+    tmp = OUT / f'.{name}.tmp'
+    with open(tmp, 'w') as f:
+        f.write(text)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, OUT / name)
+
+
 def repo_dirty():
-    """Uncommitted changes in the checkout, apart from this harness's own output."""
-    out = OUT.resolve()
-    spec = ['.'] + ([f':(exclude){out.relative_to(ROOT)}'] if out.is_relative_to(ROOT) else [])
-    return bool(subprocess.run(['git', '-C', str(ROOT), 'status', '--porcelain', '--', *spec],
+    """Uncommitted changes in the checkout, apart from this harness's own files."""
+    own = [(OUT / name).resolve() for name in ARTIFACTS] + [(OUT / f'.{name}.tmp').resolve() for name in ARTIFACTS]
+    spec = ['.'] + [f':(exclude){path.relative_to(ROOT)}' for path in own if path.is_relative_to(ROOT)]
+    # every untracked file listed by name: a new output directory is not one entry that hides the files beside it
+    return bool(subprocess.run(['git', '-C', str(ROOT), 'status', '--porcelain', '--untracked-files=all', '--', *spec],
                                capture_output=True, text=True).stdout.strip())
 
 
 def code_digest():
     """The engine's files (Python, kernels, recipes, the native module) and this harness, committed or not."""
     digest, out = hashlib.sha256(), OUT.resolve()
+    own = {out / name for name in ARTIFACTS} | {out / f'.{name}.tmp' for name in ARTIFACTS}
     files = [path for part in ('monolith', 'kernels') for path in sorted((ROOT / part).rglob('*'))
-             if path.is_file() and '__pycache__' not in path.parts and not path.resolve().is_relative_to(out)]
+             if path.is_file() and '__pycache__' not in path.parts and path.resolve() not in own]
     for path in files + [Path(__file__).resolve()]:
         digest.update(str(path.relative_to(ROOT)).encode() + b'\0' + path.read_bytes())
     return digest.hexdigest()[:16]
@@ -163,7 +180,7 @@ if cases and cases.get('__run__') != RUN:
     print('prefill_exact_edges: the output holds another configuration; starting over', flush=True)
     cases = {}
 cases['__run__'] = RUN
-(OUT / 'cases.json').write_text(json.dumps(cases))     # a reset holds even if this run stops before its first case
+save('cases.json', json.dumps(cases))     # a reset holds even if this run stops before its first case
 meta = dict(RUN, time=time.strftime('%Y-%m-%dT%H:%M:%S'), skipped=[], sessions=[])
 started = time.time()
 shared = {}
@@ -204,7 +221,7 @@ def run_case(session, name, key, config, ids, **kw):
                cached_prompt_tokens=g.cached_prompt_tokens, prefill_wall_ms=g.prefill_wall_ms, setup_ms=g.setup_ms,
                wall_s=round(time.time() - t, 2))
     cases.setdefault(name, dict(prompt_tokens=len(ids), recipe=key))[config] = rec
-    (OUT / 'cases.json').write_text(json.dumps(cases))
+    save('cases.json', json.dumps(cases))
     print(f"{name:28s} {config:9s} P={len(ids):6d} recipe={key} passes={rec['passes'][-4:]} ref-path={rec['reference_path']} "
           f"cached={rec['cached_prompt_tokens']} prefill={g.prefill_wall_ms / 1e3:.2f}s wall={rec['wall_s']}s "
           f"t={time.time() - started:.0f}", flush=True)
@@ -256,5 +273,5 @@ for group in a.groups.split(','):
         session.release_engines()
         del session
 meta['elapsed_s'] = round(time.time() - started, 1)
-(OUT / 'meta.json').write_text(json.dumps(meta, indent=1))
+save('meta.json', json.dumps(meta, indent=1))
 sys.exit(report())
