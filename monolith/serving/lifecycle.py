@@ -106,12 +106,16 @@ class IdleRelease:
         self._set(ModelState.READY)
         LOG.info('Loaded the model in %.2f s', self.clock() - started)
 
-    def release_if_idle(self):
+    def release_if_idle(self, *, watcher=False):
         """Unload the model if it is ready and no request arrived or finished within the idle period. Waits for the
-        GPU lock, then checks again: a request that arrived in the meantime keeps the model."""
-        with self.gpu_lock:
+        GPU lock, then checks again: a request that arrived in the meantime keeps the model. For the ``watcher``,
+        stop() ends that wait (a generation can hold the lock for long) and nothing is unloaded."""
+        while not self.gpu_lock.acquire(timeout=0.1):
+            if watcher and self._stopped:
+                return False
+        try:
             with self._condition:
-                if (self.state is not ModelState.READY or self.pending
+                if (watcher and self._stopped or self.state is not ModelState.READY or self.pending
                         or self.clock() - self.last_active < self.seconds):
                     return False
                 self.state = ModelState.UNLOADING
@@ -125,6 +129,8 @@ class IdleRelease:
             self.unloads += 1
             self._set(ModelState.UNLOADED)
             LOG.info('Released the idle model in %.2f s', self.clock() - started)
+        finally:
+            self.gpu_lock.release()
         return True
 
     def _set(self, state):
@@ -148,7 +154,7 @@ class IdleRelease:
                 if self._stopped:
                     return
             try:
-                self.release_if_idle()
+                self.release_if_idle(watcher=True)
             except Exception:
                 LOG.exception('Idle release failed')
                 time.sleep(1.0)

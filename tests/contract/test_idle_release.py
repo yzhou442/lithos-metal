@@ -207,6 +207,19 @@ def test_watcher_thread_releases_on_the_real_clock_and_stops():
     assert not life._thread.is_alive()                     # stop() waits for the watcher
 
 
+def test_stop_ends_a_watcher_waiting_for_the_gpu():
+    gpu, unloaded = threading.Lock(), []
+    life = IdleRelease(gpu, lambda: unloaded.append(1), 0.05)
+    gpu.acquire()                                          # a long generation holds the GPU past the deadline
+    life.start()
+    time.sleep(0.3)                                        # the watcher waits for the lock
+    started = time.monotonic()
+    life.stop()
+    assert time.monotonic() - started < 2 and not life._thread.is_alive()
+    gpu.release()
+    assert unloaded == [] and life.state is ModelState.READY
+
+
 def test_a_period_longer_than_a_timer_can_wait_keeps_the_watcher_alive():
     life = IdleRelease(threading.Lock(), lambda: None, 1e12).start()
     time.sleep(0.05)
