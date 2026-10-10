@@ -283,6 +283,7 @@ class Session:
         sizes. Reusing them skips allocating and zero-filling several GB and their first residency. As reset() does
         for a new request, every adopted state except the KV caches (rows are written before they are read) is
         cleared. Call before ``other`` releases its engines; this session must not hold allocations yet."""
+        other._settle(raise_error=False)        # a decoder still mapping in the background adds to other.buffers
         if self.buffers is not None or not other.buffers or not self._programs:
             return
         mine = {name: spec for prog in self._programs.values() for name, spec in prog.buffers.items()}

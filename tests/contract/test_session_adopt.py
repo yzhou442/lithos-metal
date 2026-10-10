@@ -1,4 +1,5 @@
 """Sessions of one model hand their state allocations to the next selected session (no GPU needed)."""
+import threading
 from types import SimpleNamespace
 
 from monolith.generate import Session
@@ -49,6 +50,23 @@ def test_a_session_with_allocations_or_without_programs_keeps_its_own():
     fresh._programs = {}
     fresh.adopt_buffers(old)
     assert fresh.buffers is None
+
+
+def test_adoption_waits_for_a_decoder_still_mapping_in_the_background():
+    specs = {'gdn': BufferSpec(32, role='state'), 'w': BufferSpec(16)}
+    old, new = session({'gdn': Buffer(32)}, specs), session(None, specs)
+    started, finish = threading.Event(), threading.Event()
+
+    def map_decoder():                          # a cancelled request's prefetch, still adding the decoder's buffers
+        started.set()
+        finish.wait(5)
+        old.buffers['w'] = Buffer(16)
+    old._prefetch = (threading.Thread(target=map_decoder), [RuntimeError('unused')])
+    old._prefetch[0].start()
+    started.wait(5)
+    threading.Timer(0.05, finish.set).start()
+    new.adopt_buffers(old)                      # joins the prefetch first, without raising its error
+    assert old._prefetch is None and set(new.buffers) == {'gdn', 'w'}
 
 
 def test_switching_sessions_adopts_before_releasing(monkeypatch):
