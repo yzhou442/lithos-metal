@@ -282,10 +282,14 @@ class Session:
         Sessions of one model differ in recipe or sampling, not in capacity, so same-named states have the same
         sizes. Reusing them skips allocating and zero-filling several GB and their first residency. As reset() does
         for a new request, every adopted state except the KV caches (rows are written before they are read) is
-        cleared. Call before ``other`` releases its engines; this session must not hold allocations yet."""
+        cleared. Call before ``other`` releases its engines; this session must not hold allocations yet. A new
+        session compiles its decoder program first (its first request needs it) to learn the buffers it binds."""
         other._settle(raise_error=False)        # a decoder still mapping in the background adds to other.buffers
-        if self.buffers is not None or not other.buffers or not self._programs:
+        if self.buffers is not None or not other.buffers:
             return
+        if not self._programs:
+            key = 0 if self.drafter is not None else 1
+            self._programs[key] = self._compile(self.decode_t_max if key == 0 else 1, dynamic=key == 0, prefill=False)
         mine = {name: spec for prog in self._programs.values() for name, spec in prog.buffers.items()}
         theirs = {name: spec for prog in other._programs.values() for name, spec in prog.buffers.items()}
 

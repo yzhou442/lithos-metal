@@ -40,16 +40,24 @@ def test_a_session_adopts_same_states_scratch_and_weight_windows(tmp_path):
     assert not buffers['ws'].cleared and not buffers['w'].cleared
 
 
-def test_a_session_with_allocations_or_without_programs_keeps_its_own():
+def test_a_session_with_allocations_keeps_its_own():
     specs = {'gdn': BufferSpec(32, role='state')}
     old = session({'gdn': Buffer(32)}, specs)
     held = session({'own': Buffer(8)}, specs)
     held.adopt_buffers(old)
     assert set(held.buffers) == {'own'}
-    fresh = session(None, specs)
-    fresh._programs = {}
-    fresh.adopt_buffers(old)
-    assert fresh.buffers is None
+
+
+def test_a_new_session_compiles_its_decoder_program_and_adopts():
+    specs = {'gdn': BufferSpec(32, role='state'), 'ws': BufferSpec(16)}
+    old = session({'gdn': Buffer(32), 'ws': Buffer(16)}, specs)
+    for drafter, key, bound, dynamic in ((object(), 0, 9, True), (None, 1, 1, False)):
+        fresh, compiled = session(None, specs), []
+        fresh._programs, fresh.drafter, fresh.decode_t_max = {}, drafter, 9
+        fresh._compile = lambda bound, **kw: compiled.append((bound, kw)) or Program({}, specs, [])
+        fresh.adopt_buffers(old)                # the first switch to a variant: no compiled programs yet
+        assert compiled == [(bound, dict(dynamic=dynamic, prefill=False))] and list(fresh._programs) == [key]
+        assert set(fresh.buffers) == {'gdn', 'ws'}
 
 
 def test_adoption_waits_for_a_decoder_still_mapping_in_the_background():
