@@ -208,6 +208,9 @@ def test_a_dropped_entry_another_server_is_reading_stays_until_it_is_done(tmp_pa
     fcntl.flock(reader, fcntl.LOCK_SH)
     first.remove(tokens)                                        # the first server drops it (e.g. a program mismatch)
     assert path.exists()                                        # kept under the lease
+    for _ in range(2):                                          # and not found again by the store that dropped it
+        assert first.match(tokens + (0,)) is None and not first.contains(tokens)
+    assert second.match(tokens + (0,)) is not None              # the other server decides for itself
     os.close(reader)
     first.remove(tokens)
     assert not path.exists()

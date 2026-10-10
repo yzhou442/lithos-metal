@@ -102,6 +102,7 @@ class PrefixStore:
         self._counter = 0
         self._stamp = None            # the entries directory's mtime when this store last listed it
         self._listed_at = 0           # time.time_ns() when it did
+        self._rejected = {}           # path -> (inode, mtime) of an entry this store dropped while a lease kept it
         self.stats = dict(hits=0, misses=0, writes=0, write_bytes=0, write_ms=0.0, read_ms=0.0,
                           evictions=0, errors=0, dropped=0)
         with self._dir_lock():
@@ -133,7 +134,7 @@ class PrefixStore:
         except OSError:
             info = None
         with self._mutex:
-            if info is None or not stat.S_ISREG(info.st_mode):
+            if info is None or not stat.S_ISREG(info.st_mode) or self._is_rejected(path, info):
                 self._index.pop(path, None)
                 return False
             self._index.setdefault(path, Record(path, self.identity, tokens, info.st_size))
@@ -449,6 +450,9 @@ class PrefixStore:
             try:
                 fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
                 try:
+                    with self._mutex:
+                        if self._is_rejected(path, os.fstat(fd)):
+                            continue                  # dropped here; another server's lease still holds the file
                     header, size = self._header(fd)
                     tokens = self._tokens(fd, header)
                 finally:
@@ -462,10 +466,23 @@ class PrefixStore:
                 self._discard(path)
 
     def _discard(self, path):
-        """Forget an entry and delete its file, unless a server holds its lease (that server deletes it later)."""
+        """Forget an entry and delete its file, unless a server holds its lease. A file the lease keeps is not indexed
+        or matched again by this store (a new file under the name is)."""
+        try:
+            info = os.lstat(path)
+        except OSError:
+            info = None
         with self._mutex:
             self._index.pop(path, None)
-        self._unlink_unless_leased(path)
+            if info is not None:
+                self._rejected[path] = (info.st_ino, info.st_mtime_ns)
+        if self._unlink_unless_leased(path):
+            with self._mutex:
+                self._rejected.pop(path, None)
+
+    def _is_rejected(self, path, info):
+        """With the mutex held: whether ``info`` is the file this store dropped at ``path``."""
+        return self._rejected.get(path) == (info.st_ino, info.st_mtime_ns)
 
     # -- the format -----------------------------------------------------------------------------------------------
 
