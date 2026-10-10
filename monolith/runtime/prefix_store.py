@@ -139,6 +139,14 @@ class PrefixStore:
         with self._mutex:
             return any(r.identity == self.identity and r.tokens == tokens for r in self._index.values())
 
+    def remove(self, tokens):
+        """Delete this identity's entry for exactly ``tokens``, if there is one."""
+        tokens = tuple(tokens)
+        with self._mutex:
+            paths = [r.path for r in self._index.values() if r.identity == self.identity and r.tokens == tokens]
+        for path in paths:
+            self._discard(path)
+
     def load(self, record, expected):
         """Read and verify ``record``: ``(tokens, state, {name: bytes})``, or None (the entry is dropped).
         ``expected(names_sizes, n_tokens, state_size)`` raises CorruptEntry for buffers this program cannot take."""

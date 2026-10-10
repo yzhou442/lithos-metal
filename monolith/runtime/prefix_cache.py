@@ -13,6 +13,10 @@ class Prefix:
     on_disk: bool = field(default=False, compare=False)    # a PrefixStore holds the same bytes
 
 
+class StalePrefix(ValueError):
+    """A checkpoint read from disk that this program cannot take. It is dropped from both tiers; the request prefills."""
+
+
 class PrefixCache:
     """Host copies of the newest checkpoints, optionally over a ``store`` (PrefixStore) on local disk.
 
@@ -93,7 +97,22 @@ class PrefixCache:
         self.items.clear()
 
     def restore(self, item, engine):
-        # Check first: a checkpoint that does not fit is never partly written.
+        # Check first: a checkpoint that does not fit is never partly written. One read from disk is dropped (until
+        # this process saves, nothing tells the disk check which buffers and StepState size to expect).
+        try:
+            self._check_fits(item, engine)
+        except ValueError as exc:
+            if not item.on_disk:
+                raise
+            self.items = [other for other in self.items if other is not item]
+            if self.store is not None:
+                self.store.remove(item.tokens)
+            raise StalePrefix(str(exc)) from exc
+        for name, data in item.buffers.items():
+            engine.buffers[name].write(data, 0)
+        engine.buffers[engine.program.step_state].write(item.state, 0)
+
+    def _check_fits(self, item, engine):
         if item.on_disk and frozenset(item.buffers) != frozenset(
                 n for n, spec in engine.program.buffers.items() if spec.role == 'state' and n in self.entries):
             raise ValueError("a stored prefix checkpoint does not hold this program's state buffers")
@@ -102,9 +121,6 @@ class PrefixCache:
                 raise ValueError(f'prefix checkpoint buffer {name!r} exceeds its allocation')
         if len(item.state) != engine.program.layout.size:
             raise ValueError('prefix checkpoint StepState does not match the program layout')
-        for name, data in item.buffers.items():
-            engine.buffers[name].write(data, 0)
-        engine.buffers[engine.program.step_state].write(item.state, 0)
 
     @staticmethod
     def _position_major(entry):

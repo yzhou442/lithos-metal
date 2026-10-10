@@ -307,6 +307,45 @@ def test_a_stored_checkpoint_of_another_layout_is_never_restored(tmp_path):
     assert entries_of(other.store) == []
 
 
+@pytest.mark.parametrize('flaw', ['missing buffer', 'StepState size'])
+def test_a_persisted_checkpoint_this_program_cannot_take_is_dropped(tmp_path, flaw):
+    from monolith.runtime.prefix_cache import StalePrefix
+    entries, eng = engine()
+    disk = store(tmp_path, persist=True)
+    cache = PrefixCache(entries, 1 << 20, store=disk)
+    cache.save([1, 2, 3], eng)
+    item = cache.items[0]
+    buffers = {k: v for k, v in item.buffers.items() if k != 'recurrent' or flaw != 'missing buffer'}
+    state = item.state + (b'\0' * 8 if flaw == 'StepState size' else b'')
+    assert disk.write(item.tokens, state, buffers) is not None
+    restarted = PrefixCache(entries, 1 << 20, store=store(tmp_path, persist=True))   # nothing saved yet to compare
+    loaded = restarted.match([1, 2, 3, 4])
+    assert loaded is not None and loaded.on_disk
+    before = state_of(eng)
+    with pytest.raises(StalePrefix):
+        restarted.restore(loaded, eng)
+    assert state_of(eng) == before and restarted.items == []
+    assert restarted.match([1, 2, 3, 4]) is None and entries_of(restarted.store) == []    # a miss from now on
+
+
+def test_generation_prefills_after_dropping_a_checkpoint_it_cannot_take():
+    from monolith.generate import Session
+    from monolith.runtime.prefix_cache import StalePrefix
+    calls = []
+
+    def restore(item, engine):
+        raise StalePrefix('a stored prefix checkpoint does not hold this program\'s state buffers')
+    s = Session.__new__(Session)
+    s.prefix_cache = NS(match=lambda ids: NS(tokens=(1, 2)), restore=restore, min_tokens=0)
+    s.decoder_kernel_config, s.prefill_exact, s.prefill_chunk_size, s.decode_t_max = None, False, 8, 8
+    s.reset = lambda preserve_kv: None
+    s.prefill_engine = lambda rows, t_max: NS(program=NS(context_capacity=0, step_state='st'), buffers={'st': None})
+    s.generate = lambda *args, **kwargs: calls.append((args, kwargs)) or 'prefilled'      # the retry
+    assert Session.generate(s, [1, 2, 3, 4], 5, steps_per_cb=2, cache_prefix_tokens=3) == 'prefilled'
+    assert calls == [(([1, 2, 3, 4], 5), dict(steps_per_cb=2, in_flight=3, on_tokens=None, cancelled=None,
+                                             cache_prefix_tokens=3))]
+
+
 def test_restore_checks_before_writing(tmp_path):
     entries, eng = engine()
     cache = PrefixCache(entries, 1 << 20)

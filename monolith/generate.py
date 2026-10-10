@@ -436,8 +436,16 @@ class Session:
         st = pre.buffers[pre.program.step_state]
         checkpoint_ms = 0.0
         if cached is not None:
+            from .runtime.prefix_cache import StalePrefix
             checkpoint_started = time.perf_counter()
-            cache.restore(cached, pre)
+            try:
+                cache.restore(cached, pre)
+            except StalePrefix as exc:
+                # Dropped from both tiers: nothing ran yet, so start over as a miss (or a shorter checkpoint).
+                import logging
+                logging.getLogger(__name__).warning('Prefix checkpoint dropped (%s); prefilling instead', exc)
+                return self.generate(prompt_ids, max_new_tokens, steps_per_cb=steps_per_cb, in_flight=in_flight,
+                                     on_tokens=on_tokens, cancelled=cancelled, cache_prefix_tokens=cache_prefix_tokens)
             checkpoint_ms += (time.perf_counter() - checkpoint_started) * 1000
         initial_step = int(self.layout.unpack(st.read(0, self.layout.size))['step'])
         prefill_ms = prefill_wall_ms = 0.0
