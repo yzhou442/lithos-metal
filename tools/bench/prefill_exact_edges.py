@@ -165,12 +165,28 @@ def code_digest():
     return digest.hexdigest()[:16]
 
 
+def artifact_stamp(*dirs):
+    """Every file the model, pack and draft directories hold, by path, size and modification time (a file replaced or
+    repacked in place changes it); directories that are not set count as empty."""
+    digest = hashlib.sha256()
+    for root in dirs:
+        if root is None or not Path(root).exists():
+            digest.update(b'-')
+            continue
+        for path in sorted(Path(root).rglob('*')):
+            if path.is_file():
+                info = path.stat()
+                digest.update(f'{path.relative_to(root)}\0{info.st_size}\0{info.st_mtime_ns}\n'.encode())
+    return digest.hexdigest()[:16]
+
+
 RUN = dict(repo_head=os.popen(f'git -C {ROOT} rev-parse --short HEAD 2>/dev/null').read().strip(),
            repo_dirty=repo_dirty(), code=code_digest(),
            # the token sequences every case is cut from, and the weights they run on
            prompts=hashlib.sha256(json.dumps([HEAD, TAIL, doc]).encode()).hexdigest()[:16],
            model_dir=str(assets.model_dir), pack=str(assets.pack_dir),
            draft=[str(assets.draft_dir), str(assets.draft_pack)],
+           artifacts=artifact_stamp(assets.model_dir, assets.pack_dir, assets.draft_dir, assets.draft_pack),
            model=a.model, chunk=a.chunk, max_new=a.max_new, max_context=a.max_context,
            env={k: v for k, v in os.environ.items() if k.startswith('LITHOS_')})
 cases = json.loads((OUT / 'cases.json').read_text()) if (OUT / 'cases.json').exists() else {}
