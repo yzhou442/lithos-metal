@@ -70,6 +70,30 @@ With a compatible fixed-verification recipe, short prompts and cached tails can 
 The limit is one chunk, capped at 128 tokens in exact mode. Longer prompts hand their final rows to the decoder
 before output streaming begins.
 
+## Idle release
+
+`--model-ttl SECONDS` sets an idle TTL that returns the model's memory to the system when the server is idle; without it
+the model stays loaded.
+The period runs on the monotonic clock from the completion of the last request, while no other request is
+pending; any request that arrives restarts it. A request counts as pending from its arrival, before it waits
+for the GPU, through prefill, decode and streaming, until it completes, fails or is cancelled.
+
+The model is `ready`, `unloading`, `unloaded`, `loading` or `failed` (`GET /health` reports it as `model` when
+the option is set). Loads and unloads run under the lock that every GPU submission holds, so an unload never
+overlaps a generation or its command buffers. The unload releases every session's allocations: target and draft
+weight mappings, KV caches, GDN convolution and recurrent states, StepState, scratch, indirect command buffers,
+runners and their residency, and the in-memory prefix checkpoints. The tokenizer, the HTTP server, compiled CPU
+programs and executable pipelines stay, so the next request maps the weights again from the local packs without
+compiling; the pack files' pages can still be in the OS file cache, which makes that load faster than one after
+memory pressure evicted them. No weights or states are copied to the CPU or written anywhere.
+
+The next request selects its session and loads it before prefill. The load is part of that request, so an
+overlapping HTTP request receives 429 as it does during a generation; in-process callers that wait for the GPU
+(`Backend.complete`) share one load and its result. A request that arrives during an unload waits for it and
+loads the model again. A failed load leaves the model `failed` and reports HTTP 503 `model_load_failed` (an error
+event on a stream), and the next request tries again. After a load the prompt is prefilled again: the released
+prefix checkpoints were host copies of GPU state.
+
 ## Prefix caching and memory ownership
 
 [Prefix checkpoints](../../monolith/runtime/prefix_cache.py) contain target and draft state for an exact
