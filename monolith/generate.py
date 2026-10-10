@@ -245,6 +245,20 @@ class Session:
             op.bindings = [(slot, renames.get(n, n), off) for slot, n, off in op.bindings]
         return prog
 
+    @property
+    def can_ingest(self) -> bool:
+        """Whether the fixed-length verification graph also takes prompt rows (accept_scan commits them under
+        ``prefill_left`` without sampling), so short prompts and tails run on the resident decoder."""
+        return (self.decoder_kernel_config is not None and self.drafter is not None
+                and self.verify == 'fixed' and (self.verify_length or 0) >= 1)
+
+    def load(self) -> None:
+        """Allocate what a request reaches first, as warm-up leaves it: the decoder and, where generate keeps both
+        allocated, the prompt graph. After release_engines() this maps the weights again from the pack files."""
+        if self.decoder_kernel_config is None or (self.prefill_exact and self.can_ingest and self._keep_both()):
+            self.prefill_engine(None, self.prefill_chunk_size)
+        self.engine(0 if self.drafter is not None else 1)
+
     def release_engines(self, keep_state_from=None):
         """Release GPU allocations, retaining CPU programs and executable pipelines."""
         self.buffers = ({n: b for n, b in keep_state_from.buffers.items()
@@ -335,8 +349,7 @@ class Session:
         # uses prefill_left to commit their state without sampling. Its pruned
         # projection variants cover T=1 as well. Keep the compact weights and
         # ICB resident for short prompts/tails instead of remapping both packs.
-        can_ingest = (self.decoder_kernel_config is not None and self.drafter is not None
-                      and self.verify == 'fixed' and (self.verify_length or 0) >= 1)
+        can_ingest = self.can_ingest
         resident_prefill = can_ingest and p - offset <= (self.EXACT_ROWS if self.prefill_exact else self.prefill_chunk_size)
         t_max = self.decode_t_max if resident_prefill else self.prefill_chunk_size
         # Split at the stable message prefix and just before the prompt tail.

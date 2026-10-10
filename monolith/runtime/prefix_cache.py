@@ -54,6 +54,10 @@ class PrefixCache:
             engine.buffers[engine.program.step_state].read(0, engine.program.layout.size),
             {name: engine.buffers[name].read(0, size) for name, size in sizes.items()}))
 
+    def clear(self):
+        """Drop every snapshot (their host copies of the attention and recurrent state)."""
+        self.items.clear()
+
     @staticmethod
     def restore(item, engine):
         for name, data in item.buffers.items():

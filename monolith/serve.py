@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
+import gc
 import queue
 import logging
 import os
@@ -22,6 +24,7 @@ from . import __version__
 from .serving.protocol import (APIError, ChatRequest, Message, TextPart, anthropic_request,
                                responses_request, parse_completion, streaming_text)
 from .serving.events import WireResponse
+from .serving.lifecycle import IdleRelease, ModelLoadError, ModelState
 from .serving.tool_stream import tool_prefixes
 
 
@@ -29,6 +32,7 @@ class Backend:
     """One cached session; sampling changes rebuild its compiled programs, never duplicate model residency."""
 
     prefill_exact = False
+    lifecycle = None                 # IdleRelease: unload after an idle period (--model-ttl)
 
     def __init__(self, model_dir, pack_dir, max_context=4096, prefill_chunk_size=128, *, assets=None, prefill_exact=False):
         from transformers import AutoTokenizer
@@ -96,8 +100,60 @@ class Backend:
             sessions.pop(next(iter(sessions)))
         self.sampling = sampling
 
-    def complete(self, request, *, on_text=None, on_content=None, on_start=None, cancelled=None, on_progress=None):
+    def _gpu(self):
+        """The lock between generations and the model's loads and unloads."""
+        return self.__dict__.get('gpu_lock') or self.__dict__.setdefault('gpu_lock', threading.Lock())
+
+    def complete(self, request, **options):
         """on_progress(content, completion_tokens) pairs each content snapshot with the committed output count."""
+        lifecycle = self.lifecycle
+        with lifecycle.request() if lifecycle is not None else contextlib.nullcontext(0) as arrived:
+            with self._gpu():
+                self._arrived = arrived
+                return self._complete(request, **options)
+
+    def enable_idle_release(self, seconds):
+        """Unload the model after ``seconds`` without requests; the next request loads it again."""
+        state = ModelState.READY if self.loaded else ModelState.UNLOADED
+        self.lifecycle = IdleRelease(self._gpu(), self.unload, seconds, state=state).start()
+        return self.lifecycle
+
+    @property
+    def loaded(self):
+        return bool(getattr(self.session, 'engines', None))
+
+    @property
+    def resident_bytes(self):
+        buffers = tuple((getattr(self.session, 'buffers', None) or {}).values())
+        return sum({id(b): b.nbytes for b in buffers}.values()) if self.loaded else 0
+
+    def load(self, request, prompt_tokens):
+        """Select the request's session and map its weights, states and scratch again (Session.load)."""
+        self.select_session(request, prompt_tokens)
+        self.session.load()
+
+    def unload(self):
+        """Release every session's GPU allocations (target and draft weights, KV and recurrent states, scratch,
+        the programs' command resources) and the prefix snapshots. The tokenizer, compiled programs and executable
+        pipelines stay, so a load maps the weights again from the local packs without compiling. Runs with the
+        GPU lock held: no command buffer is in flight."""
+        import weakref
+
+        released = self.resident_bytes
+        sessions = [s for s in (self.session, *getattr(self, '_sessions', {}).values()) if s is not None]
+        engines = [weakref.ref(e) for s in sessions for e in getattr(s, 'engines', {}).values()]
+        for session in sessions:
+            session.release_engines()
+        cache = getattr(self.session, 'prefix_cache', None)
+        if cache is not None:
+            cache.clear()
+        gc.collect()
+        alive = sum(ref() is not None for ref in engines)
+        if alive:
+            logging.getLogger(__name__).warning('%d released engines are still referenced', alive)
+        logging.getLogger(__name__).info('Released %.2f GB of model allocations', released / 1e9)
+
+    def _complete(self, request, *, on_text=None, on_content=None, on_start=None, cancelled=None, on_progress=None):
         from jinja2 import TemplateError
 
         request_started = time.perf_counter()
@@ -116,7 +172,14 @@ class Backend:
         if on_start:
             on_start(len(ids))
         assets = getattr(self, 'assets', None)
-        self.select_session(request, len(ids))
+        lifecycle = self.lifecycle
+        if lifecycle is not None and lifecycle.state is not ModelState.READY:
+            try:
+                lifecycle.ensure_loaded(getattr(self, '_arrived', 0), lambda: self.load(request, len(ids)))
+            except ModelLoadError as exc:
+                raise APIError(f'{exc}; retry the request', 503, 'model_load_failed') from exc
+        else:
+            self.select_session(request, len(ids))
         try:
             started = time.perf_counter()
             stopped = False
@@ -212,7 +275,7 @@ def create_app(backend, model_name, api_key=None):
 
     @app.exception_handler(APIError)
     async def api_error(request, exc):
-        kind = {401: "authentication_error", 429: "rate_limit_error", 500: "server_error"}.get(
+        kind = {401: "authentication_error", 429: "rate_limit_error", 500: "server_error", 503: "server_error"}.get(
             exc.status, "invalid_request_error")
         if request.url.path.startswith('/v1/messages'):
             return JSONResponse(status_code=exc.status, content={'type': 'error', 'error': {'type': kind, 'message': exc.message}})
@@ -233,7 +296,8 @@ def create_app(backend, model_name, api_key=None):
 
     @app.get("/health")
     async def health():
-        return {"status": "ok"}
+        lifecycle = getattr(backend, 'lifecycle', None)
+        return {"status": "ok", "model": lifecycle.state.value} if lifecycle is not None else {"status": "ok"}
 
     @app.get("/v1/models", dependencies=[Depends(authorize)])
     async def models():
@@ -423,6 +487,10 @@ def parse_args(argv=None):
                         help="Prompt tokens per prefill pass. N-exact reproduces the results of 128-token passes bit for bit; "
                              "auto-exact (default) uses the chip's measured size for the model that way, else 128")
     parser.add_argument("--no-warmup", action='store_true', help="Skip startup compilation/warmup; the first request pays this cost")
+    parser.add_argument("--model-ttl", type=float, default=None, metavar='SECONDS',
+                        help="Idle TTL: release the model's GPU memory (weights, KV/recurrent state, scratch, prefix snapshots) after "
+                             "this many seconds without requests; every request resets it, and the next request loads the model again "
+                             "from the local packs. Default: no TTL, the model stays loaded")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
     args = parser.parse_args(argv)
@@ -431,6 +499,8 @@ def parse_args(argv=None):
         args.draft = default_draft(args.model)
     if args.max_context < 1:
         parser.error("--max-context must be positive")
+    if args.model_ttl is not None and not 0 < args.model_ttl < float('inf'):
+        parser.error('--model-ttl must be a finite number of seconds > 0')
     if args.draft_block_size is not None and args.draft_block_size < 1:
         parser.error('--draft-block-size must be positive')
     if not args.draft and (args.draft_pack or args.draft_revision or args.draft_block_size is not None or args.kernel_config or args.kernel_config_key
@@ -453,6 +523,8 @@ def main(argv=None):
     model_name = args.served_model_name or (assets.model_dir.name if Path(args.model).expanduser().exists() else args.model)
     if not args.no_warmup:
         backend.warmup(model_name)
+    if args.model_ttl is not None:
+        backend.enable_idle_release(args.model_ttl)
     app = create_app(backend, model_name, api_key)
     logging.getLogger(__name__).info('lithos-metal ready: http://%s:%s — model=%s; DSpark=%s; verification rows=%s',
                                    args.host, args.port, model_name, args.draft or 'disabled', assets.gamma + 1)
