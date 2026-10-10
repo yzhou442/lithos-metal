@@ -140,9 +140,9 @@ def repo_dirty():
 
 def code_digest():
     """The engine's files (Python, kernels, recipes, the native module) and this harness, committed or not."""
-    digest = hashlib.sha256()
+    digest, out = hashlib.sha256(), OUT.resolve()
     files = [path for part in ('monolith', 'kernels') for path in sorted((ROOT / part).rglob('*'))
-             if path.is_file() and '__pycache__' not in path.parts]
+             if path.is_file() and '__pycache__' not in path.parts and not path.resolve().is_relative_to(out)]
     for path in files + [Path(__file__).resolve()]:
         digest.update(str(path.relative_to(ROOT)).encode() + b'\0' + path.read_bytes())
     return digest.hexdigest()[:16]
