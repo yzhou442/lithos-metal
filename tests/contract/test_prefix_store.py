@@ -208,6 +208,19 @@ def test_an_entry_evicted_before_its_lease_is_a_miss_not_damage(tmp_path, monkey
     assert path.exists()                                        # the new entry under that name is kept
 
 
+def test_a_second_write_of_one_prefix_keeps_the_first_entry(tmp_path):
+    import fcntl
+    first, second = store(tmp_path), store(tmp_path)
+    tokens, state, buffers = snapshot()
+    path = first.write(tokens, state, buffers)
+    inode = path.stat().st_ino
+    reader = os.open(path, os.O_RDONLY)                         # a third server is reading it
+    fcntl.flock(reader, fcntl.LOCK_SH)
+    assert second.write(tokens, state, buffers) == path         # both passed contains() before either published
+    assert path.stat().st_ino == inode and list(second.tmp.iterdir()) == []
+    os.close(reader)
+
+
 def test_an_entry_is_published_under_the_quota_lock(tmp_path, monkeypatch):
     s = store(tmp_path)
     held, seen = [False], []

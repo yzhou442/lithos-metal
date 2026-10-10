@@ -281,7 +281,12 @@ class PrefixStore:
             os.close(fd)
             fd = None
             with self._dir_lock():        # another server counting the quota sees the partial or the entry
-                os.replace(partial, final)
+                if os.path.lexists(final):
+                    # Another server wrote this prefix meanwhile: the name follows from the identity and the
+                    # tokens, so its entry holds the same state. Replacing it would unlink a file under a read lease.
+                    os.unlink(partial)
+                else:
+                    os.replace(partial, final)
             dir_fd = os.open(self.dir, os.O_RDONLY)
             try:
                 os.fsync(dir_fd)
