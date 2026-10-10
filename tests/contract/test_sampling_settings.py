@@ -66,3 +66,24 @@ def test_a_greedy_session_does_not_take_sampling_settings():
     s, _, _ = sampling_session(GreedySampler(prefix='sampler.'))
     with pytest.raises(ValueError):
         s.set_sampling(0.2, 0, 0.9, 0)
+
+
+def test_set_sampling_waits_for_a_decoder_still_compiling():
+    import threading
+    s, prog, _ = sampling_session(StochasticSampler(0.7, 0, 0.9, 0.0, 42, prefix='sampler.'))
+    late = SimpleNamespace(buffers={'params.D8.sample.11': BufferSpec(len(prog.buffers['params.D8.sample.7'].init),
+                                                                      prog.buffers['params.D8.sample.7'].init, 'params')})
+    started, finish = threading.Event(), threading.Event()
+
+    def map_decoder():                          # a cancelled request's decoder, compiled with the old settings
+        started.set()
+        finish.wait(5)
+        s._programs['late'] = late
+    s._prefetch = (threading.Thread(target=map_decoder), [])
+    s._prefetch[0].start()
+    started.wait(5)
+    threading.Timer(0.05, finish.set).start()
+    s.set_sampling(0.2, 20, 0.95, 7)            # rewrites that program too
+    assert late.buffers['params.D8.sample.11'].init == kernels.sample_params(
+        vocab=1000, t_active=8, n_sg=12, top_k=20, temperature=0.2, top_p=0.95, seed=7)
+

@@ -376,6 +376,7 @@ class Session:
         from . import kernels
         if temperature <= 0 or not isinstance(getattr(self.model, "sampler", None), StochasticSampler):
             raise ValueError("set_sampling: only a sampling session takes other sampling settings")
+        self._settle(raise_error=False)     # a decoder still compiling in the background adds programs and engines
         settings = (float(temperature), int(top_k), float(top_p), int(seed))
         if getattr(self, "_sampling", None) == settings:
             return
