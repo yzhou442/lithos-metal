@@ -445,7 +445,7 @@ def shared_gdn_preparation(program, op, *, sgs=2):
     op.grid, op.threadgroup = ((rows*(2*hk+hv)+sgs-1)//sgs, 1, 1), (32*sgs, 1, 1)
 
 
-def device_attention_tiles(program, *, qm=32, kn=128, ks=None):
+def device_attention_tiles(program, *, qm=32, kn=128, ks=None, score_bf16=False):
     """Use larger prompt attention tiles after separate Q/K normalization.
 
     Compact Q by KV head so a matrix view can span both tokens and replicated
@@ -454,10 +454,12 @@ def device_attention_tiles(program, *, qm=32, kn=128, ks=None):
     This transformation applies only to isolated, prepared target attention.
     ``ks`` splits each ``kn``-key score tile into blocks with their own softmax
     and value product: the results of ``ks``-key tiles with fewer barriers.
+    ``score_bf16`` stores the scores BF16-rounded (their first step) and overwrites them with the probabilities in
+    place: the same values in a third of the threadgroup memory.
     """
     ks = ks or kn
     if (qm <= 0 or kn <= 0 or ks <= 0 or kn % ks or ks % 32
-            or qm*kn*6+qm*8*(kn//ks)+qm*8 > 32768):
+            or qm*kn*(2 if score_bf16 else 6)+qm*8*(kn//ks)+qm*8 > 32768):
         raise ValueError('prefill attention tile exceeds threadgroup scratch')
     cores = [op for op in program.ops if program.kernels[op.kernel].function == 'gqa_decode_mma']
     preparations = [op for op in program.ops if program.kernels[op.kernel].function == 'gqa_prepare_mma']
@@ -490,6 +492,8 @@ def device_attention_tiles(program, *, qm=32, kn=128, ks=None):
         elif k.function=='gqa_decode_mma':
             k.source=k.source[:k.source.index('// Matrix-accelerator attention:')]+template('gqa_prefill.metal')+'\n#endif\n'
             k.macros.update(QM=str(qm),KN=str(kn),KS=str(ks))
+            if score_bf16:
+                k.macros['SCORE_BF16']='1'
             op.meta['prefill_device_tiles']=[qm,kn,ks]
         if k.function in ('gqa_prepare_mma','gqa_decode_mma'):
             for macro in k.macros:

@@ -11,6 +11,9 @@ using PrefillProb = tensor<threadgroup bfloat, dextents<int, 2>, tensor_inline>;
 #ifndef KS
 #define KS KN
 #endif
+#ifndef SCORE_BF16
+#define SCORE_BF16 0                 // 1: the scores' first step is BF16 rounding, so store them as BF16 and overwrite them
+#endif                               // with the probabilities in place: a third of the threadgroup memory, same values
 constexpr constant auto prefill_score = matmul2d_descriptor(QM, KN, D, false, true, false, matmul2d_descriptor::mode::multiply_accumulate);
 constexpr constant auto prefill_value = matmul2d_descriptor(QM, D, KS, false, false, false, matmul2d_descriptor::mode::multiply_accumulate);
 
@@ -18,7 +21,11 @@ kernel void gqa_decode_mma(device bfloat* q [[buffer(0)]], device bfloat* k [[bu
     device float* part_o [[buffer(7)]], device float* part_md [[buffer(8)]], constant GqaParams& p [[buffer(9)]],
     device const StepState* st [[buffer(15)]], uint group [[threadgroup_position_in_grid]],
     uint lane [[thread_index_in_simdgroup]], uint sg [[simdgroup_index_in_threadgroup]]) {
+#if SCORE_BF16
+  threadgroup float carry[2*QM*(KN/KS)], md[2*QM];
+#else
   threadgroup float score[QM*KN], carry[2*QM*(KN/KS)], md[2*QM];
+#endif
   threadgroup bfloat prob[QM*KN];
   if(st->done || st->t_this_step==0u) return;
   const uint T=st->t_this_step,pos=st->position,ctx=pos+T;
@@ -28,7 +35,9 @@ kernel void gqa_decode_mma(device bfloat* q [[buffer(0)]], device bfloat* k [[bu
   PrefillQKV kt(k,dextents<int,2>(p.kv_heads*D,p.ctx_max));
   PrefillQKV vt(v,dextents<int,2>(p.kv_heads*D,p.ctx_max));
   PrefillProb pt(prob,dextents<int,2>(KN,QM));
+#if !SCORE_BF16
   PrefillScore sc(score,dextents<int,2>(KN,QM));
+#endif
   for(uint task=group;task<p.kv_heads*chunks*groups;task+=p.n_sg) {
     const uint h=task/(chunks*groups),chunk=(task/groups)%chunks,r0=(task%groups)*QM;
     PrefillQKV qt(q+(ulong)h*p.rows_max*D,dextents<int,2>(D,p.rows_max));
@@ -45,7 +54,14 @@ kernel void gqa_decode_mma(device bfloat* q [[buffer(0)]], device bfloat* k [[bu
       auto scores=score_op.get_destination_cooperative_tensor<decltype(a),decltype(b),float>();
       for(uint16_t i=0;i<scores.get_capacity();i++) if(scores.is_valid_element(i)) scores[i]=0;
       score_op.run(a,b,scores);
+#if SCORE_BF16
+      for(uint16_t i=0;i<scores.get_capacity();i++) if(scores.is_valid_element(i)) {
+        auto x=scores.get_multidimensional_index(i);
+        prob[x[1]*KN+x[0]]=bfloat(scores[i]);                 // round to nearest even, as round_bf16
+      }
+#else
       scores.store(sc);
+#endif
       threadgroup_barrier(mem_flags::mem_threadgroup);
       for(uint r=sg;r<QM;r+=MMA_SG) {
         const uint row=r0+r,t=row/rep;
@@ -53,7 +69,11 @@ kernel void gqa_decode_mma(device bfloat* q [[buffer(0)]], device bfloat* k [[bu
           float values[KS/32],m=-INFINITY;
           for(uint u=0;u<KS/32;u++) {
             const uint key=key0+s*KS+lane+32*u;
+#if SCORE_BF16
+            values[u]=row<rows && key<ctx && key<=pos+t ? round_bf16(float(prob[r*KN+s*KS+lane+32*u])*p.scaling) : -INFINITY;
+#else
             values[u]=row<rows && key<ctx && key<=pos+t ? round_bf16(round_bf16(score[r*KN+s*KS+lane+32*u])*p.scaling) : -INFINITY;
+#endif
             m=max(m,values[u]);
           }
           m=simd_max(m);float den=0;

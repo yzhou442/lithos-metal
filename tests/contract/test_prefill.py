@@ -253,6 +253,10 @@ def test_prefill_attention_splits_score_tiles_into_softmax_blocks():
     for kw in (dict(kn=128, ks=48), dict(kn=128, ks=16), dict(qm=64, kn=128, ks=32)):
         with pytest.raises(ValueError, match='threadgroup scratch'):
             device_attention_tiles(_attention_pair(), **kw)
+    # BF16 scores overwritten by the probabilities: a third of the scratch, so 64-query tiles fit
+    p = device_attention_tiles(_attention_pair(), qm=64, kn=128, ks=32, score_bf16=True)
+    assert p.kernels['core'].macros['SCORE_BF16'] == '1'
+    assert 'SCORE_BF16' not in device_attention_tiles(_attention_pair(), qm=16, kn=128, ks=32).kernels['core'].macros
 
 
 def test_projection_geometry_two_token_blocks_halve_the_token_planes():

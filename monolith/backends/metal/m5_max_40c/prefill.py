@@ -67,7 +67,7 @@ def optimize(program, exact=False):
         part = specialize_attention(part, sgs, True, 64)
         if rows == 512 and exact:
             # 16-query tiles, 128-key scores, softmax and value products per 32-key block.
-            device_attention_tiles(part, qm=16, kn=128, ks=32)
+            device_attention_tiles(part, qm=16, kn=128, ks=32, score_bf16=True)
         elif rows == 512:
             device_attention_tiles(part, kn=128)
         compact_partials(part)
