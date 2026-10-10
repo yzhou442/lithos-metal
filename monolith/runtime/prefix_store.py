@@ -355,10 +355,14 @@ class PrefixStore:
             return fd
 
     def _make_room(self, nbytes, keep):
-        """With the directory lock held: unlink this store's least recently used entries (never a pinned one, another
-        process's directory or a partial write) until ``nbytes`` more fit the quota."""
+        """With the directory lock held: remove what dead processes left, then unlink this store's least recently used
+        entries (never a pinned one, another process's directory or a partial write) until ``nbytes`` more fit."""
         entries = self._entries()
         used = sum(size for _, size, _, _ in entries)
+        if used + nbytes > self.max_bytes:
+            self._remove_stale()                  # a process that died after this store started still holds quota
+            entries = self._entries()
+            used = sum(size for _, size, _, _ in entries)
         with self._mutex:
             pinned = set(self._pinned) | {keep}
         for path, size, _, own in sorted(entries, key=lambda e: e[2]):

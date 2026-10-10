@@ -81,6 +81,21 @@ def test_a_dead_process_leaves_no_partial_or_run_directory(tmp_path):
     assert s.dir.exists()                                      # the live process keeps its directory
 
 
+def test_a_process_that_died_after_this_store_started_frees_its_quota(tmp_path):
+    s = store(tmp_path)
+    a = s.write((1, 2), b's' * 16, {'k': b'a' * 100})
+    size = a.stat().st_size
+    s.max_bytes = 2 * size                                     # room for two entries
+    dead = 2 ** 22 + 12345
+    stale = s.root / f'run-{dead}-abcd'                        # a peer that crashed after this store started
+    stale.mkdir(mode=0o700)
+    (stale / f'x{SUFFIX}').write_bytes(b'o' * size)
+    (s.tmp / f'{dead}-0000-1.partial').write_bytes(b'half')
+    assert s.write((3, 4), b's' * 16, {'k': b'b' * 100}) is not None
+    assert not stale.exists() and a.exists() and s.stats['evictions'] == 0    # its files went, not this store's
+    assert list(s.tmp.iterdir()) == []
+
+
 @pytest.mark.parametrize('damage', ['flip', 'truncate', 'magic', 'header'])
 def test_corrupt_entries_are_misses_and_removed(tmp_path, damage):
     s = store(tmp_path, persist=True)
