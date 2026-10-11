@@ -11,7 +11,21 @@
 namespace monolith {
 
 struct DeviceImpl { id<MTLDevice> dev; };
-struct BufferImpl { id<MTLBuffer> buf; void* mapped = nullptr; size_t mapped_len = 0; };
+struct BufferImpl { id<MTLBuffer> buf; void* mapped = nullptr; size_t mapped_len = 0; bool resident = false; };
+
+// One residency set for every buffer a Runner binds, kept while the buffer lives: buffers that several programs
+// bind (the prompt graph and the decoder share weights) stay resident when the programs change, and no command
+// buffer declares them again. LITHOS_RESIDENCY_SET=0 declares each program's buffers per command buffer instead.
+static std::mutex residency_mu;
+static id<MTLResidencySet> residency_set = nil;
+static bool residency_enabled() { const char* v = getenv("LITHOS_RESIDENCY_SET"); return !v || v[0] != '0'; }
+static void residency_release(BufferImpl& b) {
+  if (!b.resident) return;
+  std::lock_guard<std::mutex> lk(residency_mu);
+  [residency_set removeAllocation:b.buf];
+  [residency_set commit];
+  b.resident = false;
+}
 struct LibraryImpl { id<MTLLibrary> lib; id<MTLDevice> dev; };
 struct PipelineImpl { id<MTLComputePipelineState> pso; };
 struct QueueImpl { id<MTLCommandQueue> q; };
@@ -69,7 +83,11 @@ Buffer::Buffer(const Device& d, const std::string& path, uint64_t offset, size_t
   if (!impl->buf) { munmap(p, nbytes); throw std::runtime_error("newBufferWithBytesNoCopy failed"); }
 }
 
-Buffer::~Buffer() { if (impl && impl.use_count() == 1 && impl->mapped) { impl->buf = nil; munmap(impl->mapped, impl->mapped_len); } }
+Buffer::~Buffer() {
+  if (!impl || impl.use_count() != 1) return;
+  residency_release(*impl);
+  if (impl->mapped) { impl->buf = nil; munmap(impl->mapped, impl->mapped_len); }
+}
 size_t Buffer::nbytes() const { return impl->buf.length; }
 void* Buffer::contents() const { return impl->buf.contents; }
 uint64_t Buffer::gpu_address() const { return impl->buf.gpuAddress; }
@@ -244,6 +262,8 @@ struct RunnerImpl {
   id<MTLBuffer> ring; uint32_t cap;
   uint32_t tail = 0;                       // next ring slot the host reads
   std::vector<int32_t> tokens; std::mutex mu;
+  bool resident = false;                   // the queue carries residency_set (replaces useResource)
+  ~RunnerImpl() { if (resident) [q removeResidencySet:residency_set]; }
 };
 
 Runner::Runner(const Device& d, const Icb& icb, const std::vector<Dispatch>& ops, std::vector<const Buffer*> resources,
@@ -256,6 +276,22 @@ Runner::Runner(const Device& d, const Icb& icb, const std::vector<Dispatch>& ops
     impl->resources.push_back(r->impl->buf);
     bool read_only = std::find(read_only_resources.begin(), read_only_resources.end(), r) != read_only_resources.end();
     impl->resource_usage.push_back(read_only ? MTLResourceUsageRead : (MTLResourceUsageRead | MTLResourceUsageWrite));
+  }
+  if (residency_enabled()) {
+    std::lock_guard<std::mutex> lk(residency_mu);
+    if (!residency_set) {
+      MTLResidencySetDescriptor* rd = [MTLResidencySetDescriptor new];
+      rd.initialCapacity = 1024;
+      NSError* err = nil;
+      residency_set = [impl->dev newResidencySetWithDescriptor:rd error:&err];
+      if (!residency_set) throw std::runtime_error(std::string("newResidencySet failed: ") + (err ? [err.localizedDescription UTF8String] : "?"));
+    }
+    bool added = false;
+    for (auto* r : resources)
+      if (!r->impl->resident) { [residency_set addAllocation:r->impl->buf]; r->impl->resident = true; added = true; }
+    if (added) { [residency_set commit]; [residency_set requestResidency]; }
+    [impl->q addResidencySet:residency_set];
+    impl->resident = true;
   }
   impl->state = step_state.impl->buf; impl->done_off = done_offset; impl->head_off = ring_head_offset; impl->tail_off = ring_tail_offset;
   impl->tail = *(volatile uint32_t*)((char*)impl->state.contents + impl->tail_off);   // resume where a previous runner over the same StepState/ring stopped
@@ -322,7 +358,8 @@ RunnerStats Runner::run(uint32_t max_steps, uint32_t steps_per_cb, uint32_t in_f
             [en dispatchThreadgroups:MTLSizeMake(d.grid[0], d.grid[1], d.grid[2]) threadsPerThreadgroup:MTLSizeMake(d.threadgroup[0], d.threadgroup[1], d.threadgroup[2])];
           }
       } else {
-        for (size_t i = 0; i < r.resources.size(); i++) [en useResource:r.resources[i] usage:r.resource_usage[i]];
+        if (!r.resident)
+          for (size_t i = 0; i < r.resources.size(); i++) [en useResource:r.resources[i] usage:r.resource_usage[i]];
         for (uint32_t s = 0; s < n; s++) [en executeCommandsInBuffer:r.icb->icb withRange:NSMakeRange(0, r.icb->count)];
       }
       [en endEncoding];

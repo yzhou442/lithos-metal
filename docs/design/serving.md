@@ -61,14 +61,31 @@ Context and chunk sizes are separate controls: a larger chunk increases temporar
 extending context capacity.
 
 Exact mode preserves the reduction orders of the 128-row reference graph. On the 40-core M5 Max, it uses
-32-key attention blocks and projections that read the decoder's packed weights in the prefill kernel's
-arithmetic order. Compatible prefill and decoder programs share those mappings and remain allocated together
-when they fit the Metal working set. Requests with a one-row reference chunk that needs the reference graph's
-projection path fall back to 128-row chunking. A plain `N` retains that chunk size's own reduction orders.
+32-key attention softmax and value blocks inside 128-key score tiles (the scores kept BF16-rounded, their
+first step, and overwritten by the probabilities in place), and projections that read the decoder's
+packed weights in the prefill kernel's arithmetic order. A chunk shorter than the program's rows spreads its
+weight tiles over the idle token planes. The MLP input projection decodes and multiplies each 128-column
+weight tile in two 64-column halves, each FP8 projection's threadgroup decodes a 32-row weight tile once into
+threadgroup memory for four 32-token blocks, and the GDN recurrence sums four state columns in one transposed
+butterfly in `simd_sum`'s order; `matmul2d` accumulates K in order, so all of these keep every result bit for
+bit. Compatible prefill and decoder programs share those mappings and remain allocated together when they fit
+the Metal working set. Requests with a one-row reference chunk that needs the reference graph's projection path
+fall back to 128-row chunking. A plain `N` retains that chunk size's own reduction orders.
 
 With a compatible fixed-verification recipe, short prompts and cached tails can reuse the resident decoder.
 The limit is one chunk, capped at 128 tokens in exact mode. Longer prompts hand their final rows to the decoder
 before output streaming begins.
+
+Switching sessions (another recipe bucket or other sampling settings) hands the previous session's KV caches,
+states, scratch and identical weight mappings to the new one instead of allocating and clearing them again.
+
+Buffers stay in one Metal residency set while they are allocated, so switching between the prompt and decode
+programs does not declare them again per command buffer (`LITHOS_RESIDENCY_SET=0` restores the declarations).
+
+After about two idle seconds, the first command buffer of a large program waits roughly 0.2 s before it starts.
+For `--keep-warm` seconds after each request (default 120, `0` disables), the server replays the loaded programs
+once a second with every kernel returning at its first instruction (about 15 ms of GPU time), so the next request
+starts at once.
 
 ## Prefix caching and memory ownership
 

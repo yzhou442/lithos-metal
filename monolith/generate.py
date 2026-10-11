@@ -14,6 +14,7 @@ import argparse
 import json
 import os
 import sys
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -146,6 +147,7 @@ class Session:
         elif q and drafter is not None:
             raise ValueError("draft_sampling='sample' needs a drafter that can sample its drafts")
         # temperature 0 = greedy (the argmax path); otherwise the Gumbel-max sampler with the thresholds
+        self._sampling = (float(temperature), int(top_k), float(top_p), int(seed)) if temperature > 0 else None
         model.sampler = GreedySampler(prefix="sampler.") if temperature <= 0 else StochasticSampler(temperature, top_k, top_p, min_p, seed, prefix="sampler.",
                                                                                                      topp_in_topk=q)
         self.engines: Dict[Any, Any] = {}
@@ -169,6 +171,7 @@ class Session:
                 budget = min(4 * 1024**3, info.recommended_working_set // 8)
             self.prefix_cache = PrefixCache(entries, max_bytes=budget, min_tokens=prefix_cache_min_tokens)
         self._last_engine = None
+        self._prefetch = None                                  # (thread, error) mapping the decoder during a prompt
         self.buffers: Optional[Dict[str, Any]] = None
         self.tuner = None
         if autotune:
@@ -183,6 +186,11 @@ class Session:
         if self.drafter is not None and t != 0:
             raise ValueError("Session: a speculative session decodes with engine(0)")
         return self._engine(t, self.decode_t_max if t == 0 else t, dynamic=(t == 0))
+
+    @property
+    def resident_rows(self) -> int:
+        """The longest prompt (past a cached prefix) a verification graph that can ingest prompt rows takes itself."""
+        return self.EXACT_ROWS if self.prefill_exact else self.prefill_chunk_size
 
     def prefill_engine(self, prompt_tokens: Optional[int] = None, rows: Optional[int] = None):
         """A separate graph/ICB for prompt chunks; short prompts use a smaller bucket."""
@@ -245,13 +253,69 @@ class Session:
             op.bindings = [(slot, renames.get(n, n), off) for slot, n, off in op.bindings]
         return prog
 
+    def touch(self) -> None:
+        """Replay each loaded program once with StepState.done set: every kernel returns at its first instruction,
+        but the command buffer references the program's buffers. After about two idle seconds the first command
+        buffer of a large program otherwise waits ~0.2 s before it starts; a touch per second keeps that away. The
+        next request's reset() clears ``done``."""
+        for eng in list(self.engines.values()):
+            st = eng.buffers[eng.program.step_state]
+            state = eng.program.layout.unpack(st.read(0, eng.program.layout.size))
+            state['done'] = 1
+            st.write(eng.program.layout.pack(state), 0)
+            eng.run(1, steps_per_cb=1, in_flight=1)
+
+    def _settle(self, *, raise_error=True) -> None:
+        """Wait for a decoder mapped in the background; re-raise its failure for the request that needs it."""
+        prefetch, self._prefetch = getattr(self, '_prefetch', None), None
+        if prefetch is not None:
+            prefetch[0].join()
+            if prefetch[1] and raise_error:
+                raise prefetch[1][0]
+
     def release_engines(self, keep_state_from=None):
         """Release GPU allocations, retaining CPU programs and executable pipelines."""
+        self._settle(raise_error=False)
         self.buffers = ({n: b for n, b in keep_state_from.buffers.items()
                          if keep_state_from.program.buffers[n].role in ('state', 'step_state', 'ring')
                          or n in ('accept_log', 'conf_log')} if keep_state_from is not None else None)
         self.engines.clear()
         self._last_engine = None
+
+    def adopt_buffers(self, other: "Session") -> None:
+        """Take over another session's allocations of the same states, scratch and weight windows.
+
+        Sessions of one model differ in recipe or sampling, not in capacity, so same-named states have the same
+        sizes. Reusing them skips allocating and zero-filling several GB and their first residency. As reset() does
+        for a new request, every adopted state except the KV caches (rows are written before they are read) is
+        cleared. Call before ``other`` releases its engines; this session must not hold allocations yet. A new
+        session compiles its decoder program first (its first request needs it) to learn the buffers it binds."""
+        other._settle(raise_error=False)        # a decoder still mapping in the background adds to other.buffers
+        if self.buffers is not None or not other.buffers:
+            return
+        if not self._programs:
+            key = 0 if self.drafter is not None else 1
+            self._programs[key] = self._compile(self.decode_t_max if key == 0 else 1, dynamic=key == 0, prefill=False)
+        mine = {name: spec for prog in self._programs.values() for name, spec in prog.buffers.items()}
+        theirs = {name: spec for prog in other._programs.values() for name, spec in prog.buffers.items()}
+
+        def window(spec):
+            return (os.path.realpath(spec.file), spec.file_offset, spec.nbytes, spec.init) if spec.file else None
+        adopted = {}
+        for name, buf in other.buffers.items():
+            spec, old = mine.get(name), theirs.get(name)
+            if spec is None or old is None or spec.role != old.role:
+                continue
+            if spec.role in ('state', 'step_state', 'ring') and buf.nbytes == spec.nbytes:
+                if name not in self._kv_buffers:
+                    buf.fill(0)
+                adopted[name] = buf
+            elif spec.role == 'arena' and spec.init is None and buf.nbytes >= spec.nbytes:
+                adopted[name] = buf
+            elif spec.role == 'weights' and window(spec) is not None and window(spec) == window(old):
+                adopted[name] = buf
+        if adopted:
+            self.buffers = adopted
 
     def _engine(self, key, bound: int, *, dynamic: bool, prefill: bool = False):
         from .runtime import Engine
@@ -310,6 +374,39 @@ class Session:
             place_barriers(prog, self.barriers)
         return prog
 
+    def set_sampling(self, temperature: float, top_k: int, top_p: float, seed: int) -> None:
+        """Sample with other settings without compiling: rewrite the samplers' parameter records (``sample`` and a
+        sampling drafter's ``draft_q``) in every compiled program and live engine. The session must already sample
+        (greedy and sampling programs differ); its StepState takes the seed at the next request."""
+        from . import kernels
+        if temperature <= 0 or not isinstance(getattr(self.model, "sampler", None), StochasticSampler):
+            raise ValueError("set_sampling: only a sampling session takes other sampling settings")
+        self._settle(raise_error=False)     # a decoder still compiling in the background adds programs and engines
+        settings = (float(temperature), int(top_k), float(top_p), int(seed))
+        if getattr(self, "_sampling", None) == settings:
+            return
+        for prog in self._programs.values():
+            for name, spec in prog.buffers.items():
+                kind = name.split(".")[2] if spec.role == "params" and name.count(".") >= 3 else None
+                if kind == "sample":
+                    spec.init = kernels.resample_params(spec.init, temperature=temperature, top_k=top_k, top_p=top_p, seed=seed)
+                elif kind == "draft_q":
+                    # Only its temperature changes: step programs draw from StepState's generator (the request's
+                    # seed), and the record keeps the seed it was compiled with, as a fresh compile emits it.
+                    compiled = int.from_bytes(spec.init[32:40], "little")
+                    spec.init = kernels.resample_params(spec.init, temperature=temperature, seed=compiled)
+                else:
+                    continue
+                for eng in self.engines.values():
+                    if eng.program is prog and name in eng.buffers:
+                        eng.buffers[name].write(spec.init, 0)
+        sampler = self.model.sampler
+        sampler.temperature, sampler.top_k, sampler.top_p, sampler.seed = settings
+        if getattr(self.drafter, "sampling", None):
+            self.drafter.sampling = float(temperature)
+        self.seed = int(seed)
+        self._sampling = settings
+
     def reset(self, *, preserve_kv: bool = False) -> None:
         """Zero the states, StepState and ring for a new sequence (the weights stay mapped)."""
         for eng in self.engines.values():
@@ -327,6 +424,7 @@ class Session:
         p = len(prompt_ids)
         if p < 1:
             raise ValueError("the prompt must have at least one token")
+        self._settle(raise_error=False)
         self._setup_ms = 0.0
         cache = getattr(self, 'prefix_cache', None)
         cached = cache.match(prompt_ids) if cache is not None else None
@@ -337,7 +435,7 @@ class Session:
         # ICB resident for short prompts/tails instead of remapping both packs.
         can_ingest = (self.decoder_kernel_config is not None and self.drafter is not None
                       and self.verify == 'fixed' and (self.verify_length or 0) >= 1)
-        resident_prefill = can_ingest and p - offset <= (self.EXACT_ROWS if self.prefill_exact else self.prefill_chunk_size)
+        resident_prefill = can_ingest and p - offset <= self.resident_rows
         t_max = self.decode_t_max if resident_prefill else self.prefill_chunk_size
         # Split at the stable message prefix and just before the prompt tail.
         # Intermediate passes do not sample or draft; their state can be reused
@@ -402,6 +500,18 @@ class Session:
             cache.restore(cached, pre)
             checkpoint_ms += (time.perf_counter() - checkpoint_started) * 1000
         initial_step = int(self.layout.unpack(st.read(0, self.layout.size))['step'])
+        if can_ingest and not resident_prefill and keep and 0 not in self.engines and len(chunks) > 1:
+            # Map the decoder while the GPU runs the prompt chunks (Runner.run releases the GIL). After a session
+            # switch its weight windows can differ from the prompt graph's: hundreds of ms of host-side mapping.
+            errors = []
+
+            def map_decoder():
+                try:
+                    self.engine(0)
+                except BaseException as exc:
+                    errors.append(exc)
+            self._prefetch = (threading.Thread(target=map_decoder, name='map-decoder', daemon=True), errors)
+            self._prefetch[0].start()
         prefill_ms = prefill_wall_ms = 0.0
         prefill_timings = []
         tokens: List[int] = []
@@ -411,6 +521,7 @@ class Session:
             if can_ingest and not resident_prefill and k == len(chunks) - 1:
                 if not keep:
                     self.release_engines(keep_state_from=pre)
+                self._settle()
                 del pre
                 pre = self.engine(0)
                 self._last_engine = pre

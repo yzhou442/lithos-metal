@@ -76,12 +76,13 @@ def test_busy_and_failed_requests_release_lock():
 def test_template_sampling_context_and_stop(monkeypatch, eos):
     from monolith import generate
 
-    calls, prompts, decoded = [], [], []
+    calls, prompts, decoded, settings = [], [], [], []
     tokens = [10, 11, 99]
 
     def load(*args, **kwargs):
         calls.append(kwargs)
-        return SimpleNamespace(eos=eos, generate=lambda ids, n: SimpleNamespace(tokens=tokens[:n]))
+        return SimpleNamespace(eos=eos, generate=lambda ids, n: SimpleNamespace(tokens=tokens[:n]),
+                               set_sampling=lambda *values: settings.append(values))
 
     def decode(ids, **kwargs):
         decoded.append(ids)
@@ -114,13 +115,14 @@ def test_template_sampling_context_and_stop(monkeypatch, eos):
     assert response.json()["choices"][0]["finish_reason"] == "length"
     assert calls[-1]["temperature"] == 0.7 and calls[-1]["top_p"] == 0.9 and calls[-1]["seed"] == 42
     assert len(calls) == 2 and calls[-1]["top_k"] == 0
-    for _ in range(2):                                                  # top_k is part of the session key
-        client.post("/v1/chat/completions", json=payload(max_tokens=2, temperature=0.7, top_p=0.9, top_k=20, seed=42))
-    assert len(calls) == 3 and calls[-1]["top_k"] == 20
+    for _ in range(2):                          # other sampling settings reuse the sampling session's programs
+        client.post("/v1/chat/completions", json=payload(max_tokens=2, temperature=0.5, top_p=0.9, top_k=20, seed=7))
+    assert len(calls) == 2 and settings[-1] == (0.5, 20, 0.9, 7)
+    assert settings[0] == (0.7, 0, 0.9, 42)
     response = client.post("/v1/chat/completions", json=payload(max_tokens=7))
     assert response.status_code == 400
     assert response.json()["error"]["code"] == "context_length_exceeded"
-    assert len(calls) == 3
+    assert len(calls) == 2
     parts = [{"type": "text", "text": "a"}, {"type": "text", "text": "b"}]
     client.post("/v1/chat/completions", json=payload(max_tokens=2, messages=[{"role": "user", "content": parts}]))
     assert prompts[-1][0] == [{"role": "user", "content": "ab"}]
@@ -173,3 +175,101 @@ def test_cli_prefill_chunk_is_a_size_an_exact_size_or_the_chips_exact_size():
     for value in ('auto', '0', '0-exact', 'exact', '-exact'):
         with pytest.raises(SystemExit):
             parse('--prefill-chunk-size', value)
+
+
+def _warmup_backend(max_context, seen, chunk=512, exact=True):
+    from monolith.generate import Session
+    backend = Backend.__new__(Backend)
+    backend.assets, backend.max_context = None, max_context
+    backend.select_session = lambda request, context: None
+    session = Session.__new__(Session)
+    session.prefill_chunk_size, session.prefill_exact = chunk, exact and chunk > Session.EXACT_ROWS   # as __init__
+    session.prepare = lambda: None
+    backend.session = session
+    # a template of 10 tokens around one token per word
+    backend.tokenizer = SimpleNamespace(apply_chat_template=lambda messages, **_: [0] * (10 + len(messages[0]['content'].split())))
+    backend.complete = lambda request, **kwargs: seen.append(len(request.messages[0].content.split()))
+    return backend
+
+
+def test_warmup_runs_the_prompt_graph_once():
+    seen = []
+    backend = _warmup_backend(4096, seen)
+    backend.warmup('test-model')
+    # two short requests on the resident decoder, then one longer than any prompt it keeps resident (512-row chunks)
+    assert seen[:2] == [1, 1] and len(seen) == 3 and seen[2] > 512
+    assert backend.last_metrics == {}
+
+
+def test_warmup_cuts_the_long_prompt_to_the_context():
+    # exact chunks: the decoder ingests up to 128 prompt tokens itself
+    for max_context, words in ((600, 589), (130, 119), (129, None), (12, None)):
+        seen = []
+        _warmup_backend(max_context, seen).warmup('test-model')
+        # the prompt's tokens plus its 2-token output budget fit; a context with no room past the decoder's own
+        # ingest skips the long prompt
+        assert seen == [1, 1] + ([words] if words else [])
+
+
+def test_warmup_drops_its_long_prompts_checkpoint():
+    seen = []
+    backend = _warmup_backend(4096, seen)
+    shared = object()
+    backend.session.prefix_cache = SimpleNamespace(items=[shared])
+    complete = backend.complete
+
+    def checkpointing(request, **kwargs):
+        complete(request, **kwargs)
+        if len(request.messages[0].content.split()) > 1:          # generate() checkpoints a prompt past the cache's minimum
+            backend.session.prefix_cache.items.append(object())
+    backend.complete = checkpointing
+    backend.warmup('test-model')
+    assert len(seen) == 3 and backend.session.prefix_cache.items == [shared]
+
+
+def test_warmup_prompt_outgrows_a_plain_chunk():
+    seen = []
+    _warmup_backend(8192, seen, chunk=2048, exact=False).warmup('test-model')
+    assert seen == [1, 1, 2112]          # 2122 tokens: past the 2048 the decoder would ingest itself
+    seen = []
+    _warmup_backend(100, seen, chunk=32, exact=True).warmup('test-model')
+    assert seen == [1, 1, 89]            # 32-exact is plain 32-row chunks: 99 tokens are past what the decoder takes
+
+
+def test_keep_warm_touches_idle_programs_only_within_its_window(monkeypatch):
+    import monolith.serve as serve
+    touches, naps = [], []
+    backend = Backend.__new__(Backend)
+    backend.session = SimpleNamespace(touch=lambda: touches.append(True))
+    clock = {'now': 100.0}
+    monkeypatch.setattr(serve.time, 'monotonic', lambda: clock['now'])
+    steps = iter([
+        lambda: None,                                      # 1 s after the request: touch
+        lambda: backend._gpu().acquire(),                  # a generation holds the GPU: skip
+        lambda: (backend._gpu().release(), clock.update(now=150.0)),   # outside the window: skip
+    ])
+    def sleep(seconds):
+        naps.append(seconds)
+        step = next(steps, None)
+        if step is None:
+            raise SystemExit                               # end the daemon loop
+        step()
+    monkeypatch.setattr(serve.time, 'sleep', sleep)
+    started = []
+    monkeypatch.setattr(serve.threading, 'Thread', lambda target, **kwargs: SimpleNamespace(start=lambda: started.append(target)))
+    backend.last_active = 99.0
+    backend.keep_warm(30)
+    with pytest.raises(SystemExit):
+        started[0]()
+    assert touches == [True] and naps == [1.0] * 4
+    assert backend._gpu().acquire(blocking=False)
+
+
+def test_complete_records_activity_and_serializes_on_the_gpu_lock(monkeypatch):
+    import monolith.serve as serve
+    backend = Backend.__new__(Backend)
+    monkeypatch.setattr(serve.time, 'monotonic', lambda: 42.0)
+    held = []
+    backend._complete = lambda request, **options: held.append(not backend._gpu().acquire(blocking=False)) or 'done'
+    assert backend.complete(object()) == 'done' and held == [True]
+    assert backend.last_active == 42.0 and backend._gpu().acquire(blocking=False)

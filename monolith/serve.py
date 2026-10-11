@@ -29,6 +29,7 @@ class Backend:
     """One cached session; sampling changes rebuild its compiled programs, never duplicate model residency."""
 
     prefill_exact = False
+    last_active = 0.0                # monotonic time a generation last finished (keep_warm's window)
 
     def __init__(self, model_dir, pack_dir, max_context=4096, prefill_chunk_size=128, *, assets=None, prefill_exact=False):
         from transformers import AutoTokenizer
@@ -61,6 +62,26 @@ class Backend:
         # incremental text path that the first real streaming request uses.
         for _ in range(2):
             self.complete(request, on_text=lambda text: None)
+        # Short prompts run on the resident decoder. Run the prompt graph once as well, so the first long request
+        # does not wait for its allocations and their residency: a prompt past what the decoder ingests itself, cut to
+        # fit the context (none if the context cannot hold one).
+        resident = self.session.resident_rows
+        words = max(700, resident + 64)
+        while words > 0:
+            prompt = ChatRequest(model=model_name, messages=[Message(role='user', content=' '.join(['Hello'] * words))],
+                                 max_tokens=2)
+            ids = self.tokenizer.apply_chat_template(prompt.template_inputs()[0], tokenize=True, return_dict=False,
+                                                     add_generation_prompt=True, enable_thinking=False)
+            if len(ids) < self.max_context:          # the prompt and its 2-token output budget fit
+                if len(ids) > resident:
+                    kept = list(getattr(getattr(self.session, 'prefix_cache', None), 'items', ()))
+                    self.complete(prompt, on_text=lambda text: None)
+                    # Its checkpoint is a prompt no request shares: drop it rather than hold (or persist) its state.
+                    cache = getattr(self.session, 'prefix_cache', None)
+                    if cache is not None:
+                        cache.items = [item for item in cache.items if any(item is k for k in kept)]
+                break
+            words -= len(ids) - self.max_context + 1
         self.last_metrics = {}
 
     def select_session(self, request, prompt_tokens):
@@ -68,8 +89,13 @@ class Backend:
 
         assets = getattr(self, 'assets', None)
         recipe_key, options = assets.options(prompt_tokens) if assets else (None, {'max_context': self.max_context})
-        sampling = (request.temperature, request.top_p, request.top_k, request.seed, recipe_key)
+        # Greedy and sampling programs differ; one sampling program serves every temperature, top-k, top-p and seed
+        # (Session.set_sampling rewrites its parameter records), so compiling it is paid once per recipe.
+        sampling = (request.temperature > 0, recipe_key)
+        settings = (request.temperature, request.top_k, request.top_p, request.seed)
         if self.session is not None and sampling == self.sampling:
+            if request.temperature > 0 and hasattr(self.session, 'set_sampling'):
+                self.session.set_sampling(*settings)
             return
         # Keep CPU programs for a bounded number of recipe/sampling variants.
         # Only the selected session retains GPU buffers; all share executable
@@ -77,11 +103,11 @@ class Backend:
         sessions = getattr(self, '_sessions', {})
         self._sessions = sessions
         prefix_cache = getattr(self.session, 'prefix_cache', None)
-        if self.session is not None:
-            if hasattr(self.session, '_pipelines'):
-                options.update(device=self.session.dev, pipeline_cache=self.session._pipelines)
-                self.session.release_engines()
-            sessions[self.sampling] = self.session
+        previous = self.session
+        if previous is not None:
+            if hasattr(previous, '_pipelines'):
+                options.update(device=previous.dev, pipeline_cache=previous._pipelines)
+            sessions[self.sampling] = previous
         self.session = sessions.pop(sampling, None)
         if self.session is None:
             self.session = load_session(self.model_dir, self.pack_dir, **options,
@@ -90,14 +116,53 @@ class Backend:
                 # exact chunks follow the 128-row chunking, its reusable prefixes included
                 prefix_cache_min_tokens=min(self.prefill_chunk_size, 128) if self.prefill_exact else self.prefill_chunk_size,
                 prefill_exact=self.prefill_exact)
+        if previous is not None and hasattr(previous, '_pipelines'):
+            # The new session reuses the previous one's state allocations; only the selected session keeps GPU buffers.
+            if hasattr(self.session, 'adopt_buffers'):
+                self.session.adopt_buffers(previous)
+            previous.release_engines()
         if prefix_cache is not None:
             self.session.prefix_cache = prefix_cache
+        if request.temperature > 0 and hasattr(self.session, 'set_sampling'):
+            self.session.set_sampling(*settings)
         while len(sessions) > 8:
             sessions.pop(next(iter(sessions)))
         self.sampling = sampling
 
-    def complete(self, request, *, on_text=None, on_content=None, on_start=None, cancelled=None, on_progress=None):
+    def _gpu(self):
+        """The lock between generations and keep_warm's touches of the loaded programs."""
+        return self.__dict__.get('gpu_lock') or self.__dict__.setdefault('gpu_lock', threading.Lock())
+
+    def complete(self, request, **options):
         """on_progress(content, completion_tokens) pairs each content snapshot with the committed output count."""
+        with self._gpu():
+            try:
+                return self._complete(request, **options)
+            finally:
+                self.last_active = time.monotonic()
+
+    def keep_warm(self, seconds, interval=1.0):
+        """For ``seconds`` after each generation, touch the loaded programs every ``interval`` (Session.touch): a
+        request after a short pause then starts at once instead of ~0.2 s later. A request never waits behind more
+        than one touch (~15 ms of GPU time)."""
+        def loop():
+            while True:
+                time.sleep(interval)
+                if self.session is None or time.monotonic() - self.last_active >= seconds:
+                    continue
+                lock = self._gpu()
+                if not lock.acquire(blocking=False):
+                    continue
+                try:
+                    self.session.touch()
+                except Exception:
+                    logging.getLogger(__name__).exception('keep-warm touch failed; disabling it')
+                    return
+                finally:
+                    lock.release()
+        threading.Thread(target=loop, name='keep-warm', daemon=True).start()
+
+    def _complete(self, request, *, on_text=None, on_content=None, on_start=None, cancelled=None, on_progress=None):
         from jinja2 import TemplateError
 
         request_started = time.perf_counter()
@@ -423,6 +488,8 @@ def parse_args(argv=None):
                         help="Prompt tokens per prefill pass. N-exact reproduces the results of 128-token passes bit for bit; "
                              "auto-exact (default) uses the chip's measured size for the model that way, else 128")
     parser.add_argument("--no-warmup", action='store_true', help="Skip startup compilation/warmup; the first request pays this cost")
+    parser.add_argument("--keep-warm", type=float, default=120.0, metavar='SECONDS',
+                        help="Keep the GPU ready for this long after each request (a ~15 ms touch per second); 0 disables")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
     args = parser.parse_args(argv)
@@ -453,6 +520,8 @@ def main(argv=None):
     model_name = args.served_model_name or (assets.model_dir.name if Path(args.model).expanduser().exists() else args.model)
     if not args.no_warmup:
         backend.warmup(model_name)
+    if args.keep_warm > 0:
+        backend.keep_warm(args.keep_warm)
     app = create_app(backend, model_name, api_key)
     logging.getLogger(__name__).info('lithos-metal ready: http://%s:%s — model=%s; DSpark=%s; verification rows=%s',
                                    args.host, args.port, model_name, args.draft or 'disabled', assets.gamma + 1)
