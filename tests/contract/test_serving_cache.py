@@ -166,6 +166,29 @@ def test_hybrid_draft_precision_recipe_is_scoped_to_validated_shape(quantization
     assert recipes(model, draft, quantization) == {}
 
 
+def test_the_affine_4bit_27b_prefills_exact_512_row_chunks():
+    from monolith.backends.metal import get_backend
+    from monolith.backends.metal.m5_max_40c.serving import exact_prefill_rows
+    target = SimpleNamespace(hidden_size=5120, intermediate_size=17408, num_hidden_layers=64, num_attention_heads=24,
+        num_key_value_heads=4, head_dim=256, vocab_size=248320, linear_num_key_heads=16, linear_num_value_heads=48,
+        linear_key_head_dim=128, linear_value_head_dim=128, linear_conv_kernel_dim=4,
+        layer_types=['full_attention' if i % 4 == 3 else 'linear_attention' for i in range(64)])
+
+    def model(*formats):
+        specs = {str(i): SimpleNamespace(format=f, aux=False) for i, f in enumerate(formats)}
+        specs['norm'] = SimpleNamespace(format='bf16', aux=True)
+        return SimpleNamespace(config=target, named_modules=lambda: [('', SimpleNamespace(weight_map=lambda: specs))])
+    backend = get_backend('m5_max_40c')
+    assert exact_prefill_rows(model('int4_affine', 'int4_affine')) == 512
+    assert backend.serving_prefill_chunk({}, model('int4_affine')) == 512
+    assert backend.serving_prefill_chunk({'0': {'target': {}}}) is None   # an empty target recipe tunes nothing
+    assert exact_prefill_rows(model('int4_affine', 'bf16')) is None          # not measured
+    assert exact_prefill_rows(model('nvfp4', 'fp8_e4m3')) is None            # served through its recipes
+    target.num_hidden_layers = 48
+    assert exact_prefill_rows(model('int4_affine')) is None
+    assert backend.serving_prefill_chunk({}) is None
+
+
 def test_prepare_builds_target_and_draft_caches(checkpoint, tmp_path):
     pytest.importorskip('fastapi')
     from monolith.serve import parse_args

@@ -12,16 +12,30 @@ from ....compiler.region_fusion import subprogram
 from ....compiler.prefill import (projection_geometry, device_attention_tiles, packed_nvfp4_projection,
                                  packed_fp8_projection, direct_bf16_projection, decoder_layout, decoder_projection)
 
-# 512-row matrix tiles over the verification graph's packed operands: (output rows, SIMD groups, workers).
-SHARED = {('nvfp4', 34816, 5120): (32, 8, 80), ('nvfp4', 5120, 17408): (32, 8, 80),
-          ('fp8_e4m3', 10240, 5120): (16, 16, 80), ('fp8_e4m3', 5120, 6144): (16, 16, 80),
-          ('fp8_e4m3', 6144, 5120): (16, 16, 40), ('fp8_e4m3', 8192, 5120): (16, 16, 80)}
+# 512-row matrix tiles over the verification graph's packed operands:
+# (output rows, SIMD groups, workers, token blocks per weight-tile fill).
+# SPLIT: shapes whose 128-column tiles are decoded and multiplied in two 64-column halves (same sums; measured
+# for the MLP input projection only: the FP8 projections and the two-block down projection are slower that way).
+SPLIT = {('nvfp4', 34816, 5120)}
+# STAGED: (output rows per tile, SIMD groups = token blocks per threadgroup) for projections whose threadgroups decode
+# each row tile once into threadgroup memory for four 32-token blocks (one threadgroup per tile). Measured for the FP8
+# projections; the NVFP4 MLP is faster with its own tiles above.
+STAGED = {('fp8_e4m3', 10240, 5120): (32, 4), ('fp8_e4m3', 5120, 6144): (32, 4),
+          ('fp8_e4m3', 6144, 5120): (32, 4), ('fp8_e4m3', 8192, 5120): (32, 4)}
+SHARED = {('nvfp4', 34816, 5120): (16, 16, 160, 1), ('nvfp4', 5120, 17408): (16, 16, 160, 2),
+          ('fp8_e4m3', 10240, 5120): (16, 16, 80, 1), ('fp8_e4m3', 5120, 6144): (16, 16, 80, 1),
+          ('fp8_e4m3', 6144, 5120): (16, 16, 40, 1), ('fp8_e4m3', 8192, 5120): (16, 16, 80, 1)}
+# INT4: affine 4-bit projections at 512 rows, (token rows, output rows, SIMD groups, workers), each SIMD group
+# multiplying its decoded weight tile with two token blocks. Geometry only: each row keeps the emitted tile's sums.
+INT4 = {('int4_affine', 34816, 5120): (16, 32, 4, 320), ('int4_affine', 5120, 17408): (16, 32, 4, 320),
+        ('int4_affine', 10336, 5120): (16, 32, 4, 160), ('int4_affine', 6144, 5120): (32, 16, 16, 80),
+        ('int4_affine', 5120, 6144): (32, 16, 16, 80)}
 
 
 def optimize(program, exact=False):
     """``exact`` keeps the 128-row graph's reduction orders, so each row equals that graph's bit for bit: 32-key
-    attention blocks, no reordered BF16 operands, and packed projections that read the verification graph's
-    layouts in their own K order (one copy of those weights for both graphs)."""
+    attention softmax/value blocks (inside 128-key score tiles), no reordered BF16 operands, and packed projections
+    that read the verification graph's layouts in their own K order (one copy of those weights for both graphs)."""
     # Work on individual core/merge pairs. Draft attention and shapes not
     # measured by the prefill sweep retain their existing implementation.
     for core in list(program.ops):
@@ -45,7 +59,10 @@ def optimize(program, exact=False):
             part.kernels[private] = copy.deepcopy(part.kernels[op.kernel])
             op.kernel = private
         tuned = part.kernels[part.ops[0].kernel]
-        sgs, groups = (8, 80) if rows == 512 else ((4, 160) if rows >= 256 and not exact else (8, 320))
+        if rows == 512:
+            sgs, groups = (4, 160) if exact else (8, 80)
+        else:
+            sgs, groups = (4, 160) if rows >= 256 and not exact else (8, 320)
         tuned.macros.update(MMA_SG=str(sgs), STATIC_GQA_P_N_SG=f'{groups}u')
         record = bytearray(part.buffers[params].init)
         struct.pack_into('<I', record, offset+16, groups)
@@ -53,8 +70,11 @@ def optimize(program, exact=False):
         part.ops[0].grid = (groups, 1, 1)
         part.ops[0].threadgroup = (sgs*32, 1, 1)
         part = specialize_attention(part, sgs, True, 64)
-        if rows == 512:
-            device_attention_tiles(part, kn=32 if exact else 128)
+        if rows == 512 and exact:
+            # 16-query tiles, 128-key scores, softmax and value products per 32-key block.
+            device_attention_tiles(part, qm=16, kn=128, ks=32, score_bf16=True)
+        elif rows == 512:
+            device_attention_tiles(part, kn=128)
         compact_partials(part)
         # Preparation has explicit writes so lifetime analysis can reuse Q.
         for op in part.ops:
@@ -90,6 +110,9 @@ def optimize(program, exact=False):
                 key = op.kernel+f'.prefill.tp{rows}'
                 private = copy.deepcopy(k)
                 private.macros['TP'] = f'{rows}u'
+                if private.macros.get('SL', '').rstrip('u') == '4':
+                    # four columns' lane sums in one transposed butterfly, summed as simd_sum sums them
+                    private.macros['TREE_REDUCE'] = '1'
                 program.kernels[key] = private
                 op.kernel = key
             continue
@@ -98,13 +121,26 @@ def optimize(program, exact=False):
                 or int(k.macros.get('TK', '0').rstrip('u')) != 128):
             continue
         shape = (op.meta.get('format'), op.meta.get('n'), op.meta.get('k'))
-        shared = None
-        tn, sgs, groups = SHARED.get(shape, (0, 0, 0))
+        shared = staged = None
+        tn, sgs, groups, blocks = SHARED.get(shape, (0, 0, 0, 1))
         if exact and tn and op.meta['t_variant'] == 512:
-            shared = decoder_layout(program, op, tn, fp8_rows.get(next((n, o) for slot, n, o in op.bindings if slot == 0)))
-        if shared:
-            projection_geometry(program, op, tm=32, tn=tn, sgs=sgs, groups=groups)
+            rows = fp8_rows.get(next((n, o) for slot, n, o in op.bindings if slot == 0))
+            # a layout the staged tiles read through their own width, else one the shared tiles read
+            staged = shape in STAGED and decoder_layout(program, op, STAGED[shape][0], rows)
+            shared = staged or decoder_layout(program, op, tn, rows)
+        if staged:
+            stage_tn, stage_sgs = STAGED[shape]
+            tiles = (shape[1] + stage_tn - 1) // stage_tn
+            projection_geometry(program, op, tm=32, tn=stage_tn, sgs=stage_sgs, groups=tiles, staged=True)
             decoder_projection(program, op, shared)
+        elif shared:
+            projection_geometry(program, op, tm=32, tn=tn, sgs=sgs, groups=groups, token_blocks=blocks)
+            if shape in SPLIT:
+                program.kernels[op.kernel].macros['SPLIT_K'] = '1'
+            decoder_projection(program, op, shared)
+        elif shape in INT4 and op.meta['t_variant'] == 512:
+            tm, tn, sgs, groups = INT4[shape]
+            projection_geometry(program, op, tm=tm, tn=tn, sgs=sgs, groups=groups, token_blocks=2)
         elif shape == ('bf16', 96, 5120) and op.meta['t_variant'] == 512 and not exact:
             # Reorder native BF16 only; FP8 projections stay eight-bit.
             projection_geometry(program, op, tm=32, tn=16, sgs=4, groups=40)

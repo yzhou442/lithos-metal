@@ -70,6 +70,7 @@ These target/draft pairs are selected automatically by the serving CLI. Run `lit
 | Target model | Automatic DSpark head |
 | --- | --- |
 | [Qwen3.8-27B-NVFP4](https://huggingface.co/nvidia/Qwen3.8-27B-NVFP4) | [LithosAI/Qwen3.8-27B-DSpark-NVFP4](https://huggingface.co/LithosAI/Qwen3.8-27B-DSpark-NVFP4) |
+| [Qwen3.8-27B-4bit](https://huggingface.co/mlx-community/Qwen3.8-27B-4bit) (affine 4-bit) | [LithosAI/Qwen3.8-27B-DSpark-NVFP4](https://huggingface.co/LithosAI/Qwen3.8-27B-DSpark-NVFP4) |
 | [Qwen3.6-35B-A3B-NVFP4](https://huggingface.co/nvidia/Qwen3.6-35B-A3B-NVFP4) | [LithosAI/Qwen3.6-35B-A3B-DSpark-NVFP4](https://huggingface.co/LithosAI/Qwen3.6-35B-A3B-DSpark-NVFP4) |
 
 The 35B hybrid MoE integration is experimental; its [adapter design](docs/design/models.md#qwen-hybrid-moe-model) describes

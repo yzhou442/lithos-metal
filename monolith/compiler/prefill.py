@@ -34,15 +34,28 @@ def specialize_prompt(program):
     return program
 
 
-def projection_geometry(program, op, *, tm, tn, sgs, groups):
-    """Retile an emitted matrix projection without changing its K layout."""
+def projection_geometry(program, op, *, tm, tn, sgs, groups, token_blocks=1, staged=False):
+    """Retile an emitted matrix projection without changing its K layout.
+
+    ``token_blocks`` = 2 multiplies every decoded weight tile with two ``tm``-token blocks (same products, half the
+    weight decoding). ``staged``: a threadgroup's ``sgs`` SIMD groups take ``sgs`` token blocks of one row tile at a
+    time and share its decoded weights through threadgroup memory (decoder_projection's staged fill)."""
     old = program.kernels[op.kernel]
     if old.function != 'gemm_tile' or int(old.macros['TK'].rstrip('u')) != 128:
         raise ValueError('prefill projection tuning requires a 128-column matrix tile')
-    key = op.kernel + f'.prefill.{tm}.{tn}.{sgs}.{groups}'
+    if token_blocks not in (1, 2):
+        raise ValueError('a SIMD group multiplies one or two token blocks per weight-tile fill')
+    key = op.kernel + f'.prefill.{tm}.{tn}.{sgs}.{groups}' + ('.tb2' if token_blocks == 2 else '')
     kernel = copy.deepcopy(old)
     oldtn = int(kernel.macros['TN'].rstrip('u'))
-    kernel.macros.update(TM=str(tm), TN=f'{tn}u', KSPLIT='1u', SCALE_CACHE='0')
+    # SHARE_PLANES: a chunk shorter than the program's rows spreads its tiles over the idle token planes.
+    kernel.macros.update(TM=str(tm), TN=f'{tn}u', KSPLIT='1u', SCALE_CACHE='0', SHARE_PLANES='1')
+    if token_blocks == 2:
+        kernel.macros['TB2'] = '1'
+    if staged:
+        if token_blocks != 1:
+            raise ValueError('staged weights take one token block per SIMD group')
+        kernel.macros.update(STAGE_B='1', STAGE_SB=f'{sgs}u', SHARE_PLANES='0')
     pn, off = next((n, o) for slot, n, o in op.bindings if slot == 4)
     data = bytearray(program.buffers[pn].init)
     n, _, _, rows, _, tile0, _, _ = struct.unpack_from('<IIIIfIII', data, off)
@@ -55,7 +68,8 @@ def projection_geometry(program, op, *, tm, tn, sgs, groups):
             kernel.macros['STATIC_GEMM_P_'+field] = f'{value}u'
     program.kernels[key] = kernel
     op.kernel = key
-    op.grid, op.threadgroup = (groups, (rows+tm-1)//tm, 1), (sgs*32, 1, 1)
+    blocks = sgs if staged else token_blocks
+    op.grid, op.threadgroup = (groups, (rows+tm*blocks-1)//(tm*blocks), 1), (sgs*32, 1, 1)
     op.meta.update(tm=tm, tile=[tn, 128], geometry=f'prefill_{groups}x{sgs}')
 
 
@@ -169,6 +183,66 @@ DECODER_NVFP4_FILL = """
       }
 """
 
+# SPLIT_K: the same NVFP4 decoding, one 64-column half at a time, each multiplied as soon as it is decoded. matmul2d
+# accumulates K in order, so two 64-deep products equal the 128-deep one bit for bit; the second half's loads and
+# decoding overlap the first product.
+DECODER_NVFP4_FILL_SPLIT = """
+      {
+        const ulong packed_tile = min(tile, p.tile0 + p.n_tiles - 1u);
+        const ulong ftile = packed_tile * TN / FILE_TN;
+        const uint slot0 = uint(packed_tile * TN % FILE_TN) / 8u;
+        const uint kpx = j * (32u / LPT) + q;
+        const uint fq = 2u * (kpx % 8u) + mq / 2u, fj = kpx / 8u;
+        const uint fkt = FILE_OUTER ? fq * (K / 1024u) + fj : fj * 16u + fq;
+        const ulong pg = (ftile / FILE_BLOCK * (K / 64u) + fkt) * FILE_BLOCK + ftile % FILE_BLOCK;
+#pragma clang loop unroll(full)
+        for (uint h = 0; h < 2u; h++) {
+          auto bH = op.get_right_input_cooperative_tensor<bfloat, bfloat, float>();
+#pragma clang loop unroll(full)
+          for (uint s = 0; s < NS_B; s++) {
+            const uint m = 2u * (mq % 2u) + h;
+            const uint lane_m = (lane & ~9u) | (m & 1u) | ((m >> 1) << 3);
+            const uint2 c2 = reinterpret_cast<device const uint2*>(w)[(pg * (FILE_TN / 8u) + slot0 + s) * 32u + lane_m];
+            float wv[32];
+            decode_word(uint4(c2.x, c2.y, 0u, 0u), wv);
+            uint sc = reinterpret_cast<device const uchar*>(w)[NVFP4_SCALE_BASE + (pg * FILE_TN + (slot0 + s) * 8u + c1b) * 4u + m];
+            const float scale = decode_scale(&sc, 0u);
+#pragma clang loop unroll(full)
+            for (uint e = 0; e < 16u; e++)
+              bH[uint16_t((((e / 4u) * NS_B + s) << 2) | (e % 4u))] = bfloat(wv[e] * scale);
+          }
+          auto sAh = tA.slice<64, int(TM)>(int(kpx * TK + h * 64u), 0);
+          op.run(sAh, bH, cT);
+        }
+      }
+"""
+# STAGE_B: the threadgroup's SIMD groups decode the row tile's FP8 weights once into threadgroup memory ([row][slot],
+# the right operand's column order) and each multiplies its own token block by them; same products and K order.
+DECODER_FP8_FILL_STAGE = """
+      {
+        const ulong packed_tile = min(tile, p.tile0 + p.n_tiles - 1u);
+        const ulong ftile = packed_tile * TN / FILE_TN;
+        const uint slot0 = uint(packed_tile * TN % FILE_TN) / 8u;
+        const uint kpx = j * (32u / LPT) + q;
+        const ulong pg = (ftile / FILE_BLOCK * (K / 32u) + kpx * 4u + mq) * FILE_BLOCK + ftile % FILE_BLOCK;
+        threadgroup bfloat* dst = stage_b + (kt & 1u) * TN * TK;
+        for (uint s = sgi; s < NS_B; s += STAGE_SB) {
+#pragma clang loop unroll(full)
+          for (uint m = 0; m < 4u; m++) {
+            const uint lane_m = (lane & ~9u) | (m & 1u) | ((m >> 1) << 3);
+            const uint2 c2 = reinterpret_cast<device const uint2*>(w)[(pg * (FILE_TN / 8u) + slot0 + s) * 32u + lane_m];
+            const uint cw[2] = {c2.x, c2.y};
+#pragma clang loop unroll(full)
+            for (uint e = 0; e < 8u; e++) {
+              const uint code = (cw[e / 4u] >> ((e % 4u) * 8u)) & 255u;
+              dst[(c1b + 8u * s) * TK + c0b + 16u * (2u * m + e / 4u) + (e % 4u)] = bfloat(fp8_e4m3(code));
+            }
+          }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+      }
+"""
+
 
 def decoder_projection(program, op, record):
     """Read a verification graph's packed operands (decoder_layout) in this kernel's own reduction order.
@@ -195,7 +269,15 @@ def decoder_projection(program, op, record):
     op.bindings = [(slot, name, 0) if slot == 0 else (slot, n, offset) for slot, n, offset in op.bindings]
     begin = kernel.source.index('#pragma clang loop unroll(full)\n      for (uint s = 0; s < NS_B; s++)')
     end = kernel.source.index('#if EXP_MODE == 2\n      }', begin)
-    kernel.source = kernel.source[:begin] + (DECODER_NVFP4_FILL if nvfp4 else DECODER_FP8_FILL) + kernel.source[end:]
+    split = kernel.macros.get('SPLIT_K') == '1'
+    if split and (not nvfp4 or kernel.macros.get('TB2') == '1'):
+        raise ValueError('split products read NVFP4 operands for one token block')
+    fill = DECODER_NVFP4_FILL_SPLIT if split else DECODER_NVFP4_FILL if nvfp4 else DECODER_FP8_FILL
+    if kernel.macros.get('STAGE_B') == '1':
+        if nvfp4 or split or kernel.macros.get('TB2') == '1':
+            raise ValueError('staged weights read FP8 operands for one token block per SIMD group')
+        fill = DECODER_FP8_FILL_STAGE
+    kernel.source = kernel.source[:begin] + fill + kernel.source[end:]
     kernel.macros.update(FILE_TN=f"{record['tn']}u", FILE_BLOCK=f"{record['tile_block']}u")
     op.meta['prefill_packed_nvfp4' if nvfp4 else 'prefill_packed_fp8'] = True
 
@@ -363,15 +445,21 @@ def shared_gdn_preparation(program, op, *, sgs=2):
     op.grid, op.threadgroup = ((rows*(2*hk+hv)+sgs-1)//sgs, 1, 1), (32*sgs, 1, 1)
 
 
-def device_attention_tiles(program, *, qm=32, kn=128):
+def device_attention_tiles(program, *, qm=32, kn=128, ks=None, score_bf16=False):
     """Use larger prompt attention tiles after separate Q/K normalization.
 
     Compact Q by KV head so a matrix view can span both tokens and replicated
     query heads. KV stays in the original cache; barriers between preparation,
     attention and merge provide the visibility required by device tensor reads.
     This transformation applies only to isolated, prepared target attention.
+    ``ks`` splits each ``kn``-key score tile into blocks with their own softmax
+    and value product: the results of ``ks``-key tiles with fewer barriers.
+    ``score_bf16`` stores the scores BF16-rounded (their first step) and overwrites them with the probabilities in
+    place: the same values in a third of the threadgroup memory.
     """
-    if qm <= 0 or kn <= 0 or qm*kn*6+qm*16 > 32768 or kn%32:
+    ks = ks or kn
+    if (qm <= 0 or kn <= 0 or ks <= 0 or kn % ks or ks % 32
+            or qm*kn*(2 if score_bf16 else 6)+qm*8*(kn//ks)+qm*8 > 32768):
         raise ValueError('prefill attention tile exceeds threadgroup scratch')
     cores = [op for op in program.ops if program.kernels[op.kernel].function == 'gqa_decode_mma']
     preparations = [op for op in program.ops if program.kernels[op.kernel].function == 'gqa_prepare_mma']
@@ -403,8 +491,10 @@ def device_attention_tiles(program, *, qm=32, kn=128):
             k.source=k.source.replace(old,'prepared_q + ((h/(p.heads/p.kv_heads))*p.rows_max+t*(p.heads/p.kv_heads)+h%(p.heads/p.kv_heads))*D+lane*DL')
         elif k.function=='gqa_decode_mma':
             k.source=k.source[:k.source.index('// Matrix-accelerator attention:')]+template('gqa_prefill.metal')+'\n#endif\n'
-            k.macros.update(QM=str(qm),KN=str(kn))
-            op.meta['prefill_device_tiles']=[qm,kn]
+            k.macros.update(QM=str(qm),KN=str(kn),KS=str(ks))
+            if score_bf16:
+                k.macros['SCORE_BF16']='1'
+            op.meta['prefill_device_tiles']=[qm,kn,ks]
         if k.function in ('gqa_prepare_mma','gqa_decode_mma'):
             for macro in k.macros:
                 if macro.startswith('STATIC_GQA_P_'):

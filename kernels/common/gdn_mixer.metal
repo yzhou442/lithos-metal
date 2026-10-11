@@ -157,6 +157,30 @@ static inline void conv_state_update(device const ushort* proj, uint in_stride, 
   }
 }
 
+#ifndef TREE_REDUCE
+#define TREE_REDUCE 0                // 1 (SL = 4): the four columns' lane sums in one transposed butterfly per token
+#endif
+#if TREE_REDUCE
+#if SL != 4
+#error "the transposed butterfly reduces four state columns"
+#endif
+// The sums simd_sum forms (masks 1, 2, 4, 8, 16 of lanes), four columns at once: the first two levels each keep half the
+// columns per lane, so lane (b0, b1) ends with column 2*b0 + b1's sum, every pair added in simd_sum's order.
+static inline float tree4(float p0, float p1, float p2, float p3, uint lane) {
+  const bool b0 = (lane & 1u) != 0u, b1 = (lane & 2u) != 0u;
+  float k0 = b0 ? p2 : p0, k1 = b0 ? p3 : p1;
+  k0 += simd_shuffle_xor(b0 ? p0 : p2, ushort(1));
+  k1 += simd_shuffle_xor(b0 ? p1 : p3, ushort(1));
+  float m = b1 ? k1 : k0;
+  m += simd_shuffle_xor(b1 ? k0 : k1, ushort(2));
+  m += simd_shuffle_xor(m, ushort(4));
+  m += simd_shuffle_xor(m, ushort(8));
+  m += simd_shuffle_xor(m, ushort(16));
+  return m;
+}
+#define TREE_LANE(j) ((((j) >> 1) & 1u) | (((j) & 1u) << 1))     // a lane holding column j's sum
+#endif
+
 static inline float pick(thread const float* arr, uint i) {         // arr[i] with a compile-time-indexed body
   float r = arr[0];
   for (uint k = 1; k < VR; k++) if (i == k) r = arr[k];
@@ -423,10 +447,23 @@ kernel void gdn_mixer(device const ushort* proj [[buffer(0)]], device const usho
 #endif
           for (uint i = 0; i < KR; i++) for (uint j = 0; j < SL; j++) S[i][j] *= eg[TI];
           float delta[SL];
+#if TREE_REDUCE
+          float kparts[SL];
           for (uint j = 0; j < SL; j++) {
             float part = 0.0f;
             for (uint i = 0; i < KR; i++) part = fma(S[i][j], kv[TI][i], part);
+            kparts[j] = part;
+          }
+          const float ksum = tree4(kparts[0], kparts[1], kparts[2], kparts[3], lane);
+#endif
+          for (uint j = 0; j < SL; j++) {
+#if TREE_REDUCE
+            const float kvm = simd_shuffle(ksum, ushort(TREE_LANE(j)));
+#else
+            float part = 0.0f;
+            for (uint i = 0; i < KR; i++) part = fma(S[i][j], kv[TI][i], part);
             const float kvm = simd_sum(part);
+#endif
             const uint v = s * SL + j;
 #if PREPARED
             const float vt = src[2u * DK + v];
@@ -436,7 +473,25 @@ kernel void gdn_mixer(device const ushort* proj [[buffer(0)]], device const usho
             delta[j] = (vt - kvm) * beta[TI];
           }
           for (uint i = 0; i < KR; i++) for (uint j = 0; j < SL; j++) S[i][j] = fma(kv[TI][i], delta[j], S[i][j]);
-#if !COMMIT
+#if !COMMIT && TREE_REDUCE
+          {
+            float oparts[SL];
+            for (uint j = 0; j < SL; j++) {
+              float part = 0.0f;
+              for (uint i = 0; i < KR; i++) part = fma(S[i][j], qv[TI][i], part);
+              oparts[j] = part;
+            }
+            const float o = tree4(oparts[0], oparts[1], oparts[2], oparts[3], lane);
+            if (lane < 4u) {
+              const uint j = 2u * (lane & 1u) + ((lane >> 1) & 1u);
+#if FUSED_NORM
+              readout[t][s * SL + j] = o;
+#else
+              o_part[(t0 + t) * p.out_stride + h * DV + s * SL + j] = o;
+#endif
+            }
+          }
+#elif !COMMIT
           for (uint j = 0; j < SL; j++) {                        // the read-out: the step's pass only (the commit pass
             float part = 0.0f;                                   // advances the state and binds no output of its own)
             for (uint i = 0; i < KR; i++) part = fma(S[i][j], qv[TI][i], part);

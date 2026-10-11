@@ -40,6 +40,12 @@ using namespace mpp::tensor_ops;
 #ifndef OUT_BF16
 #define OUT_BF16 0
 #endif
+#ifndef TB2
+#define TB2 0                        // 1: each SIMD group multiplies its decoded weight tile with two TM-token blocks
+#endif
+#ifndef SHARE_PLANES
+#define SHARE_PLANES 0               // 1: grid.y planes beyond a short step's tokens take over tiles of the planes with tokens
+#endif
 #ifndef STEP_STATE
 #define STEP_STATE 0                 // 1: the row count comes from StepState (buffer 15) and the dispatch is a per-T variant
 #endif
@@ -206,8 +212,15 @@ static inline uint narrow_scale_word(device const uint4* wb, uint ln, uint r, ui
 #define BLOCK_WORDS (R * 32u * UNIT_WORDS)
 #endif
 
-constexpr constant auto desc = matmul2d_descriptor(int(TM), int(TN), int(TK), false, true, false, matmul2d_descriptor::mode::multiply_accumulate);
+#ifndef STAGE_B
+#define STAGE_B 0                    // 1: STAGE_SB SIMD groups (one TM-token block each) share each row tile's decoded weights
+#endif                               // through threadgroup memory: the injected fill writes them, one barrier per K step
+#ifndef SPLIT_K
+#define SPLIT_K 0                    // 1: the injected fill (compiler/prefill.py) multiplies each 128-column tile as two 64-deep
+#endif                               // products, each right after decoding its half: matmul2d sums K in order, same results
+constexpr constant auto desc = matmul2d_descriptor(int(TM), int(TN), SPLIT_K ? 64 : int(TK), false, true, false, matmul2d_descriptor::mode::multiply_accumulate);
 using tA_t = tensor<device bfloat, dextents<int, 2>, tensor_inline>;
+using tB_s = tensor<threadgroup bfloat, dextents<int, 2>, tensor_inline>;
 
 kernel void gemm_tile(device const uint4* w [[buffer(0)]], device const float* row_scale [[buffer(1)]],
                       device bfloat* xp [[buffer(2)]],
@@ -233,11 +246,23 @@ kernel void gemm_tile(device const uint4* w [[buffer(0)]], device const float* r
                       device const StepState* st [[buffer(15)]],
 #endif
                       uint3 gid [[thread_position_in_grid]], uint lane [[thread_index_in_simdgroup]], uint sw [[threads_per_simdgroup]],
+#if SHARE_PLANES || STAGE_B
+                      uint3 planes [[threadgroups_per_grid]],
+#endif
                       uint3 group [[threadgroup_position_in_grid]]) {
   const uint sg = gid.x / sw;
 #if KSPLIT > 1
   const uint slice = sg % KSPLIT, sg_tile = sg / KSPLIT, n_tg = p.n_sg / KSPLIT;   // a threadgroup is the KSPLIT SIMD-groups of one tile
   threadgroup float part[KSPLIT - 1][PART_LANES][PART_CAP];                            // the partial tiles of slices 1 … KSPLIT-1
+#elif STAGE_B
+#if SHARE_PLANES || TB2 || POST_NORM
+#error "staged weights take one token block per SIMD group"
+#endif
+  threadgroup bfloat stage_b[2u * TN * TK];
+  const uint sgi = (gid.x / sw) % STAGE_SB;                              // this SIMD group's token block in the threadgroup
+  const uint sg_tile = group.x, n_tg = planes.x;                         // one row tile per threadgroup at a time
+#elif SHARE_PLANES
+  uint sg_tile = sg, n_tg = p.n_sg;                                     // remapped below for a short step
 #else
   const uint sg_tile = sg, n_tg = p.n_sg;
 #endif
@@ -253,9 +278,41 @@ kernel void gemm_tile(device const uint4* w [[buffer(0)]], device const float* r
 #endif
   // Each grid.y plane processes at most TM tokens. Predication above uses the
   // full step length; all following addressing and guards are local to this tile.
-  const uint token0 = group.y * TM;
+#if STAGE_B
+  // grid.y covers STAGE_SB token blocks per threadgroup; a block past the step still decodes and meets the barriers
+  if (group.y * STAGE_SB * TM >= T_act) return;                         // uniform: the whole threadgroup is past the step
+  const uint token0 = (group.y * STAGE_SB + sgi) * TM;
+  const bool live = token0 < T_act;
+  T_act = live ? min(T_act - token0, uint(TM)) : 0u;
+#else
+  uint plane = group.y;
+#if SHARE_PLANES
+#if KSPLIT > 1
+#error "shared planes need an unsplit reduction"
+#endif
+  {
+    // A short step leaves planes idle: spread each active plane's tiles over replicas of it. A tile's products,
+    // order and epilogue are unchanged; a step that fills every plane keeps the one-plane-per-group mapping.
+    const uint active = (T_act + TM * (TB2 ? 2u : 1u) - 1u) / (TM * (TB2 ? 2u : 1u));
+    if (active < planes.y) {
+      const uint replicas = planes.y / active;
+      if (group.y >= active * replicas) return;
+      plane = group.y % active;
+      sg_tile += (group.y / active) * n_tg;
+      n_tg *= replicas;
+    }
+  }
+#endif
+  uint token0 = plane * TM * (TB2 ? 2u : 1u);
   if (token0 >= T_act) return;
+#if TB2
+  // Two token blocks share every weight-tile fill; the second block's epilogue reuses the first's code.
+  const uint T_all = min(T_act - token0, 2u * TM);
+  T_act = min(T_all, uint(TM));
+#else
   T_act = min(T_act - token0, uint(TM));
+#endif
+#endif
   xp += (ulong)token0 * K;
   const uint output_cols = (EPILOGUE == 2) ? p.n_rows / 2u : p.n_rows;
   y += (ulong)token0 * output_cols;
@@ -267,6 +324,9 @@ kernel void gemm_tile(device const uint4* w [[buffer(0)]], device const float* r
 #endif
   matmul2d<desc, execution_simdgroup> op;
   tA_t tA(xp, dextents<int, 2>(int(K), int(TM)));
+#if TB2
+  tA_t tA2(xp + (ulong)TM * K, dextents<int, 2>(int(K), int(TM)));     // the second token block (keep tA's line intact:
+#endif                                                                  // decoder fusions rewrite it textually)
   const uint c0b = 4u * ((lane & 1u) + 2u * ((lane >> 3) & 1u));      // this thread's column-run base
   const uint c1b = ((lane >> 1) & 3u) + 4u * ((lane >> 4) & 1u);      // this thread's row-slot base
   const uint mq = (lane & 1u) | (((lane >> 3) & 1u) << 1);            // its member id in the quad sharing those rows
@@ -275,8 +335,19 @@ kernel void gemm_tile(device const uint4* w [[buffer(0)]], device const float* r
 #endif
   for (uint tile = p.tile0 + sg_tile; tile < p.tile0 + p.n_tiles; tile += n_tg) {
     auto bT = op.get_right_input_cooperative_tensor<bfloat, bfloat, float>();
+#if STAGE_B
+    auto cT = op.get_destination_cooperative_tensor<tA_t, tB_s, float>();
+#else
     auto cT = op.get_destination_cooperative_tensor<tA_t, decltype(bT), float>();
+#endif
     for (uint16_t i = 0; i < cT.get_capacity(); i++) cT[i] = 0.0f;
+#if TB2
+#if KSPLIT > 1 || POST_NORM
+#error "two token blocks need an unsplit reduction and no post-product norm"
+#endif
+    auto cT2 = op.get_destination_cooperative_tensor<tA_t, decltype(bT), float>();
+    for (uint16_t i = 0; i < cT2.get_capacity(); i++) cT2[i] = 0.0f;
+#endif
 #if SCALE_CACHE
     uint scc[NS_B][NW][SCALE_WORDS * 4];                                // the scale words of this thread's rows and lanes,
 #endif                                                                  // kept across the PAYLOAD_WORDS tiles of a lane group
@@ -415,8 +486,21 @@ kernel void gemm_tile(device const uint4* w [[buffer(0)]], device const float* r
 #else
       auto sA = tA.slice<int(TK), int(TM)>(int(kp * TK), 0);
 #endif
-#if EXP_MODE != 1
+#if SPLIT_K
+      (void)sA;                                                        // the fill ran both halves' products
+#elif STAGE_B
+      if (live) {
+        tB_s sBs(stage_b + (kt & 1u) * TN * TK, dextents<int, 2>(int(TK), int(TN)));
+        op.run(sA, sBs, cT);
+      }
+#elif EXP_MODE != 1
       op.run(sA, bT, cT);
+#if TB2
+      if (T_all > TM) {
+        auto sA2 = tA2.slice<int(TK), int(TM)>(int(kp * TK), 0);
+        op.run(sA2, bT, cT2);
+      }
+#endif
 #else
       if (kt == KT - 1u) op.run(sA, bT, cT);                          // fill-only timing: one run so the fill is not dead
 #endif
@@ -474,6 +558,21 @@ kernel void gemm_tile(device const uint4* w [[buffer(0)]], device const float* r
     // epilogue over the destination: element ((blk*(TN/16) + jump)*2 + s2) << 2 | q holds row n = c0b + 16*jump + q
     // and token m = 16*blk + c1b + 8*s2; a lane's 4 rows lie in one pack block, the block's other rows in the lanes
     // differing in bit 0 (and bit 3 when R = 16); rows beyond t_active and the range are not written
+#if TB2
+    for (uint hb = 0; hb < 2u; hb++) {
+      if (hb == 1u) {
+        if (T_all <= TM) break;
+        for (uint16_t i = 0; i < cT.get_capacity(); i++) cT[i] = cT2[i];
+        T_act = T_all - TM; token0 += TM;
+        y += (ulong)TM * output_cols;
+#if EPILOGUE == 1
+        residual += (ulong)TM * output_cols;
+#endif
+#if STAT_OUT
+        stat_out += (ulong)TM * p.n_blocks;
+#endif
+      }
+#endif
 #pragma clang loop unroll(full)
     for (uint jump = 0; jump < TN / 16u; jump++) {
       const uint n = c0b + 16u * jump;                                   // this lane's 4 consecutive rows of the tile
@@ -547,6 +646,19 @@ kernel void gemm_tile(device const uint4* w [[buffer(0)]], device const float* r
 #endif
         }
     }
+#if TB2
+    }
+    if (T_all > TM) {                                                   // back to the first block for the next tile
+      T_act = min(T_all, uint(TM)); token0 -= TM;
+      y -= (ulong)TM * output_cols;
+#if EPILOGUE == 1
+      residual -= (ulong)TM * output_cols;
+#endif
+#if STAT_OUT
+      stat_out -= (ulong)TM * p.n_blocks;
+#endif
+    }
+#endif
   }
 }
 

@@ -16,6 +16,10 @@ class ServingModel:
 SERVING_MODELS = (
     ServingModel("nvidia/Qwen3.8-27B-NVFP4", "LithosAI/Qwen3.8-27B-DSpark-NVFP4",
                  "Qwen3_5ForConditionalGeneration", 5120, 64),
+    # Every linear layer, the embedding and the head as affine 4-bit groups of 64 (mlx_lm.convert); the draft head
+    # reads the target's hidden states, so it serves this conversion of the same model as well
+    ServingModel("mlx-community/Qwen3.8-27B-4bit", "LithosAI/Qwen3.8-27B-DSpark-NVFP4",
+                 "Qwen3_5ForConditionalGeneration", 5120, 64),
     ServingModel("nvidia/Qwen3.6-35B-A3B-NVFP4", "LithosAI/Qwen3.6-35B-A3B-DSpark-NVFP4",
                  "Qwen3_5MoeForConditionalGeneration", 2048, 40),
 )

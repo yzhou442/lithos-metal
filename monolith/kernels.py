@@ -715,6 +715,15 @@ def sample_params(*, vocab: int, t_active: int, n_sg: int, top_k: int = 0, tempe
                        seed & 0xFFFFFFFF, (seed >> 32) & 0xFFFFFFFF, step, flags)
 
 
+def resample_params(data: bytes, *, temperature: float, top_k: int = 0, top_p: float = 0.0, seed: int = 0) -> bytes:
+    """A ``SampleParams`` record with other sampling settings: what ``sample_params`` gives for the same vocabulary,
+    rows, SIMD groups, ``min_p`` and ``topp_in_topk``. The sampler reads these at run time, so a compiled sampling
+    program serves every temperature, top-k, top-p and seed."""
+    vocab, t_active, n_sg, _, _, _, _, min_p, _, _, step, flags = struct.unpack("<IIIIIfffIIII", data)
+    return sample_params(vocab=vocab, t_active=t_active, n_sg=n_sg, top_k=top_k, temperature=temperature, top_p=top_p,
+                         min_p=min_p, seed=seed, step=step, topp_in_topk=bool(flags & 8))
+
+
 def sample_workspace(t_max: int, n_sg: int) -> Tuple[int, int, int]:
     """Bytes of the histogram, tau and partial buffers."""
     return t_max * SAMPLE_HIST_KEYS * 4, t_max * 4, t_max * n_sg * 4
