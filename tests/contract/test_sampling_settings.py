@@ -56,8 +56,9 @@ def test_set_sampling_rewrites_the_samplers_records_and_nothing_else():
     assert s.engines[0].buffers['params.D8.sample.7'].data == want               # and the live engine
     assert other.buffers['params.D512.sample.9'].init == kernels.sample_params(
         vocab=1000, t_active=8, n_sg=12, top_k=20, temperature=0.2, top_p=0.95, seed=7)
+    # the draft sampler's record as the compiler emits it at that temperature (its draws use StepState's seed)
     assert s.engines[0].buffers['params.D8.draft_q.3'].data == kernels.sample_params(
-        vocab=1000, t_active=1, n_sg=12, temperature=0.2, seed=7)
+        vocab=1000, t_active=1, n_sg=12, temperature=0.2)
     assert prog.buffers['params.D8.gemv.0'].init == gemv and s.engines[0].buffers['params.D8.gemv.0'].data == gemv
     assert (s.seed, s.drafter.sampling, s.model.sampler.temperature, s.model.sampler.top_k) == (7, 0.2, 0.2, 20)
 

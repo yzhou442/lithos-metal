@@ -391,7 +391,10 @@ class Session:
                 if kind == "sample":
                     spec.init = kernels.resample_params(spec.init, temperature=temperature, top_k=top_k, top_p=top_p, seed=seed)
                 elif kind == "draft_q":
-                    spec.init = kernels.resample_params(spec.init, temperature=temperature, seed=seed)
+                    # Only its temperature changes: step programs draw from StepState's generator (the request's
+                    # seed), and the record keeps the seed it was compiled with, as a fresh compile emits it.
+                    compiled = int.from_bytes(spec.init[32:40], "little")
+                    spec.init = kernels.resample_params(spec.init, temperature=temperature, seed=compiled)
                 else:
                     continue
                 for eng in self.engines.values():
