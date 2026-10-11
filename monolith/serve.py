@@ -74,7 +74,12 @@ class Backend:
                                                      add_generation_prompt=True, enable_thinking=False)
             if len(ids) < self.max_context:          # the prompt and its 2-token output budget fit
                 if len(ids) > resident:
+                    kept = list(getattr(getattr(self.session, 'prefix_cache', None), 'items', ()))
                     self.complete(prompt, on_text=lambda text: None)
+                    # Its checkpoint is a prompt no request shares: drop it rather than hold (or persist) its state.
+                    cache = getattr(self.session, 'prefix_cache', None)
+                    if cache is not None:
+                        cache.items = [item for item in cache.items if any(item is k for k in kept)]
                 break
             words -= len(ids) - self.max_context + 1
         self.last_metrics = {}

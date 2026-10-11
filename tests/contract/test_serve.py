@@ -211,6 +211,22 @@ def test_warmup_cuts_the_long_prompt_to_the_context():
         assert seen == [1, 1] + ([words] if words else [])
 
 
+def test_warmup_drops_its_long_prompts_checkpoint():
+    seen = []
+    backend = _warmup_backend(4096, seen)
+    shared = object()
+    backend.session.prefix_cache = SimpleNamespace(items=[shared])
+    complete = backend.complete
+
+    def checkpointing(request, **kwargs):
+        complete(request, **kwargs)
+        if len(request.messages[0].content.split()) > 1:          # generate() checkpoints a prompt past the cache's minimum
+            backend.session.prefix_cache.items.append(object())
+    backend.complete = checkpointing
+    backend.warmup('test-model')
+    assert len(seen) == 3 and backend.session.prefix_cache.items == [shared]
+
+
 def test_warmup_prompt_outgrows_a_plain_chunk():
     seen = []
     _warmup_backend(8192, seen, chunk=2048, exact=False).warmup('test-model')
