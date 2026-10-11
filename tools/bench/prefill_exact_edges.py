@@ -156,13 +156,17 @@ def repo_dirty():
 
 
 def code_digest():
-    """The engine's files (Python, kernels, recipes, the native module) and this harness, committed or not."""
+    """The engine's files (Python, kernels, recipes, native runtime sources) and this harness, committed or not, and
+    the native module this process loaded, wherever it was built."""
+    from monolith.runtime import _native
     digest, out = hashlib.sha256(), OUT.resolve()
     own = {out / name for name in ARTIFACTS} | {out / f'.{name}.tmp' for name in ARTIFACTS}
-    files = [path for part in ('monolith', 'kernels') for path in sorted((ROOT / part).rglob('*'))
+    files = [path for part in ('monolith', 'kernels', 'runtime') for path in sorted((ROOT / part).rglob('*'))
              if path.is_file() and '__pycache__' not in path.parts and path.resolve() not in own]
     for path in files + [Path(__file__).resolve()]:
         digest.update(str(path.relative_to(ROOT)).encode() + b'\0' + path.read_bytes())
+    native = Path(getattr(_native, '__file__', '') or '')
+    digest.update(b'native\0' + (native.read_bytes() if native.is_file() else b'-'))
     return digest.hexdigest()[:16]
 
 
