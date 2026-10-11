@@ -28,6 +28,8 @@ def main():
     parser.add_argument('--rows', type=int, default=None, help='Tokens in the profiled pass (default: --chunk)')
     parser.add_argument('--out', required=True)
     args = parser.parse_args()
+    if args.rows is not None and not 1 <= args.rows <= args.chunk:
+        parser.error('--rows must be between 1 and --chunk (the compiled pass)')
     from monolith.serve import parse_args
     from monolith.serving.setup import prepare
     from monolith.generate import load_session
